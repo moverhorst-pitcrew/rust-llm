@@ -473,6 +473,75 @@ tool, so look for the step out of a quiet neighbourhood, not for the absolute
 value; whether the two implementations agree is settled by the gate, not by the
 bottom of that table.
 
+## The correctness gate
+
+Ten prompts in `fixtures/gate_prompts.json`, 32 to 48 tokens each: thinking on
+and off, a system persona, a multi-turn conversation, a non-ASCII prompt, Dutch
+diacritics, two code prompts (one with tabs) and one raw completion with no
+chat template. `fixtures/reference_generations.json` holds the reference's
+tokens, ours, and the model's sha256, so CI needs neither llama.cpp nor the
+weights.
+
+**There are two gates rather than one, and the reason is not a concession.**
+Free-running token-for-token agreement is not a property an implementation can
+have unless its kernels are bit-identical to the reference's, which these
+deliberately are not. On a logit scale whose next-token margins are typically
+0.25 to 1.2, the two implementations' logits differ by about 1e-2, which leaves
+a band of roughly +/-0.1 inside which neither one's choice is determined by the
+model. llama.cpp disagrees with *itself* across its own two kernel paths on
+these prompts for the same reason: with repacking on it answers "Here's a
+thinking process that leads to the answer", with `--no-repack` "Here's my
+thought process for solving this word problem", same file, same greedy sampler.
+
+So:
+
+- `every_next_token_matches_the_reference` is the correctness gate. It feeds
+  the reference's own tokens and checks the prediction at every position
+  independently, so a flipped near-tie cannot hide the predictions behind it. A
+  disagreement is accepted only where the fixture records one and only when the
+  top-two margin is inside the 0.25 band and the reference's token is at least
+  our runner-up. Currently 380 of 384 positions are identical and the four that
+  are not have margins of 0.0094, 0.0104, 0.0475 and 0.1262, against typical
+  margins twenty times that.
+- `greedy_output_is_unchanged` is the regression gate: free-running output must
+  equal the committed sequence token for token. For 7 of the 10 prompts that
+  sequence is the reference's own output for its whole length; the fixture
+  records both and the test prints which.
+
+Both run against the dispatched fast path (`avx2+vnni` on this box) and print
+the tier. Neither is ever run against a pinned scalar build: a gate that passes
+only on the slow path proves nothing about what ships.
+
+`the_fixture_is_still_what_the_reference_produces` is the non-default test that
+keeps the fixture from rotting. It re-derives a case against a local reference
+build and compares, or writes it with `RUST_LLM_WRITE_FIXTURE=1`. One prompt
+per command, selected by a substring of its name:
+
+```sh
+RUST_LLM_REFERENCE_BIN=/paperclip/models/ref/llama.cpp/build/bin \
+  RUST_LLM_GATE_ONLY=capital_no_think \
+  cargo test -p rust-llm --release --test gate -- --ignored the_fixture_is_still
+```
+
+A case is merged into the fixture by name as soon as it is produced and the
+file is rewritten in prompt-set order, so a command that is stopped part-way
+keeps its work and the next one continues with what is missing. A case that is
+in neither the fresh run nor the file is left out, and the two gates then fail
+on the case count rather than quietly running a short set.
+
+Omitting `RUST_LLM_GATE_ONLY` does the whole set in one command, which is about
+four minutes. Per prompt it is 20 to 35 seconds, which is the size to keep a
+check at.
+
+It reads the reference's ids out of its verbose log, because `llama-completion`
+prints a generated token's text and never its id: a token's bytes are exactly
+the text between one log line and the `n_past` line after it. Inverting text
+back to ids needs the whole vocabulary decoded once, and the inversion is
+asserted to be a function rather than assumed. Tokens that are half a
+multi-byte character cannot be inverted this way and would fail by name; none
+of the committed prompts produces one. One extra token is always asked for and
+dropped, so every token the gate uses is bounded by a log line on both sides.
+
 ## Baseline numbers
 
 Qwen3.5-4B-heretic-Q4_K_M, `avx2+vnni`, this box (8 of 32 cores by cgroup
@@ -521,3 +590,26 @@ eight threads the reference is about 15 per cent ahead of it.
 So the reference is not a floor to walk over. The bar is memory bandwidth,
 which batch-1 generation hits by reading every weight once per token, and
 establishing where that bar actually is belongs to the throughput ticket.
+
+## What the checks cost
+
+Every check is sized to finish in one command, and none of them is a wait with
+no signal in it. Measured on this box:
+
+| command | time |
+| --- | --- |
+| `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` | 1 s, 25 s cold |
+| `cargo test --release` (the default set, no weights needed) | 35 s cold, 2 s warm |
+| gate: `every_next_token_matches_the_reference` | 2:01 |
+| gate: `greedy_output_is_unchanged` | 2:10 |
+| gate: `resetting_the_caches_is_the_same_as_a_fresh_runner` | 27 s |
+| gate: `the_thread_count_does_not_change_the_output` | 21 s |
+| `the_generation_loop_allocates_nothing_per_token` | 14 s |
+| fixture re-derivation, one prompt | 20 to 35 s |
+| fixture re-derivation, all ten prompts | about 4 min |
+| per-layer trace comparison against the reference | 40 s |
+
+The default `cargo test` holds no weights and no reference, so it is the same
+35 seconds in CI. The gate tests are `#[ignore]`d because they need the model
+file, not because they are slow, so nothing had to be left out of the set to
+keep a command short.

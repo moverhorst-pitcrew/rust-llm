@@ -1,0 +1,104 @@
+{
+  "comment": [
+    "The correctness gate's prompt set. Greedy generation from each of these",
+    "must match the reference runner token for token; the reference's answers",
+    "are in reference_generations.json, which is generated from this file.",
+    "Covers thinking mode on and off, a system message, a multi-turn",
+    "conversation, non-ASCII text, code, and a raw completion that does not go",
+    "through the chat template at all."
+  ],
+  "cases": [
+    {
+      "name": "capital_no_think",
+      "thinking": false,
+      "max_tokens": 32,
+      "messages": [{ "role": "user", "content": "What is the capital of France?" }]
+    },
+    {
+      "name": "capital_think",
+      "thinking": true,
+      "max_tokens": 32,
+      "messages": [{ "role": "user", "content": "What is the capital of France?" }]
+    },
+    {
+      "name": "arithmetic_think",
+      "thinking": true,
+      "max_tokens": 48,
+      "messages": [
+        {
+          "role": "user",
+          "content": "A shop sells pens in packs of 7 and pencils in packs of 4. I bought 3 packs of pens and 5 packs of pencils. How many items do I have?"
+        }
+      ]
+    },
+    {
+      "name": "system_persona_no_think",
+      "thinking": false,
+      "max_tokens": 32,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a physics tutor. Explain things in plain language, step by step."
+        },
+        { "role": "user", "content": "Why is the sky blue?" }
+      ]
+    },
+    {
+      "name": "multi_turn_no_think",
+      "thinking": false,
+      "max_tokens": 40,
+      "messages": [
+        { "role": "system", "content": "You are a helpful assistant." },
+        { "role": "user", "content": "My favourite number is 17." },
+        { "role": "assistant", "content": "Noted, 17 it is. What would you like to do with it?" },
+        { "role": "user", "content": "Is it prime, and what is it squared?" }
+      ]
+    },
+    {
+      "name": "non_ascii_no_think",
+      "thinking": false,
+      "max_tokens": 40,
+      "messages": [
+        { "role": "user", "content": "请用中文解释一下什么是向量，并举一个例子。" }
+      ]
+    },
+    {
+      "name": "dutch_diacritics_think",
+      "thinking": true,
+      "max_tokens": 40,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Leg in het Nederlands uit waarom een één-dimensionale coëfficiënt geen matrix is. Gebruik maximaal twee zinnen."
+        }
+      ]
+    },
+    {
+      "name": "code_rust_no_think",
+      "thinking": false,
+      "max_tokens": 48,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a Rust function `fn rev(s: &str) -> String` that reverses a string by characters, with a doc comment and a unit test. Then explain why bytes and characters differ here."
+        }
+      ]
+    },
+    {
+      "name": "code_with_tabs_no_think",
+      "thinking": false,
+      "max_tokens": 40,
+      "messages": [
+        {
+          "role": "user",
+          "content": "What does this print?\n\n\tdef f(n):\n\t\treturn n * 2\n\tprint(f(21))\n"
+        }
+      ]
+    },
+    {
+      "name": "raw_completion",
+      "max_tokens": 32,
+      "raw": "The three primary colours used in additive colour mixing are"
+    }
+  ]
+}
