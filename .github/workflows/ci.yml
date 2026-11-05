@@ -30,14 +30,15 @@ jobs:
       - run: cargo test --workspace --all-targets
 
       # Pure Rust is a hard requirement: no C or C++ toolchain anywhere in the
-      # build graph. `cc` would come in with a -sys crate, `cmake` and
-      # `bindgen` with a wrapper around a native library.
+      # build graph. The realistic way this breaks is a transitive -sys crate,
+      # or tokenizers' default features, which would pull esaxx-rs/cpp and with
+      # it `cc`. Cargo.lock is committed and complete, so grepping it catches
+      # the crate however it arrived.
       - name: No C or C++ build dependencies
         run: |
-          cargo tree --workspace --edges build > build-deps.txt
-          if grep -Eq '(^|[^a-zA-Z0-9_-])(cc|cmake|bindgen) v' build-deps.txt; then
-            echo "A C or C++ build dependency entered the tree:"
-            cat build-deps.txt
+          cargo tree --workspace --edges build
+          if grep -E '^name = "(cc|cmake|bindgen|cxx|cxx-build|pkg-config|onig_sys)"$' Cargo.lock; then
+            echo "A C or C++ build dependency entered the tree, see the name above."
             exit 1
           fi
-          cat build-deps.txt
+          echo "no C or C++ build dependency in Cargo.lock"

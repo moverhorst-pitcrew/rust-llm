@@ -7,3 +7,8 @@ publish.workspace = true
 
 [dependencies]
 llm-core.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

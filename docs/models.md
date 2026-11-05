@@ -11,6 +11,9 @@ of weights. The fallback, if that repository disappears, is
 `HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive`.
 
 Weights are never committed: `.gitignore` excludes `*.gguf` and `/models/`.
+`tokenizer.json` is committed, as `fixtures/tokenizer.json`, so the tokenizer
+tests run without the weights and without network. It is a byte-identical copy;
+the ignored `weights` test asserts that.
 
 ## Files
 
