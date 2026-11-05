@@ -359,3 +359,112 @@ fn reports_the_dispatch_tier() {
     // Whatever the box is, the scalar tier must always be available.
     assert!(available_tiers().iter().any(|(t, _)| *t == Tier::Scalar));
 }
+
+// ------------------------------------------------- the embedding lookup
+
+/// `dequantize_row` against the same scalar reference the kernels are checked
+/// against.
+///
+/// This is the one place the product path turns a weight back into f32, for the
+/// embedding lookup, and on this model only the `Q6_K` branch of it ever runs.
+/// The other four are reached by a different file's embedding type, so they are
+/// checked here rather than by the model.
+///
+/// The tolerance is relative and tiny: the two differ at most in the last bit,
+/// because `dequantize_row` multiplies the integer scale and quant together
+/// before the one f32 multiply while the reference above scales in f32 twice.
+/// Any wrong nibble, lane, index or sign is orders of magnitude outside it.
+#[test]
+fn dequantize_row_matches_the_reference() {
+    let mut rng = Rng::new(0x5EED_5EED);
+    let ks: Vec<usize> = AWKWARD_SHAPES
+        .iter()
+        .chain(MODEL_SHAPES)
+        .map(|&(k, _)| k)
+        .collect();
+    for ty in [GgmlType::Q4_K, GgmlType::Q6_K] {
+        for &k in &ks {
+            let nb = k.div_ceil(ty.block_len());
+            let row = random_weights(ty, &mut rng, nb);
+            let want = dequantize(ty, &row, nb);
+            let mut got = vec![f32::NAN; k];
+            llm_core::dequantize_row(ty, &row, &mut got);
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                let tol = w.abs() * 1e-6 + 1e-12;
+                assert!(
+                    (g - w).abs() <= tol,
+                    "{ty:?} k={k} element {i}: {g} against {w}"
+                );
+            }
+        }
+    }
+}
+
+/// The three float layouts, which have no scalar reference above because no
+/// kernel reads them.
+///
+/// Each is checked against what the format means rather than against the same
+/// bit shuffle written twice: an f32 row comes back exactly, an f16 row comes
+/// back as the `f16` it was built from, and a bf16 row comes back as the f32 it
+/// was truncated from with its low mantissa bits cleared. Odd lengths are in
+/// the list because a stride error is invisible at a round one.
+#[test]
+fn dequantize_row_reads_the_float_layouts() {
+    let mut rng = Rng::new(0xF10A7);
+    for k in [1usize, 2, 3, 7, 37, 256, 2560] {
+        let values: Vec<f32> = (0..k).map(|_| rng.signed() * 100.0).collect();
+
+        let mut bytes = Vec::new();
+        for v in &values {
+            bytes.extend(v.to_le_bytes());
+        }
+        let mut got = vec![f32::NAN; k];
+        llm_core::dequantize_row(GgmlType::F32, &bytes, &mut got);
+        assert_eq!(got, values, "F32 k={k}");
+
+        let mut bytes = Vec::new();
+        let halves: Vec<f16> = values.iter().map(|&v| f16::from_f32(v)).collect();
+        for h in &halves {
+            bytes.extend(h.to_le_bytes());
+        }
+        let mut got = vec![f32::NAN; k];
+        llm_core::dequantize_row(GgmlType::F16, &bytes, &mut got);
+        let want: Vec<f32> = halves.iter().map(|h| h.to_f32()).collect();
+        assert_eq!(got, want, "F16 k={k}");
+
+        // bf16 is the top half of an f32, so truncating is the whole encoding.
+        let mut bytes = Vec::new();
+        for v in &values {
+            bytes.extend(((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        let mut got = vec![f32::NAN; k];
+        llm_core::dequantize_row(GgmlType::BF16, &bytes, &mut got);
+        let want: Vec<f32> = values
+            .iter()
+            .map(|v| f32::from_bits(v.to_bits() & 0xFFFF_0000))
+            .collect();
+        assert_eq!(got, want, "BF16 k={k}");
+    }
+}
+
+/// `can_dequantize` is what the loader checks before the forward pass starts,
+/// and `dequantize_row` panics on anything else, so the two have to list the
+/// same types. A type that passed the first and not the second would be a panic
+/// in the middle of a run instead of an error at load.
+#[test]
+fn can_dequantize_lists_exactly_what_dequantize_row_handles() {
+    for ty in [
+        GgmlType::F32,
+        GgmlType::F16,
+        GgmlType::BF16,
+        GgmlType::Q4_K,
+        GgmlType::Q6_K,
+    ] {
+        assert!(llm_core::can_dequantize(ty), "{ty:?} should be accepted");
+    }
+    // Q8_0 has a matmul kernel but no dequantizer: nothing in the product path
+    // needs one, and the loader refuses such a file by name.
+    for ty in [GgmlType::Q8_0, GgmlType::Q5_K, GgmlType::Q4_0] {
+        assert!(!llm_core::can_dequantize(ty), "{ty:?} should be refused");
+    }
+}

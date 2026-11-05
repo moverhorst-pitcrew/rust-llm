@@ -310,6 +310,16 @@ exact. That is not something to take on trust, because it is silent when wrong:
 a unit test replays the reference's interleaved sector-to-axis selection and
 asserts no pair reaches the fourth axis.
 
+**The embedding lookup is the only place a weight becomes f32.** The row it
+wants is picked by a token id rather than dotted with anything, so it is the one
+caller of `dequantize_row`; everything else meets the quantized bytes with int8
+activations. That function knows five layouts and this model reaches one of
+them, so all five are checked in `crates/llm-core/tests/kernels.rs` against the
+independent scalar dequantizer the kernel tests already use, and the list it
+accepts is pinned to the list the loader validates against: a type that passed
+the loader's check and not the dequantizer's would be a panic in the middle of a
+run instead of an error at load.
+
 **Linear-attention block** (gated delta net). `attn_qkv` splits into q 16x128,
 k 16x128 and v 32x128, two value heads per key head; a value head reads its key
 head as `vh % n_k_heads`, which is the broadcast the reference does. The
