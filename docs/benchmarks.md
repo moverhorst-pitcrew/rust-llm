@@ -32,7 +32,7 @@ dynamically rather than splitting it equally up front.
 ## The commands
 
 ```sh
-export RUST_LLM_MODEL=/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf
+export RUST_LLM_MODEL=<path>/Qwen3.5-4B-heretic-Q4_K_M.gguf
 
 # throughput, median of repeats with the spread, per thread count
 rust-llm bench --context 1024 --threads 1,2,3,4,5,6,7,8 --prompt-tokens 19 \
@@ -153,20 +153,22 @@ measures now.
 
 ## llama.cpp on the same file, at matching thread counts
 
-Reference build: llama.cpp at commit `3259ab6`, binaries in
-`/paperclip/models/ref/llama.cpp/build/bin` with `LD_LIBRARY_PATH` pointing at
-that directory. Recipe in `docs/decisions.md` under "The reference harness". The
-same GGUF file, so quantization is out of the comparison.
+Reference build: llama.cpp at commit `3259ab6`, built outside this repository
+with the recipe in `docs/decisions.md` under "The reference harness". `$REF_BIN`
+below is its `build/bin`, which holds `llama-bench` next to the shared libraries
+it needs, so `LD_LIBRARY_PATH` has to point at that same directory. The model is
+the same GGUF file this runner reads, so quantization is out of the comparison.
 
 ```sh
-export LD_LIBRARY_PATH=/paperclip/models/ref/llama.cpp/build/bin
-M=/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf
+REF_BIN=$REF_DIR/llama.cpp/build/bin   # $REF_DIR as in "The reference harness"
+export LD_LIBRARY_PATH=$REF_BIN
+M=<path>/Qwen3.5-4B-heretic-Q4_K_M.gguf
 
 # flags matched to what this runner does: no weight repacking, no flash attention
-llama-bench -m $M -p 19 -n 16 -t 1,3,4,6,7,8 -r 3 --repack 0 -fa off
+$REF_BIN/llama-bench -m $M -p 19 -n 16 -t 1,3,4,6,7,8 -r 3 --repack 0 -fa off
 
 # the reference as it ships: repacking on, flash attention auto, f16 KV cache
-llama-bench -m $M -p 19 -n 16 -t 1,3,4,6,7,8 -r 3
+$REF_BIN/llama-bench -m $M -p 19 -n 16 -t 1,3,4,6,7,8 -r 3
 ```
 
 `-ctk f32 -ctv f32` is refused by `llama-bench` at this commit, so both
