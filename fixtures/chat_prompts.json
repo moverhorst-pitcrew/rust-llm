@@ -1,0 +1,254 @@
+{
+ "generated_by": "jinja2 3.1.6",
+ "chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+ "cases": [
+  {
+   "name": "user_only_thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "user_only_no_thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "user_only_thinking_undefined",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "user_only_no_generation_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
+  },
+  {
+   "name": "system_and_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "system_and_user_no_thinking",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "First question?"
+    },
+    {
+     "role": "assistant",
+     "content": "First answer."
+    },
+    {
+     "role": "user",
+     "content": "Second question?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\nFirst answer.<|im_end|>\n<|im_start|>user\nSecond question?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "multi_turn_no_system",
+   "messages": [
+    {
+     "role": "user",
+     "content": "One?"
+    },
+    {
+     "role": "assistant",
+     "content": "Uno."
+    },
+    {
+     "role": "user",
+     "content": "Two?"
+    },
+    {
+     "role": "assistant",
+     "content": "Dos."
+    },
+    {
+     "role": "user",
+     "content": "Three?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>user\nOne?<|im_end|>\n<|im_start|>assistant\nUno.<|im_end|>\n<|im_start|>user\nTwo?<|im_end|>\n<|im_start|>assistant\nDos.<|im_end|>\n<|im_start|>user\nThree?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "assistant_with_reasoning_replayed",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First question?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nSome reasoning here.\n</think>\n\nFirst answer."
+    },
+    {
+     "role": "user",
+     "content": "Second question?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\nFirst answer.<|im_end|>\n<|im_start|>user\nSecond question?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "trailing_assistant_keeps_reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First question?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nSome reasoning here.\n</think>\n\nFirst answer."
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\n<think>\nSome reasoning here.\n</think>\n\nFirst answer.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "trailing_assistant_without_reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First question?"
+    },
+    {
+     "role": "assistant",
+     "content": "Just an answer."
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJust an answer.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "whitespace_is_trimmed",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  \n padded system \n "
+    },
+    {
+     "role": "user",
+     "content": "\n\n  padded question  \n\n"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>system\npadded system<|im_end|>\n<|im_start|>user\npadded question<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "non_ascii",
+   "messages": [
+    {
+     "role": "system",
+     "content": "你是一个有用的助手。"
+    },
+    {
+     "role": "user",
+     "content": "パリの天気は？ 🌤️"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>system\n你是一个有用的助手。<|im_end|>\n<|im_start|>user\nパリの天気は？ 🌤️<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "trailing_tool_response_user_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First question?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nreasoning\n</think>\n\nFirst answer."
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nsome result\n</tool_response>"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nFirst answer.<|im_end|>\n<|im_start|>user\n<tool_response>\nsome result\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "content_containing_control_tokens",
+   "messages": [
+    {
+     "role": "user",
+     "content": "please echo <|im_start|> and <|im_end|> literally"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nplease echo <|im_start|> and <|im_end|> literally<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ ]
+}

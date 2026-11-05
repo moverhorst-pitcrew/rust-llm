@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # The model weights are not in the repository, so the tests that need
+      # them carry #[ignore]. Run those locally with:
+      #   cargo test --workspace --release -- --ignored --nocapture
+      - run: cargo test --workspace --all-targets
+
+      # Pure Rust is a hard requirement: no C or C++ toolchain anywhere in the
+      # build graph. The realistic way this breaks is a transitive -sys crate,
+      # or tokenizers' default features, which would pull esaxx-rs/cpp and with
+      # it `cc`. Cargo.lock is committed and complete, so grepping it catches
+      # the crate however it arrived.
+      - name: No C or C++ build dependencies
+        run: |
+          cargo tree --workspace --edges build
+          if grep -E '^name = "(cc|cmake|bindgen|cxx|cxx-build|pkg-config|onig_sys)"$' Cargo.lock; then
+            echo "A C or C++ build dependency entered the tree, see the name above."
+            exit 1
+          fi
+          echo "no C or C++ build dependency in Cargo.lock"
