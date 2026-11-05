@@ -602,15 +602,6 @@ fn bench(
     load: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let generate = args.max_tokens.unwrap_or(16);
-    let full = tokenizer.encode(bench::FILLER, true)?;
-    if args.prompt_tokens > full.len() {
-        return Err(format!(
-            "--prompt-tokens {} is more than the {} tokens of the fixed bench text",
-            args.prompt_tokens,
-            full.len()
-        )
-        .into());
-    }
     if args.prompt_tokens + generate > args.context {
         return Err(format!(
             "prompt {} plus {generate} generated tokens does not fit a context of {}",
@@ -618,7 +609,8 @@ fn bench(
         )
         .into());
     }
-    let prompt = &full[..args.prompt_tokens];
+    let prompt = bench_prompt(tokenizer, args.prompt_tokens)?;
+    let prompt = &prompt[..];
 
     eprintln!(
         "model {} ({} blocks), loaded in {:.2}s",
@@ -651,8 +643,8 @@ fn profile(
     args: &Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let generate = args.max_tokens.unwrap_or(16);
-    let full = tokenizer.encode(bench::FILLER, true)?;
-    let prompt = &full[..args.prompt_tokens.min(full.len())];
+    let prompt = bench_prompt(tokenizer, args.prompt_tokens)?;
+    let prompt = &prompt[..];
     // The same check `bench` makes, and for the same reason: without it the
     // run ends in the forward pass's assert instead of saying what to change.
     if prompt.len() + generate > args.context {
@@ -694,6 +686,30 @@ fn profile(
     println!();
     print!("{}", runner.profile_report("generation", generate));
     Ok(())
+}
+
+/// Exactly `n` tokens of the fixed bench text, repeated if `n` is more than it
+/// holds.
+///
+/// Repeating rather than refusing, because the long-context configurations
+/// need a prompt that fills the context and the measurement does not care what
+/// the text says: what matters is that two runs read the same `n` tokens, so
+/// the work being compared is the same. The copies are joined with a space, so
+/// a copy boundary is an ordinary word boundary rather than a token that exists
+/// nowhere else in the text.
+fn bench_prompt(tokenizer: &Tokenizer, n: usize) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let mut ids = tokenizer.encode(bench::FILLER, true)?;
+    if n > ids.len() {
+        let copies = n.div_ceil(ids.len());
+        ids = tokenizer.encode(&vec![bench::FILLER; copies].join(" "), true)?;
+    }
+    assert!(
+        ids.len() >= n,
+        "{n} tokens asked for, the repeated bench text gives {}",
+        ids.len()
+    );
+    ids.truncate(n);
+    Ok(ids)
 }
 
 /// `4` or `1,2,3,4`: one thread count for `run`, a sweep for `bench`.
