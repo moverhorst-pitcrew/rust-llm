@@ -241,10 +241,13 @@ struct Buffers {
     z: Vec<f32>,
     conv: Vec<f32>,
     heads: Vec<f32>,
-    /// The delta net's readout, head-major (`[value head][token][d_state]`),
-    /// because one value head owns one recurrent state and runs the whole
-    /// batch over it; the gated norm transposes it into `heads`.
-    dn: Vec<f32>,
+    /// Per-head output, head-major (`[head][token][head width]`), because a
+    /// head owns its whole batch: a value head owns one recurrent state and an
+    /// attention head owns one walk over the KV cache, and neither can be split
+    /// over the tokens. The gate that follows transposes it into `heads`.
+    /// Both block kinds use it and they are never live at once; the two widths
+    /// are the same, `d_inner` and `head_dim * n_head` both being 4096 here.
+    head_major: Vec<f32>,
     scores: Vec<f32>,
     ffn_a: Vec<f32>,
     ffn_b: Vec<f32>,
@@ -316,7 +319,7 @@ impl<'a> Runner<'a> {
                 z: vec![0.0; b * c.d_inner],
                 conv: vec![0.0; b * c.conv_dim()],
                 heads: vec![0.0; b * c.attn_dim().max(c.d_inner)],
-                dn: vec![0.0; b * c.d_inner],
+                head_major: vec![0.0; b * c.d_inner.max(c.attn_dim())],
                 scores: vec![0.0; b * c.n_head * context],
                 ffn_a: vec![0.0; b * c.n_ff],
                 ffn_b: vec![0.0; b * c.n_ff],
@@ -721,6 +724,7 @@ impl Exec<'_, '_> {
             kb,
             vb,
             heads,
+            head_major,
             scores,
             ..
         } = bufs;
@@ -775,23 +779,27 @@ impl Exec<'_, '_> {
         let at = self.profile.start();
         let scale = 1.0 / (hd as f32).sqrt();
         let qg = &*qg;
-        // One chunk per (token, head): chunk `i * n_head + h` owns the output
-        // at `i * attn_dim + h * hd`, which is where it lands in a token-major
-        // buffer, and its own score row.
+        // One chunk per head, holding that head's whole batch: the batch walks
+        // the same keys and values, so what the chunk owns is one walk over
+        // them. The output comes out head-major and the gate below transposes
+        // it.
         self.pool.chunks(
-            &mut heads[..t * attn_dim],
-            hd,
-            &mut scores[..t * n_head * context],
-            context,
-            |chunk, out, scores| {
-                let (i, h) = (chunk / n_head, chunk % n_head);
+            &mut head_major[..n_head * t * hd],
+            t * hd,
+            &mut scores[..n_head * t * context],
+            t * context,
+            |h, out, scores| {
                 let kh = h / group;
-                attend(
-                    &qg[i * qg_dim + h * 2 * hd..][..hd],
+                attend_batch(
+                    &qg[h * 2 * hd..],
+                    qg_dim,
                     &k_cache[kh * context * hd..],
                     &v_cache[kh * context * hd..],
-                    pos + i + 1,
+                    t,
+                    pos,
+                    hd,
                     scale,
+                    context,
                     scores,
                     out,
                 );
@@ -799,14 +807,16 @@ impl Exec<'_, '_> {
         );
         self.profile.add(Op::Attention, at);
         self.tracer
-            .node("attn_pregate", Some(il), &heads[..t * attn_dim]);
+            .node("attn_pregate", Some(il), &head_major[..t * attn_dim]);
 
         let at = self.profile.start();
         for i in 0..t {
             for h in 0..n_head {
                 let gate = &qg[i * qg_dim + h * 2 * hd + hd..][..hd];
-                for (o, &g) in heads[i * attn_dim + h * hd..][..hd].iter_mut().zip(gate) {
-                    *o *= sigmoid(g);
+                let from = &head_major[(h * t + i) * hd..][..hd];
+                let into = &mut heads[i * attn_dim + h * hd..][..hd];
+                for ((o, &g), &a) in into.iter_mut().zip(gate).zip(from) {
+                    *o = a * sigmoid(g);
                 }
             }
         }
@@ -851,7 +861,7 @@ impl Exec<'_, '_> {
             z,
             conv,
             heads,
-            dn,
+            head_major,
             decay,
             beta,
             ..
@@ -931,7 +941,7 @@ impl Exec<'_, '_> {
         // readout therefore comes out head-major and is transposed by the
         // gated norm below.
         self.pool.chunks(
-            &mut dn[..n_vh * t * s],
+            &mut head_major[..n_vh * t * s],
             t * s,
             ssm_state,
             s * s,
@@ -972,7 +982,7 @@ impl Exec<'_, '_> {
         // what `trace` runs, so this node is still the vector the reference
         // prints.
         self.tracer
-            .node("attn_output", Some(il), &dn[..t * d_inner]);
+            .node("attn_output", Some(il), &head_major[..t * d_inner]);
 
         // The gated norm: RMSNorm per value head, then the sigmoid-linear
         // gate. This is also where the readout turns from head-major into the
@@ -981,7 +991,7 @@ impl Exec<'_, '_> {
         for i in 0..t {
             for h in 0..n_vh {
                 let head = &mut heads[i * d_inner + h * s..][..s];
-                rms_norm(&dn[(h * t + i) * s..][..s], b.norm, c.rms_eps, head);
+                rms_norm(&head_major[(h * t + i) * s..][..s], b.norm, c.rms_eps, head);
                 for (o, &g) in head.iter_mut().zip(&z[i * d_inner + h * s..][..s]) {
                     *o *= silu(g);
                 }
@@ -1069,33 +1079,80 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(&x, &y)| x * y).sum()
 }
 
-/// One query head against `n_kv` cached positions: scores, softmax, and the
-/// weighted sum of the values.
+/// Positions a tile of the KV walk covers.
 ///
-/// `k` and `v` are this KV head's whole span of the cache, position-major, so
-/// both loops walk them forwards. `scores` is scratch for one row, which is why
-/// this is two passes over the cache rather than one; the tiled alternative
-/// that needs no score row was measured and is not here, see
-/// `docs/benchmarks.md` under "Flash-style attention, measured and not kept".
-fn attend(
+/// A tile of keys is `TILE * head_dim` floats, 128 KiB at this model's head
+/// dimension of 256, so a tile of keys and the tile of values that follows it
+/// both fit a core's 2 MiB L2 several times over while every query of the batch
+/// goes over them.
+const TILE: usize = 128;
+
+/// One head's batch of `t` queries against the KV cache, tiled over the cached
+/// positions.
+///
+/// `q` starts at this head's query inside the first token's projection and
+/// `q_stride` steps to the next token's; `k` and `v` are this KV head's whole
+/// span of the cache, position-major, and `row` is the stride of a score row.
+/// Query `i` is the token at position `pos + i` and attends over `pos + i + 1`
+/// positions: everything already cached plus the batch up to and including
+/// itself. That is the causal mask, and it is a bound on the loops rather than
+/// a masking step.
+///
+/// The tiling is the point. A head's span of the cache is 8 MiB at a context of
+/// 4096, so it does not sit in the shared 36 MiB L3 next to the seven other
+/// heads being computed at the same time, and a batch that walked it per token
+/// read it from memory `t` times over. Tiled, the tile is read once for the
+/// whole batch.
+///
+/// What is *not* here is the running maximum and running sum of a flash-style
+/// attention. The score rows stay materialised, one per query, and that is a
+/// deliberate choice measured in `docs/benchmarks.md`: a row is 16 KiB at a
+/// context of 4096, it never leaves L2, and keeping it means the softmax still
+/// sees the whole row at once. An incremental softmax would be a different
+/// rounding of the one operator the correctness gate is most sensitive to, for
+/// no measured gain.
+#[allow(clippy::too_many_arguments)]
+fn attend_batch(
     q: &[f32],
+    q_stride: usize,
     k: &[f32],
     v: &[f32],
-    n_kv: usize,
+    t: usize,
+    pos: usize,
+    hd: usize,
     scale: f32,
+    row: usize,
     scores: &mut [f32],
     out: &mut [f32],
 ) {
-    let hd = q.len();
-    let scores = &mut scores[..n_kv];
-    for (p, s) in scores.iter_mut().enumerate() {
-        *s = dot(q, &k[p * hd..][..hd]) * scale;
+    // The last query of the batch has the longest row; every other one stops
+    // earlier, which is the mask.
+    let n_kv = pos + t;
+    for base in (0..n_kv).step_by(TILE) {
+        let tile = (base + TILE).min(n_kv);
+        for i in 0..t {
+            let upto = tile.min(pos + i + 1);
+            let q = &q[i * q_stride..][..hd];
+            for p in base..upto {
+                scores[i * row + p] = dot(q, &k[p * hd..][..hd]) * scale;
+            }
+        }
     }
-    softmax(scores);
-    out.fill(0.0);
-    for (p, &w) in scores.iter().enumerate() {
-        for (o, &vd) in out.iter_mut().zip(&v[p * hd..][..hd]) {
-            *o += w * vd;
+    for i in 0..t {
+        softmax(&mut scores[i * row..][..pos + i + 1]);
+    }
+    out[..t * hd].fill(0.0);
+    for base in (0..n_kv).step_by(TILE) {
+        let tile = (base + TILE).min(n_kv);
+        for i in 0..t {
+            let upto = tile.min(pos + i + 1);
+            let out = &mut out[i * hd..][..hd];
+            for p in base..upto {
+                let w = scores[i * row + p];
+                for (o, &vd) in out.iter_mut().zip(&v[p * hd..][..hd]) {
+                    *o += w * vd;
+                }
+            }
         }
     }
 }
@@ -1160,6 +1217,179 @@ fn depthwise_conv(x: &[f32], w: &[f32], kernel: usize, state: &mut [f32], out: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Attention written the straightforward way, as the tiled version in the
+    /// product is checked against.
+    ///
+    /// One query, one pass over the keys into a score row, one softmax, one
+    /// pass over the values. This is what [`attend_batch`] has to agree with,
+    /// and it lives here rather than in the pass for the same reason the
+    /// scalar dequantizer lives in the kernel tests: a reference that shares
+    /// the tiling and the loop order of the thing it checks would only assert
+    /// that the code agrees with itself.
+    fn attend(q: &[f32], k: &[f32], v: &[f32], n_kv: usize, scale: f32, out: &mut [f32]) {
+        let hd = q.len();
+        let mut scores = vec![0.0f32; n_kv];
+        for (p, s) in scores.iter_mut().enumerate() {
+            *s = dot(q, &k[p * hd..][..hd]) * scale;
+        }
+        softmax(&mut scores);
+        out.fill(0.0);
+        for (p, &w) in scores.iter().enumerate() {
+            for (o, &vd) in out.iter_mut().zip(&v[p * hd..][..hd]) {
+                *o += w * vd;
+            }
+        }
+    }
+
+    /// xorshift64*, so a failure is reproducible from its seed.
+    fn noise(seed: u64) -> impl FnMut() -> f32 {
+        let mut x = seed | 1;
+        move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            // 23 bits mapped onto [-1, 1), so a dot over 256 of them lands in
+            // the range the real q and k reach after their per-head norm.
+            ((x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 41) as f32 / 4_194_304.0) - 1.0
+        }
+    }
+
+    /// The tiled walk over the KV cache has to give what one query at a time
+    /// gives, **bit for bit**: the same dots, the same softmax over the whole
+    /// row, and the value sum accumulated in ascending position.
+    ///
+    /// A tolerance would be the wrong check. This model's output is
+    /// discontinuous in the arithmetic, so a difference too small to see in an
+    /// attention output is one flipped int8 level away from a different token,
+    /// which is why the tiling deliberately keeps the score rows instead of
+    /// running the softmax incrementally.
+    ///
+    /// The shapes are the ones that can go wrong: the model's own GQA grouping
+    /// (16 query heads over 4 KV heads, head dim 256), a short context and a
+    /// long one, a batch and a single token, a cache that is not a multiple of
+    /// the tile size, and positions that make the causal bound land inside a
+    /// tile as well as on its edge.
+    #[test]
+    fn the_tiled_attention_matches_one_query_at_a_time() {
+        let (hd, n_head, n_kv_head) = (256, 16, 4);
+        let group = n_head / n_kv_head;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut rand = noise(0x5eed_a77e);
+        // (positions already cached, tokens in the batch); the context is
+        // whatever those need, and the cases straddle TILE = 128 both in the
+        // cache length and in where the causal bound falls.
+        let cases = [
+            (0usize, 1usize),
+            (0, 5),
+            (1, 1),
+            (7, 3),
+            (TILE - 1, 1),
+            (TILE, 1),
+            (TILE - 2, 5),
+            (TILE + 1, 4),
+            (2 * TILE, 16),
+            (3 * TILE - 3, 9),
+            (1000, 16),
+        ];
+        for (pos, t) in cases {
+            let context = pos + t;
+            let q: Vec<f32> = (0..t * n_head * 2 * hd).map(|_| rand()).collect();
+            let k: Vec<f32> = (0..n_kv_head * context * hd).map(|_| rand()).collect();
+            let v: Vec<f32> = (0..n_kv_head * context * hd).map(|_| rand()).collect();
+            let mut scores = vec![0.0f32; t * context];
+            let mut tiled = vec![0.0f32; t * hd];
+            let mut plain = vec![0.0f32; hd];
+            for h in 0..n_head {
+                let kh = h / group;
+                attend_batch(
+                    &q[h * 2 * hd..],
+                    n_head * 2 * hd,
+                    &k[kh * context * hd..],
+                    &v[kh * context * hd..],
+                    t,
+                    pos,
+                    hd,
+                    scale,
+                    context,
+                    &mut scores,
+                    &mut tiled,
+                );
+                for i in 0..t {
+                    attend(
+                        &q[i * n_head * 2 * hd + h * 2 * hd..][..hd],
+                        &k[kh * context * hd..],
+                        &v[kh * context * hd..],
+                        pos + i + 1,
+                        scale,
+                        &mut plain,
+                    );
+                    assert_eq!(
+                        &tiled[i * hd..(i + 1) * hd],
+                        &plain[..],
+                        "pos {pos} t {t} head {h} token {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The causal bound is the whole mask, so a query must not be able to see a
+    /// position after its own: changing a later key or value cannot change an
+    /// earlier token's output.
+    #[test]
+    fn a_token_cannot_see_the_tokens_after_it() {
+        let (hd, t, pos) = (256, 8, TILE + 5);
+        let context = pos + t;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut rand = noise(0xca05_a1);
+        let q: Vec<f32> = (0..t * hd).map(|_| rand()).collect();
+        let k: Vec<f32> = (0..context * hd).map(|_| rand()).collect();
+        let mut v: Vec<f32> = (0..context * hd).map(|_| rand()).collect();
+        let mut scores = vec![0.0f32; t * context];
+        let mut before = vec![0.0f32; t * hd];
+        attend_batch(
+            &q,
+            hd,
+            &k,
+            &v,
+            t,
+            pos,
+            hd,
+            scale,
+            context,
+            &mut scores,
+            &mut before,
+        );
+        // The last token's value row: only the last token reads it.
+        for x in v[(context - 1) * hd..].iter_mut() {
+            *x += 10.0;
+        }
+        let mut after = vec![0.0f32; t * hd];
+        attend_batch(
+            &q,
+            hd,
+            &k,
+            &v,
+            t,
+            pos,
+            hd,
+            scale,
+            context,
+            &mut scores,
+            &mut after,
+        );
+        assert_eq!(
+            before[..(t - 1) * hd],
+            after[..(t - 1) * hd],
+            "a token saw the value of a position after it"
+        );
+        assert_ne!(
+            before[(t - 1) * hd..],
+            after[(t - 1) * hd..],
+            "the last token did not read the last position"
+        );
+    }
 
     /// The mrope section layout this file carries picks one of the first three
     /// position axes for every rotated dimension pair and never the fourth.
