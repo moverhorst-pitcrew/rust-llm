@@ -57,3 +57,38 @@ Deliberately not taken:
 - **`rayon`** is not here yet. Threading lands with the forward pass, where
   there is something to parallelise over.
 - **`bytemuck`**. Three `from_le_bytes` calls and one checked pointer cast.
+
+## GGUF loader
+
+**Weights stay in the map.** The header, metadata and tensor index are parsed
+into owned structures; tensor bytes are never copied. `Gguf::tensor` returns a
+slice borrowed from the map, and the kernels read the quantized bytes in place.
+Opening the 2.7 GB file costs about 52 MB of resident memory, essentially all
+of it the 248320-token vocabulary and the 247587 merges, which is 2% of the
+file.
+
+**No self-referential struct.** `Gguf` owns the `Mmap` and stores byte offsets,
+not slices; `tensor()` resolves an offset against `&self.mmap` on each call.
+This is why there is no lifetime parameter on `Gguf`, no `Pin`, and no
+owning-reference crate.
+
+**Metadata arrays hold `Value`s, including nested arrays.** GGUF allows an
+array of arrays, so a parallel element-type enum would have to recurse anyway.
+The cost is the enum tag per element, about 16 MB on the vocabulary, which is
+noise against a 2.7 GB model and is paid once at load.
+
+**The block count comes out of the tensors, not out of `block_count`.** In this
+conversion `qwen35.block_count` is 33 while `blk.32` does not exist, because
+the MTP block was stripped. `qwen35::layer_plan` takes
+`block_count - nextn_predict_layers` and then requires every block it implies
+to be present, so a file that really is missing a block fails with the name of
+the missing tensor instead of producing a 31-block model.
+
+**Layer typing comes from `qwen35.attention.recurrent_layers`.** Deriving it
+from `full_attention_interval` would be arithmetic that happens to agree with
+this file.
+
+**The loader validates, the kernels assume.** Bounds, alignment, block-aligned
+row lengths and unknown type tags are all rejected at open time with an error
+that names the tensor. After that the kernels index without re-checking, which
+is what keeps the hot loop free of branches that cannot fire.
