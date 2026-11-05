@@ -260,6 +260,57 @@ fn temperature_zero_is_argmax() {
     assert_eq!(sampler.sample(&dead), 0, "a drawing sampler on all -inf");
 }
 
+/// Nothing sorts unless top-p needs the order.
+///
+/// The partial selection leaves the candidates in whatever order it happened to
+/// partition them into, so a candidate set that comes back descending is a
+/// sort that ran. Over a thousand random logits the chance of twenty of them
+/// landing in order by accident is one in twenty factorial, and the logits here
+/// are fixed, so this is a test and not a coin toss. It is the cheap guard
+/// against the one change that would quietly cost six milliseconds a token.
+#[test]
+fn the_candidates_are_only_ordered_where_the_order_is_used() {
+    let l = logits(1024, 44, 3.0);
+    let base = Sampling {
+        temperature: 1.0,
+        top_k: 20,
+        top_p: 1.0,
+        min_p: 0.0,
+        repeat_penalty: 1.0,
+        repeat_last_n: 0,
+        seed: 1,
+    };
+
+    let mut off = Sampler::new(l.len(), base);
+    off.sample(&l);
+    let (ids, _) = off.candidates();
+    let values: Vec<f32> = ids.iter().map(|&id| l[id as usize]).collect();
+    assert_eq!(values.len(), 20);
+    assert!(
+        values.windows(2).any(|w| w[0] < w[1]),
+        "with top-p off the candidates came back in descending order, so \
+         something sorted them: {values:?}"
+    );
+
+    // And with top-p on they have to be ordered, because the cut is a prefix
+    // of that order.
+    let mut on = Sampler::new(
+        l.len(),
+        Sampling {
+            top_p: 0.999,
+            ..base
+        },
+    );
+    on.sample(&l);
+    let (ids, probs) = on.candidates();
+    let values: Vec<f32> = ids.iter().map(|&id| l[id as usize]).collect();
+    assert!(
+        values.windows(2).all(|w| w[0] >= w[1]),
+        "top-p cut a prefix of an unordered candidate set: {values:?}"
+    );
+    assert!(probs.windows(2).all(|w| w[0] >= w[1]));
+}
+
 /// Greedy has to be byte-identical to what the gate recorded, so the penalty
 /// being off must leave the logits completely untouched.
 #[test]
