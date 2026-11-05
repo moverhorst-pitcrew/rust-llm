@@ -17,7 +17,7 @@ use llm_core::quant::Activations;
 use llm_core::{Kernels, TensorView};
 
 use crate::model::{Attn, Config, FullBlock, LinearBlock, Model};
-use crate::pool::Pool;
+use crate::pool::{Matvec, Pool};
 
 /// Per-layer activations for the reference comparison, off unless asked for.
 ///
@@ -100,23 +100,20 @@ pub struct Profile {
 #[repr(usize)]
 pub enum Op {
     Embed,
-    /// Full block: the fused query-and-gate projection.
-    Qg,
-    K,
-    V,
+    /// Full block: the query-and-gate, key and value projections, one job.
+    FullQkv,
     AttnOut,
     /// Scores, softmax and the weighted sum over the KV cache.
     Attention,
-    /// Linear block: the q/k/v projection the convolution reads.
-    Qkv,
-    /// Linear block: the output gate, `alpha` and `beta` projections.
-    Zab,
+    /// Linear block: the q/k/v projection the convolution reads together with
+    /// the output gate, `alpha` and `beta`, one job.
+    LinearQkv,
     Conv,
     /// The delta-rule recurrence over the per-head state.
     DeltaNet,
     LinearOut,
-    FfnGate,
-    FfnUp,
+    /// The feed-forward gate and up projections, one job.
+    FfnGateUp,
     FfnDown,
     /// The output head over the tied embedding table.
     Head,
@@ -127,21 +124,17 @@ pub enum Op {
 }
 
 impl Op {
-    const COUNT: usize = 17;
+    const COUNT: usize = 13;
     const ALL: [Op; Op::COUNT] = [
         Op::Embed,
-        Op::Qg,
-        Op::K,
-        Op::V,
+        Op::FullQkv,
         Op::AttnOut,
         Op::Attention,
-        Op::Qkv,
-        Op::Zab,
+        Op::LinearQkv,
         Op::Conv,
         Op::DeltaNet,
         Op::LinearOut,
-        Op::FfnGate,
-        Op::FfnUp,
+        Op::FfnGateUp,
         Op::FfnDown,
         Op::Head,
         Op::Norms,
@@ -151,18 +144,14 @@ impl Op {
     fn label(self) -> &'static str {
         match self {
             Op::Embed => "embed",
-            Op::Qg => "full: qg matmul",
-            Op::K => "full: k matmul",
-            Op::V => "full: v matmul",
+            Op::FullQkv => "full: qg, k and v matmul",
             Op::AttnOut => "full: output matmul",
             Op::Attention => "full: attention",
-            Op::Qkv => "linear: qkv matmul",
-            Op::Zab => "linear: gate/alpha/beta matmul",
+            Op::LinearQkv => "linear: qkv, gate, alpha, beta matmul",
             Op::Conv => "linear: convolution",
             Op::DeltaNet => "linear: delta-net recurrence",
             Op::LinearOut => "linear: output matmul",
-            Op::FfnGate => "ffn: gate matmul",
-            Op::FfnUp => "ffn: up matmul",
+            Op::FfnGateUp => "ffn: gate and up matmul",
             Op::FfnDown => "ffn: down matmul",
             Op::Head => "output head matmul",
             Op::Norms => "norms and rope",
@@ -532,12 +521,36 @@ impl Exec<'_, '_> {
 
     /// `out = W x`, with the rows of `W` split over the pool.
     fn matmul(&mut self, op: Op, w: &TensorView<'_>, x: &[f32], out: &mut [f32]) {
-        debug_assert_eq!(w.dims[0] as usize, x.len());
-        debug_assert_eq!(w.dims[1] as usize, out.len());
+        self.matmul_group(op, x, [(w, out)]);
+    }
+
+    /// Several projections of the same input, as one job and one activation
+    /// quantization.
+    ///
+    /// Every weight here has to read `x`, which is what makes the grouping
+    /// free: the rows of the group are one range for the split to divide, so
+    /// this is one pair of barriers where the separate matmuls were `N`, and
+    /// the activations are quantized once. It changes no result, because a row
+    /// is still one worker's work from start to finish.
+    fn matmul_group<const N: usize>(
+        &mut self,
+        op: Op,
+        x: &[f32],
+        group: [(&TensorView<'_>, &mut [f32]); N],
+    ) {
         let at = self.profile.start();
         self.acts.quantize(x);
+        let group = group.map(|(w, out)| {
+            debug_assert_eq!(w.dims[0] as usize, x.len());
+            debug_assert_eq!(w.dims[1] as usize, out.len());
+            Matvec {
+                ty: w.ty,
+                w: w.data,
+                out,
+            }
+        });
         self.pool
-            .matvec(&self.model.kernels, w.ty, w.data, x.len(), self.acts, out)
+            .matvec_group(&self.model.kernels, x.len(), self.acts, group)
             .expect("every weight type was checked when the model loaded");
         self.profile.add(op, at);
     }
@@ -551,9 +564,12 @@ impl Exec<'_, '_> {
             ffn_b,
             ..
         } = bufs;
-        self.matmul(Op::FfnGate, &block.ffn_gate, xn, ffn_a);
+        self.matmul_group(
+            Op::FfnGateUp,
+            xn,
+            [(&block.ffn_gate, &mut ffn_a[..]), (&block.ffn_up, ffn_b)],
+        );
         self.tracer.node("ffn_gate", Some(il), ffn_a);
-        self.matmul(Op::FfnUp, &block.ffn_up, xn, ffn_b);
         self.tracer.node("ffn_up", Some(il), ffn_b);
         let at = self.profile.start();
         for (a, b) in ffn_a.iter_mut().zip(&*ffn_b) {
@@ -592,11 +608,13 @@ impl Exec<'_, '_> {
         } = bufs;
         let qg = &mut qkv[..c.qg_dim()];
 
-        self.matmul(Op::Qg, &b.qg, xn, qg);
+        self.matmul_group(
+            Op::FullQkv,
+            xn,
+            [(&b.qg, qg), (&b.v, &mut vb[..]), (&b.k, &mut kb[..])],
+        );
         self.tracer.node("Qcur_full", Some(il), qg);
-        self.matmul(Op::V, &b.v, xn, vb);
         self.tracer.node("Vcur", Some(il), vb);
-        self.matmul(Op::K, &b.k, xn, kb);
         self.tracer.node("Kcur", Some(il), kb);
 
         // The query occupies the first half of each head's slice of `attn_q`
@@ -699,12 +717,18 @@ impl Exec<'_, '_> {
         } = bufs;
         let qkv = &mut qkv[..c.conv_dim()];
 
-        self.matmul(Op::Qkv, &b.qkv, xn, qkv);
+        self.matmul_group(
+            Op::LinearQkv,
+            xn,
+            [
+                (&b.qkv, qkv),
+                (&b.gate, &mut z[..]),
+                (&b.alpha, &mut decay[..]),
+                (&b.beta, &mut beta[..]),
+            ],
+        );
         self.tracer.node("linear_attn_qkv_mixed", Some(il), qkv);
-        self.matmul(Op::Zab, &b.gate, xn, z);
         self.tracer.node("z", Some(il), z);
-
-        self.matmul(Op::Zab, &b.alpha, xn, decay);
         self.tracer.node("alpha", Some(il), decay);
         let at = self.profile.start();
         for (d, (&bias, &a)) in decay.iter_mut().zip(b.dt_bias.iter().zip(b.a)) {
@@ -715,7 +739,6 @@ impl Exec<'_, '_> {
         self.profile.add(Op::Elementwise, at);
         self.tracer.node("gate", Some(il), decay);
 
-        self.matmul(Op::Zab, &b.beta, xn, beta);
         let at = self.profile.start();
         for v in beta.iter_mut() {
             *v = sigmoid(*v);

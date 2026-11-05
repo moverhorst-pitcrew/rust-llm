@@ -178,9 +178,6 @@ impl Pool {
 
     /// `out[r] = row_r . a` for a `[k, out.len()]` quantized weight tensor,
     /// with the rows split between the threads.
-    ///
-    /// The kernel is looked up once here rather than inside the loop, and an
-    /// unsupported type is refused before any thread starts.
     pub fn matvec(
         &self,
         kernels: &Kernels,
@@ -190,21 +187,63 @@ impl Pool {
         a: &Activations,
         out: &mut [f32],
     ) -> Result<(), KernelError> {
-        kernels.vec_dot(ty)?;
-        let stride = ty.bytes_for(k as u64).expect("row size fits in a u64") as usize;
-        let rows = out.len();
-        let out = Scatter::new(out);
+        self.matvec_group(kernels, k, a, [Matvec { ty, w, out }])
+    }
+
+    /// Several matvecs that read the same activations, as **one** job over the
+    /// rows of all of them.
+    ///
+    /// This is a barrier count, not a kernel change. A job costs two barriers
+    /// and, under a CPU quota, the wait for whichever worker the scheduler
+    /// gets around to last; the forward pass has groups of projections that
+    /// read the same normalised input, and run as separate jobs they pay that
+    /// twice, three times or four times for no reason. The rows of the group
+    /// are one range that the split divides, so a group of a 8192-row tensor
+    /// and two 32-row ones also balances, which three separate jobs could not.
+    ///
+    /// The result does not depend on the grouping or on the thread count: an
+    /// output row is still computed by exactly one worker from start to
+    /// finish, over the same activations, which are quantized once here
+    /// instead of once per tensor.
+    ///
+    /// The kernels are looked up before any thread starts, so an unsupported
+    /// type is an error rather than a panic inside a job.
+    pub fn matvec_group<const N: usize>(
+        &self,
+        kernels: &Kernels,
+        k: usize,
+        a: &Activations,
+        group: [Matvec<'_>; N],
+    ) -> Result<(), KernelError> {
+        for m in &group {
+            kernels.vec_dot(m.ty)?;
+        }
+        let parts = group.map(|m| Part {
+            ty: m.ty,
+            w: m.w,
+            stride: m.ty.bytes_for(k as u64).expect("row size fits in a u64") as usize,
+            rows: m.out.len(),
+            out: Scatter::new(m.out),
+        });
+        let total: usize = parts.iter().map(|p| p.rows).sum();
+        let parts = &parts;
         self.run(&|ith, nth| {
-            let (lo, hi) = split(rows, ith, nth);
-            if lo == hi {
-                return;
+            let (lo, hi) = split(total, ith, nth);
+            let mut base = 0;
+            for p in parts {
+                let (from, to) = (lo.max(base), hi.min(base + p.rows));
+                if from < to {
+                    let (at, len) = (from - base, to - from);
+                    // SAFETY: the ranges `split` hands out are disjoint, and
+                    // every part has its own output slice, so no two threads
+                    // write the same rows.
+                    let chunk = unsafe { p.out.at(at, len) };
+                    kernels
+                        .matvec(p.ty, &p.w[at * p.stride..], k, a, chunk)
+                        .expect("the kernel was resolved before the threads started");
+                }
+                base += p.rows;
             }
-            // SAFETY: the ranges `split` hands out are disjoint, so no two
-            // threads write the same rows.
-            let chunk = unsafe { out.at(lo, hi - lo) };
-            kernels
-                .matvec(ty, &w[lo * stride..], k, a, chunk)
-                .expect("the kernel was resolved before the threads started");
         });
         Ok(())
     }
@@ -297,6 +336,22 @@ fn worker(shared: &Shared, ith: usize, nth: usize) {
         }
         shared.end.wait();
     }
+}
+
+/// One matvec of a group: a quantized weight tensor and where its rows go.
+pub struct Matvec<'a> {
+    pub ty: GgmlType,
+    pub w: &'a [u8],
+    pub out: &'a mut [f32],
+}
+
+/// A [`Matvec`] as the workers see it, with the output handed out by range.
+struct Part<'a> {
+    ty: GgmlType,
+    w: &'a [u8],
+    stride: usize,
+    rows: usize,
+    out: Scatter,
 }
 
 /// A `&mut [f32]` several threads may split between them.
