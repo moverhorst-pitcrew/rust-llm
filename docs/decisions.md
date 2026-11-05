@@ -401,3 +401,74 @@ whatever the token count, the output vector and the copy of the stop-token set,
 both before the loop starts. It is one test and not two because the counter is
 global and a second test in the harness's thread pool would be charged to the
 same window.
+
+## Sampling and the CLI
+
+Greedy argmax and nothing else; a temperature, top-k or top-p surface is a
+separate change, and putting the hooks in now would be an interface with one
+implementation. Ties go to the lowest token id, which matters only for
+reproducibility.
+
+`rust-llm run --prompt "..."` renders the chat template, streams tokens as they
+are produced and prints the timings and the peak RSS to stderr. `--model`,
+`--tokenizer`, `--system`, `--context`, `--threads`, `--max-tokens`,
+`--think/--no-think` and `--raw`. Arguments are parsed by hand: there are ten,
+they are all `--name value`, and a parser crate would be a dependency and a
+build-time cost for that shape.
+
+A streamed token is decoded on its own, so a multi-byte character split across
+two tokens comes out as a replacement character. When that happens the whole
+output is decoded again and printed after the stream, rather than buffering
+every token and streaming nothing.
+
+`rust-llm trace` runs the same pass with the activation tracer on and prints
+one node per line, which is the input to the reference comparison below.
+
+## Baseline numbers
+
+Qwen3.5-4B-heretic-Q4_K_M, `avx2+vnni`, this box (8 of 32 cores by cgroup
+quota, and shared with other work, so these wobble by 10 to 20 per cent):
+
+| | prompt tok/s | generation tok/s |
+| --- | --- | --- |
+| default context 4096, 384-token prompt, 8 threads | 6.68 | 3.90 |
+| default context 4096, 384-token prompt, 4 threads | 7.37 | 8.12 |
+| context 1024, 19-token prompt, 4 threads | 8.34 | 9.66 |
+
+Peak RSS at the default context of 4096 is **2.78 GiB** for the 384-token run
+above, and 2.75 GiB for a 13-token prompt. Of that, 2.52 GiB is the mapped
+model file, read through the mmap and resident because the output head reads
+the whole embedding table every token; about 190 MiB is the tokenizer's
+in-memory vocabulary (248044 entries and 247587 merges); 50 MiB is the
+recurrent state, which is written every token and therefore fully resident.
+
+The KV cache is the part that is *not* in there. `vec![0.0; n]` of that size
+comes from `mmap`, so its pages become resident as they are first written: the
+same run at a context of 256 instead of 4096 peaks 1.4 MiB lower, and the whole
+difference between the 13-token and the 384-token run is the 25 MiB of cache
+those extra positions touch. Raising `--context` therefore costs nothing until
+the positions are used.
+
+Prompt processing is no faster per token than generation, because the prompt
+goes through the same single-token path. That is the first thing to fix for
+throughput, not a measurement error.
+
+**The reference, measured properly, is in the same range**, and an earlier
+figure saying otherwise was wrong. `llama-completion` on the same file and the
+same box, same prompt, 8 generated tokens:
+
+| threads | 4 | 8 | 32 |
+| --- | --- | --- | --- |
+| reference generation tok/s | 2.89 | 8.12 | 0.10 |
+| this runner, same prompt | 9.99 | 7.08 | |
+
+The 0.10 at 32 threads is where "llama.cpp does 0.20 tok/s on this
+architecture" came from. It is not a property of llama.cpp or of this
+architecture, it is four times oversubscription against an eight-core cgroup
+quota, the same barrier effect that costs this runner half its speed at eight
+threads. Best against best, this runner is about 23 per cent ahead; at the same
+eight threads the reference is about 15 per cent ahead of it.
+
+So the reference is not a floor to walk over. The bar is memory bandwidth,
+which batch-1 generation hits by reading every weight once per token, and
+establishing where that bar actually is belongs to the throughput ticket.
