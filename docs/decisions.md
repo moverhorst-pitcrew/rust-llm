@@ -45,7 +45,7 @@ the wrong thing. `cargo bench` inherits this profile.
 | `half` | `f16` decoding for the ggml block scales. `f16` in `core` is still unstable, and hand-rolling the subnormal cases is a silent-wrongness risk for twenty saved lines. |
 | `thiserror` | Error enums with a `Display` that names the file, the key or the tensor. Derive only, nothing at runtime. |
 | `tokenizers` | See the tokenizer section. |
-| `serde_json` | Reads the committed test fixtures. Already in the tree through `tokenizers`. |
+| `serde_json` | Parses and builds the HTTP surface's bodies, and reads the committed test fixtures. Already in the tree through `tokenizers`. |
 
 Deliberately not taken:
 
@@ -605,6 +605,111 @@ missed every real case and fired on every character in U+F000..U+FFFF.
 `rust-llm trace` runs the same pass with the activation tracer on and prints
 one node per line, which is the input to the reference comparison below.
 
+`rust-llm serve` is the fourth command and has a section of its own below.
+
+## The HTTP surface
+
+`rust-llm serve` answers `POST /v1/chat/completions` and `POST /v1/completions`,
+streaming and not, in OpenAI's shapes, so anything that already speaks to an
+OpenAI endpoint speaks to this.
+
+**No HTTP crate and no async runtime.** There are two routes; a request is a
+line, a few headers and a JSON body that `serde_json` already parses, and the
+answer is a status line and a JSON body. What a framework would add on top of
+that is a dependency tree, and the one rule this project has is that there is no
+C or C++ anywhere in the build, which is a rule we have to keep checking rather
+than hope for. An executor buys nothing either: the forward pass is blocking and
+uses every core, so there is nothing to interleave it with. `crates/rust-llm/src/serve.rs`
+is the whole server, and the request reading in it is about sixty lines.
+
+**One request at a time, by having one accept loop.** Generation *is* the
+`Runner` and its KV cache and there is one of each, so the loop accepts a
+connection, answers it, and then accepts the next: a second client waits in the
+listener's backlog rather than being refused, and no lock is needed anywhere to
+say so. That is also all the hardware can do, since a single token already
+saturates the cores. The cost is that a connection holds the slot while it is
+being read, which is why a socket that goes quiet for 30 seconds is dropped, and
+why the request line, the headers and the body are all capped: the other end of
+a socket is not trusted to stop sending.
+
+**The caches are reset between requests.** Requests are independent and the
+previous one left its own conversation in the cache. A chat request also
+re-renders its whole conversation, for the reason the chat section above gives:
+the template drops the reasoning of earlier assistant turns, so turn N+1's
+tokens are not a prefix of turn N's and the cache could not be reused even if
+requests were related.
+
+**The command line is the defaults.** Every option `run` takes is the default
+for a request that does not send that field, and a request overrides the fields
+it sends and keeps the rest. Honoured:
+
+| field | |
+| --- | --- |
+| `messages` | the conversation, rendered through the model's chat template |
+| `prompt` | `/v1/completions` only, and it goes to the model verbatim, as `--raw` does |
+| `temperature`, `top_p`, `top_k`, `min_p` | the sampler, checked the way the flags are |
+| `repetition_penalty` | `--repeat-penalty`; the name vLLM and Qwen clients send |
+| `max_tokens` | `--max-tokens`, which is where the default of 512 comes from |
+| `seed` | per request, so one answer can be replayed on its own |
+| `stream` | `text/event-stream` instead of one object |
+| `chat_template_kwargs.enable_thinking` | the thinking toggle, where Qwen clients put it |
+
+`--seed` is the one default with a twist: given, every request without a seed of
+its own replays that same seed; not given, each request draws a fresh one from
+entropy and the server logs it, so any answer can still be reproduced.
+
+**Everything else in the body is deliberately ignored**, which is the OpenAI
+convention for unknown fields and the instruction this was built to. `n`,
+`stop`, `logprobs`, `presence_penalty`, `frequency_penalty`, `tools`,
+`stream_options` and the rest are read by nobody: a request asking for four
+choices or an extra stop string gets one answer that ignores it, and the README
+says so, because the alternative is a 400 on a field OpenAI clients send by
+default. Two more that are not oversights: `repeat_last_n` has no OpenAI field
+and stays at the command line's value, and the `model` a request names is
+ignored because the answer reports the file that is loaded, which is what
+actually answered.
+
+**Streaming flushes per event.** Every token that decodes into something whole
+is one `data:` event, flushed on its own, the last event carries the
+`finish_reason` and no content, and the stream closes with `data: [DONE]`. A
+token is held back until what is pending decodes without a replacement
+character: a character spread over two tokens cannot be decoded from either of
+them alone, and unlike the CLI, which reprints the whole answer afterwards, a
+stream cannot take a chunk back.
+
+**A client that drops mid-stream ends that request and nothing else.** The write
+fails, the generation callback returns `false`, and the run stops with
+`Stop::Cancelled`. That hook is why `generate`'s callback returns a `bool` at
+all: otherwise a client hanging up after one token would cost every core up to
+`--max-tokens` of work nobody will read, and the next request would wait in the
+backlog for all of it.
+
+**The error mapping**, every body in OpenAI's `{"error": {...}}` shape:
+
+| | |
+| --- | --- |
+| 400 | a body that is not JSON or not an object, a sampler value that cannot be a setting, `max_tokens` of 0, a `messages` array that is missing or malformed, a role this runner does not implement (`tool`, `function`), a system message that is not first, message content that is not a string, a missing `prompt` |
+| 404 | any other path, with the two it does serve in the message |
+| 405 | anything but `POST` on the two paths, with `Allow: POST` |
+| 408 | the connection closed before a whole request arrived |
+| 413 | `Content-Length` over a megabyte |
+| 431 | request line and headers over 16 KB |
+| 500 | only if what was generated cannot be decoded |
+
+The 400s on the message shapes are not re-implemented here: `Role::from_str` and
+`chat::render` already refuse a `tool` message and a misplaced system message,
+because that is where a role from outside enters the program, and the server
+turns their errors into the status instead of into a 500. Content that is not a
+string is refused rather than flattened, for the reason `chat::Message` gives:
+flattening a list of content parts would drop an image and change the prompt
+without saying so.
+
+**Loopback by default.** `--host 127.0.0.1 --port 8080`, and there is no
+authentication: a server that answers whatever it is asked is not something to
+bind to a network by default. `--port 0` takes whatever is free and the address
+the listener actually got is printed, which is also how the test avoids racing
+another run for a port number.
+
 ## The reference harness
 
 llama.cpp on the **same GGUF file**, so quantization is out of the comparison.
@@ -736,7 +841,9 @@ only ever exercised by hand.
 178 KB, in milliseconds: two blocks, one linear and one full attention, `Q8_0`
 weights so the real dequant-free kernels run, and the `tokenizer.json` that goes
 with it. `crates/rust-llm/tests/tiny_model.rs` drives the real binary against
-it through `CARGO_BIN_EXE_rust-llm`. It needs no weights, so it runs in CI.
+it through `CARGO_BIN_EXE_rust-llm`, and `crates/rust-llm/tests/serve.rs` starts
+the real server against it the same way. Neither needs weights, so both run in
+CI.
 
 **It proves the surface, not the output.** The weights are noise from a fixed
 seed, so the text is meaningless, but it is produced by the real loader, the
@@ -772,6 +879,16 @@ Every run in that file is either greedy or carries an explicit `--seed`. The
 fixture's end-of-turn tokens are inside the vocabulary it can produce, so a run
 left on the default settings with a seed from entropy stops on one now and
 then; the first version of these tests failed about one run in six that way.
+
+One property the fixture cannot show is the streaming flush. It generates
+microseconds per token, so every event is in the socket buffer before the
+client's first `read` returns, and a server that built the whole answer and
+wrote it once would produce the same bytes in the same number of reads. So the
+serve test asserts the stream's shape instead: a whole event in hand before the
+stream ends, several events rather than one, the `finish_reason` only on the
+last, the closing `data: [DONE]`, and no `Content-Length`. The flush itself is
+one call per event, and the real model, at ten tokens a second, is where it is
+visible.
 
 ## Baseline numbers
 
@@ -832,6 +949,7 @@ no signal in it. Measured on this box:
 | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` | 1 s, 25 s cold |
 | `cargo test --workspace --all-targets` (the default set, no weights needed) | 47 s cold, 25 s warm |
 | of which `tests/sample.rs`, `tests/sample_allocations.rs` and `tests/tiny_model.rs` | 2 s, 2 s, 3 s |
+| of which `tests/serve.rs`, which starts the server and drives both endpoints | 2 s |
 | gate: `every_next_token_matches_the_reference` | 2:01 |
 | gate: `greedy_output_is_unchanged` | 2:10 |
 | gate: `resetting_the_caches_is_the_same_as_a_fresh_runner` | 27 s |
