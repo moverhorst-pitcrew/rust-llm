@@ -9,12 +9,117 @@
 
 use std::arch::x86_64::*;
 
-use super::avx2::hsum_i32;
-use crate::quant::{ActBlock, Activations, Q4_K_BYTES, Q6_K_BYTES, q4k_scale_min, read_f16};
+use super::avx2::{hsum_i32, q4k_unpack, q6k_unpack};
+use crate::quant::{
+    ActBlock, ActRow, Activations, Q4_K_BYTES, Q6_K_BYTES, QK_K, q4k_scale_min, read_f16,
+};
 
-pub(super) fn q4k_dot(w: &[u8], a: &Activations) -> f32 {
+/// `out[j] += row . a.row(t0 + j)` for one `Q4_K` weight row against a group of
+/// the activation batch.
+///
+/// Same arithmetic as [`q4k_dot`] in the same order, so the two agree bit for
+/// bit. What the batch saves is the work that does not depend on the
+/// activations: the nibble split, the 6-bit scale unpacking and building the
+/// scale vector, once per super-block instead of once per token.
+pub(super) fn q4k_dot_batch(w: &[u8], a: &Activations, t0: usize, out: &mut [f32]) {
+    for ib in 0..a.k().div_ceil(QK_K) {
+        unsafe { q4k_block_batch(&w[ib * Q4_K_BYTES..(ib + 1) * Q4_K_BYTES], a, t0, ib, out) };
+    }
+}
+
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn q4k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: &mut [f32]) {
+    let d = read_f16(b, 0);
+    let dmin = read_f16(b, 2);
+    let mut qw = [0u8; QK_K];
+    let mut scs = [0u8; 8];
+    let mut mins = [0u8; 8];
+    unsafe {
+        q4k_unpack(b, &mut qw, &mut scs, &mut mins);
+        let zero = _mm256_setzero_si256();
+        // One vector per sub-block pair, in the lane order VPACKSSDW leaves
+        // the two VPDPBUSD results in.
+        let mut scv = [zero; 4];
+        for (t, v) in scv.iter_mut().enumerate() {
+            let (s0, s1) = (scs[2 * t] as i16, scs[2 * t + 1] as i16);
+            *v = _mm256_set_epi16(
+                s1, s1, s1, s1, s0, s0, s0, s0, s1, s1, s1, s1, s0, s0, s0, s0,
+            );
+        }
+        for (j, o) in out.iter_mut().enumerate() {
+            let ab = &a.row(t0 + j).blocks[ib];
+            let aqs = ab.qs.as_ptr();
+            let mut acc = zero;
+            let mut imin = 0i32;
+            for (t, &scv) in scv.iter().enumerate() {
+                let dp0 = _mm256_dpbusd_avx_epi32(
+                    zero,
+                    _mm256_loadu_si256(qw.as_ptr().add(64 * t).cast()),
+                    _mm256_loadu_si256(aqs.add(64 * t).cast()),
+                );
+                let dp1 = _mm256_dpbusd_avx_epi32(
+                    zero,
+                    _mm256_loadu_si256(qw.as_ptr().add(64 * t + 32).cast()),
+                    _mm256_loadu_si256(aqs.add(64 * t + 32).cast()),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_packs_epi32(dp0, dp1), scv));
+                for sb in [2 * t, 2 * t + 1] {
+                    imin +=
+                        mins[sb] as i32 * (ab.bsums[sb * 2] as i32 + ab.bsums[sb * 2 + 1] as i32);
+                }
+            }
+            *o += ab.d * (d * hsum_i32(acc) as f32 - dmin * imin as f32);
+        }
+    }
+}
+
+/// `out[j] += row . a.row(t0 + j)` for one `Q6_K` weight row, as above.
+pub(super) fn q6k_dot_batch(w: &[u8], a: &Activations, t0: usize, out: &mut [f32]) {
+    for ib in 0..a.k().div_ceil(QK_K) {
+        unsafe { q6k_block_batch(&w[ib * Q6_K_BYTES..(ib + 1) * Q6_K_BYTES], a, t0, ib, out) };
+    }
+}
+
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn q6k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: &mut [f32]) {
+    let sc = &b[192..208];
+    let d = read_f16(b, 208);
+    let mut qw = [0u8; QK_K];
+    unsafe {
+        q6k_unpack(b, &mut qw);
+        let zero = _mm256_setzero_si256();
+        // i32 lanes 0..4 cover bytes 0..16 and carry the even scale, lanes
+        // 4..8 cover bytes 16..32 and carry the odd one.
+        let mut scv = [zero; 8];
+        for (g, v) in scv.iter_mut().enumerate() {
+            let s0 = sc[2 * g] as i8 as i32;
+            let s1 = sc[2 * g + 1] as i8 as i32;
+            *v = _mm256_set_epi32(s1, s1, s1, s1, s0, s0, s0, s0);
+        }
+        for (j, o) in out.iter_mut().enumerate() {
+            let ab = &a.row(t0 + j).blocks[ib];
+            let aqs = ab.qs.as_ptr();
+            let mut acc = zero;
+            for (g, &scv) in scv.iter().enumerate() {
+                let dp = _mm256_dpbusd_avx_epi32(
+                    zero,
+                    _mm256_loadu_si256(qw.as_ptr().add(32 * g).cast()),
+                    _mm256_loadu_si256(aqs.add(32 * g).cast()),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(dp, scv));
+            }
+            let mut bias = 0i32;
+            for (i, s) in sc.iter().enumerate() {
+                bias += *s as i8 as i32 * ab.bsums[i] as i32;
+            }
+            *o += ab.d * d * (hsum_i32(acc) - 32 * bias) as f32;
+        }
+    }
+}
+
+pub(super) fn q4k_dot(w: &[u8], a: ActRow<'_>) -> f32 {
     let mut sum = 0.0f32;
-    for (ib, ab) in a.blocks().iter().enumerate() {
+    for (ib, ab) in a.blocks.iter().enumerate() {
         sum += unsafe { q4k_block(&w[ib * Q4_K_BYTES..(ib + 1) * Q4_K_BYTES], ab) };
     }
     sum
@@ -64,9 +169,9 @@ unsafe fn q4k_block(b: &[u8], ab: &ActBlock) -> f32 {
     ab.d * (d * isum as f32 - dmin * imin as f32)
 }
 
-pub(super) fn q6k_dot(w: &[u8], a: &Activations) -> f32 {
+pub(super) fn q6k_dot(w: &[u8], a: ActRow<'_>) -> f32 {
     let mut sum = 0.0f32;
-    for (ib, ab) in a.blocks().iter().enumerate() {
+    for (ib, ab) in a.blocks.iter().enumerate() {
         sum += unsafe { q6k_block(&w[ib * Q6_K_BYTES..(ib + 1) * Q6_K_BYTES], ab) };
     }
     sum

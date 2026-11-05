@@ -123,10 +123,47 @@ coarser than ggml's pairing, and it is the right trade here: one scratch buffer,
 one quantization pass, one code path, against a quantization error that is
 already well inside what int8 activations cost at all.
 
-**No allocations in the hot loop.** `Activations::new` takes the largest `K` in
-the model and allocates once; `quantize` refills it and panics rather than grow.
-`matvec` writes into a caller-owned slice. There is no allocation anywhere below
-the forward pass.
+**No allocations in the hot loop.** `Activations::with_batch` takes the largest
+`K` in the model and the largest batch and allocates once; `quantize_batch`
+refills it and panics rather than grow. `matvec` writes into a caller-owned
+slice. There is no allocation anywhere below the forward pass.
+
+**A batch is `t` rows of the same format, quantized exactly as they would be
+alone.** The scale is per row and per super-block, so no row's quants depend on
+another's, which is what makes a batched matmul produce the same bits as `t`
+single ones. A kernel is handed one row at a time as an `ActRow`, and never
+needs to know whether it came out of a batch.
+
+**There are two entry points per type: one weight row against one activation
+row, and one weight row against a group of them.** The second exists because
+about half of what a `Q4_K` super-block costs does not depend on the
+activations: splitting the nibbles, unpacking the six-bit scales out of
+`get_scale_min_k4`'s bit shuffle, and building the scale vector. Per token a
+batch paid that `t` times; per group it pays it once, into a 256-byte stack
+buffer the group's dot products then read from L1. Measured on the prompt path,
+which is where it shows: 31.6 to 44.0 tok/s at 8 threads, 39 per cent.
+
+The group is 16 rows. Bigger divides the unpacking further, but past 16 the
+gain is under a per cent and the outputs stop fitting a small stack array; a
+batch longer than the group is run as several groups. `Q8_0` has no batched
+kernel: this file holds no `Q8_0` tensor, so there is nothing here to measure
+one on, and an unmeasured kernel is a second rounding behaviour to keep green
+for nothing.
+
+**The batched kernel is bit-identical to the per-row one**, not merely close.
+The same products accumulate in the same order and only the unpacking moves, so
+the kernel test asserts it with `==` rather than a tolerance, for both types on
+every tier, over the model's shapes and the awkward ones, at batch sizes either
+side of the group boundary. That is what lets a prompt be read in batches
+without changing a single logit, which is the property the correctness gate
+would otherwise have to absorb.
+
+**Where the batch's win actually comes from is the caller's loop order**, not
+the kernel: the pool hands a worker a block of weight rows and runs it against
+every row of the batch before moving on, so the block's bytes cross the memory
+bus once for the whole batch. The kernel's own win is the unpacking. Both are
+needed: without the loop order the prompt stays bandwidth-bound, and with it the
+unpacking becomes the next bottleneck.
 
 **A `K` that is not a whole number of blocks needs no special case.**
 `quantize` zeroes the tail of its last super-block, so a zero activation kills
@@ -157,6 +194,30 @@ kernel *slower* than the AVX2 one. Every `VPDPBUSD` lane is at most
 and scaled with one `VPMADDWD` instead. Measured on this box (single thread,
 `2560x8192`): scalar 2.02 ms, AVX2 0.61 ms, VNNI 0.59 ms.
 
+**The VNNI tier stays, and this is the measurement that decided it.** M1's
+number above is one shape, single threaded, 3 per cent apart, which is inside
+this box's noise, and the plan was to delete the tier if it could not do better
+than that. The reason it could not be seen is that batch-1 generation is
+bandwidth-bound: no kernel change shows up in it at all. The batched prompt path
+is compute-bound, and there the two tiers differ reproducibly. Prompt tok/s,
+context 1024, 192-token prompt, batch 16, two passes each alternated from one
+binary:
+
+| | `avx2+vnni` | `avx2+fma` |
+| --- | --- | --- |
+| 8 threads | 46.19, 44.53 | 43.63, 43.27 |
+| 1 thread | 10.48 | 9.96 |
+
+4.4 per cent at 8 threads and 5.2 at 1, with generation a tie inside the spread
+at both, as a bandwidth-bound path has to be. Both tiers have the batched kernel,
+so it is like for like. 4 per cent is small, but it is the same sign in every
+pass measured and it is free: the tier is 118 lines that the kernel tests hold
+to the same bits as the AVX2 one.
+
+That the comparison can be made at all is why `--tier` exists on the CLI. It
+pins the tier by name for one run, the default stays the strongest the CPU
+reports, and the gates are never run against a pinned tier.
+
 **Where the sign trick is exact and where it is not.** `Q8_0` meets two signed
 operands on `VPMADDUBSW`, which wants one unsigned. Taking `|weight|` with
 `VPSIGNB` and moving the weight's sign onto the activation is exact over the
@@ -180,9 +241,10 @@ halves, flipped bias and minimum signs, a wrong scale index, an off-by-one
 activation offset) one at a time; all seven failed the tests.
 
 `cargo run --release -p llm-core --example bench_kernels` prints one line per
-(type, shape, tier) with the weight bandwidth and the speedup over scalar. It is
-a starting point for M2's tuning, not a tuned result: single threaded, one
-matvec at a time.
+(type, shape, tier) with the weight bandwidth and the speedup over scalar. It
+measures one matvec at a time on one thread, which is a microbenchmark and not
+the product's shape: the numbers that decide anything are in
+`docs/benchmarks.md`, measured on the whole model at the real thread count.
 
 ## Tokenizer
 
@@ -261,14 +323,82 @@ byte, and the fixture records the template's sha256, so a different template
 fails rather than being rendered by the old rules.
 ## The forward pass
 
-**One token at a time, for the prompt as much as for generation.** The
-delta-net recurrence is sequential over tokens, so a batched prompt path would
-only help the eight full-attention blocks and the feed-forward halves, and it
-would be a second code path through the twenty-four linear blocks. One path
-also makes the hand-over free: the state generation starts from is, by
-construction, the state the prompt produced, because it is the same buffer and
-nothing re-reads the prompt. Batched prompt evaluation belongs with the rest of
-the throughput work.
+**`t` tokens at a time, and one token is `t = 1`.** M1 ran one token at a time
+for the prompt as much as for generation, and reasoned that a batched path would
+help only the eight full-attention blocks and the feed-forward halves and would
+be a second code path through the twenty-four linear blocks. The first half of
+that was wrong and the second half was avoidable, so M2 replaced it.
+
+Wrong, because what a batch divides is the weight traffic, not the arithmetic:
+batch-1 generation reads all 2.52 GiB of weights per token, and a block of
+weight rows run against every token of a batch crosses the memory bus once for
+the whole batch. That is the projections, the output matmuls and the output
+head, which is 76 per cent of a token; it is not limited to the full-attention
+blocks. Avoidable, because `forward_batch` *is* the forward pass and
+`forward(token)` calls it with one token: every loop runs once, the pool sees
+`t == 1` and uses the per-row kernel it always had, and the result is
+bit-identical by construction rather than by a second test. Measured rather than
+assumed: a batch of 1 reads a prompt at 13.9 tok/s against the 13.6 of the
+commit before the batched path, inside the spread, and
+`greedy_output_is_unchanged` holds.
+
+Prompt tok/s went from 13.6 to 47.2 at 8 threads, 3.2 times generation.
+`docs/benchmarks.md` has the per-commit pairs and the batch-size curve.
+
+**What does not batch, and why that is the whole correctness story.** Two things
+are sequential over tokens by construction:
+
+- the depthwise convolution, whose tap `j` for token `i` is token
+  `i - kernel + 1 + j`: inside a batch that is an earlier row of the same batch,
+  and before the batch it is the history buffer;
+- the delta-net recurrence, whose state for token `i` is the state token `i - 1`
+  wrote.
+
+Both run token by token inside the batch, over the same rolling state, in the
+same order as the single-token path. So the state a batch leaves behind is the
+state the single-token path would have left, and the hand-over to generation is
+not a thing that has to be made to work, it is a thing that cannot be wrong
+unless the loop order is. That is what the tests pin down: the convolution's
+batch boundary against hand-computed taps, and the whole 248320-entry logit
+vector after a batched prompt against the token-by-token one at five batch
+sizes, including a prompt length that is not a multiple of the batch and a batch
+larger than the prompt. The parallelism in both cases is over heads, each of
+which owns its whole batch, so a batch is one pool job where it used to be `t`.
+
+**Only the last token of a batch gets logits.** The output head is a single
+2560 x 248320 matmul, 16 per cent of a single-token token, and a prompt throws
+every position's logits away except the last. So `forward_batch` runs the final
+norm and the head for the last row only, and a batch of 16 pays the head once.
+The gate that feeds the reference's own tokens still sees every position,
+because it feeds them one at a time.
+
+**The batch is 16 tokens by default**, from the measured crossover in
+`docs/benchmarks.md`: the curve rises steeply to 16 (13.75, 21.29, 30.68, 38.28,
+44.26 tok/s at 1, 2, 4, 8, 16) and then by 8 per cent in total out to 64. It is
+also exactly one group of the batched kernel, which is not a coincidence: past
+one group the weight block's unpacking is already divided by 16 and only the
+per-batch fixed costs are left to amortise. `--batch` moves it, and there is no
+length below which batching is off, because the curve is monotone from 1: a
+two-token prompt is already 55 per cent faster read as one batch.
+
+**Nothing allocates per token in either path.** Every buffer is `max_batch` rows
+of what one token needed, token-major, sized by `Runner::new`, and the
+activation scratch holds `max_batch` rows of blocks. The allocation test covers
+the batched prompt at three batch sizes next to the generation loop.
+
+**Speculative decoding (M3) is what this path was shaped for**, and nothing for
+it is built here. A drafted-token verification is exactly a batch: `n` drafted
+tokens go through `forward_batch` in one pass over the weights, and what M3
+needs that this does not have is the logits of *every* row rather than the last,
+so that it can find the first position where the draft and the model disagree.
+That is one more weight tensor's worth of work per batch (the head on `n` rows
+instead of 1) and a second entry point next to `forward_batch`; the caches
+already end up in the right state, because a batch leaves the state the tokens
+would have left one at a time, and a rejected suffix is a `pos` the KV cache can
+simply be rewound to for the full-attention blocks. The recurrent state cannot
+be rewound, which is the one real design problem M3 has to solve: it will have
+to keep a copy of the conv history and the delta-net state from before the
+batch, 2.1 MiB per linear block, 50 MiB in total.
 
 **Every buffer is allocated by `Runner::new`, from the config.** The pass
 quantizes activations into scratch it owns, hands row ranges to the pool and
@@ -309,6 +439,45 @@ section leaves no dimension pair for the fourth axis, so plain partial RoPE is
 exact. That is not something to take on trust, because it is silent when wrong:
 a unit test replays the reference's interleaved sector-to-axis selection and
 asserts no pair reaches the fourth axis.
+
+**The causal mask is a loop bound, not a mask.** A batch takes the positions
+`pos..pos + t`; its keys and values go into the cache before any score is
+formed, and token `i` then attends over `pos + i + 1` positions. So there is
+nothing to mask: the score loop stops where the token's own position is. A test
+changes the last position's values and requires every earlier token's output not
+to move.
+
+**The walk over the cache is tiled over positions, with the queries inside the
+tile.** One pool chunk is one head holding its whole batch, because the batch's
+queries all read the same keys and values: per (token, head) chunks read a
+head's span of the cache `t` times over, and at a context of 4096 that span is
+8 MiB per KV head, which does not stay in the 36 MiB L3 next to everything else
+a token touches. Tiled at 128 positions, a tile of keys is 128 KiB and every
+query of the batch crosses it while it is in L2. Worth 9 per cent of a prompt
+token at context 4096 and nothing measurable at 2048; for generation there is
+one query per head, so no byte is read twice and the tiling has nothing to save
+at any context. The numbers are in `docs/benchmarks.md`.
+
+**The score rows stay materialised, which is the half of a flash-style
+attention that is deliberately not here.** A running maximum and running sum
+would let the rows go, and the rows are the only thing it would save: 16 KiB per
+query at context 4096, read back by a loop that also reads 4 MiB of values from
+memory, so under a per cent of an operator that is 20 per cent of a token at the
+longest context in the budget. Against that, an incremental softmax rescales its
+accumulator per tile, which is a different rounding of the operator the
+correctness gate is most sensitive to. Keeping the rows makes the tiled walk
+bit-identical to one query at a time, which the unit tests assert with `==` on
+this model's GQA shapes, at a cache length and a causal bound either side of the
+tile boundary, for a batch and for a single token. `docs/benchmarks.md` carries
+the measurement and the projection for the contexts we cannot run.
+
+**The output comes out head-major and the gate transposes it.** A head owns its
+whole batch, so the natural layout of the per-head output is
+`[head][token][head dim]`, and the output projection needs
+`[token][head][head dim]`. The output gate's multiply is already a pass over
+exactly those values, so it does the transpose on the way through and costs
+nothing extra. The linear blocks' gated norm does the same with the delta net's
+readout, and the two share the buffer.
 
 **The embedding lookup is the only place a weight becomes f32.** The row it
 wants is picked by a token id rather than dotted with anything, so it is the one
@@ -362,56 +531,152 @@ on all 248320 entries.
 
 The hand-over from prompt to generation is checked in the same test by feeding
 the prompt plus all but the last generated token as one long prompt and
-requiring it to predict that last token. Today that is close to tautological,
-since both paths are the same `forward` over the same positions, and it is
-written down as such: it is the property a batched prompt path would break, and
-it is free to keep nailed down until then. What checks the hand-over against
-something outside this runner is the next-token gate below, which feeds the
-reference's tokens.
+requiring it to predict that last token. M1 wrote that down as close to
+tautological, both paths being the same `forward` over the same positions, and
+as "the property a batched prompt path would break". It is a real check now:
+`a_batched_prompt_is_the_same_as_one_token_at_a_time` reads the prompt in
+batches of 2, 5, 7, exactly its length and more than its length, and requires
+the whole 248320-entry logit vector to equal the token-by-token one and the
+tokens generated afterwards to match as well. The logits alone would miss a
+stale recurrent state that only the next token reads; the tokens alone would
+miss a wrong state the decay fades out before an argmax moves, for the reason
+above. The comparison is bit-exact rather than within a tolerance, because the
+batched path is the same arithmetic in the same order and anything else is a
+bug.
+
+**The KV cache stays f32**, and that is now a measured decision rather than a
+default. An f16 cache halves the bytes generation's attention reads, and that
+operator is 20.1 per cent of a generation token at context 4096, 14.7 at 2048
+and 1.5 at 1024, so the upper bound on the win is 10 per cent of a token at
+4096 and nothing measurable at the default configurations. It is also a
+rounding change in the attention scores, which is exactly what the correctness
+gate measures, so taking it would move the fixture that records the four
+permitted disagreements. That trade needs a decision of its own, written down
+with the number, rather than arriving inside a change made for speed, and
+`docs/benchmarks.md` carries the number for it. Note that the
+reference's own default *is* an f16 cache, which is part of why its shipping
+numbers are ahead of its matched-flags ones.
+
+**Raising `--context` still costs nothing until the positions are used**, which
+M1 reasoned about and this branch measured again on the batched path: a
+16-token prompt peaks at 2.76 GiB resident at context 1024 and 2.75 GiB at
+context 4096, the same number, because the cache's pages become resident as they
+are first written. A 1024-token prompt at context 4096 is 180 MiB above a
+192-token prompt at context 1024, which is exactly the KV positions the longer
+prompt touches.
 
 ## Threading
 
 **One persistent pool, built at load time**, with the submitting thread as one
 of its workers. A job is published once, run by everyone, and `run` returns
-only after every thread has passed the second barrier; that is what lets a job
-borrow the caller's stack and write into disjoint pieces of a caller-owned
-slice without allocating. At 32 cores and a few hundred matmuls per token,
-spawning per matmul would cost more than the work.
+only after every thread has left it; that is what lets a job borrow the
+caller's stack and write into disjoint pieces of a caller-owned slice without
+allocating. At 32 cores and a few hundred matmuls per token, spawning per
+matmul would cost more than the work.
 
-Two shapes of work cover the whole pass: matmul rows split over the threads,
-and per-head chunks where one attention head or one delta-net value head owns
-one output chunk and one piece of scratch. Everything else is elementwise and
-cheaper than a barrier.
+Two shapes of work cover the whole pass: matmul rows, and per-head chunks where
+one attention head or one delta-net value head owns one output chunk and one
+piece of scratch. Everything else is elementwise and cheaper than a job.
 
-**A panic in a job is carried across the barrier, not out of it.** Both sides
+**Projections that read the same input are one job.** The feed-forward gate and
+up, the full block's q, k and v, and the linear block's qkv together with its
+output gate, alpha and beta each read the same normalised vector, so each group
+is one job over one row range and one activation quantization instead of N jobs
+over N quantizations of the same input. That took a token from 281 pool jobs to
+161. It also balances better than separate jobs could: alpha and beta are 32
+rows each next to tensors of thousands, so on their own they were a pair of
+barriers around work one thread does in microseconds. The profile pays for it
+by no longer being able to attribute time per tensor inside a group; the
+per-tensor breakdown from before the change is in `docs/benchmarks.md`.
+
+**A job is handed out through a sequence counter, not a barrier.** A
+`std::sync::Barrier` is a mutex and a condvar, so the 161 jobs in a token cost
+two of them each: a futex wake for every worker before the job and a futex wait
+after it. Instead the submitter writes the job pointer, bumps a counter and
+unparks the workers, and a worker waits for that counter to change by spinning
+for about twenty microseconds before it parks. The completion side is a
+countdown the workers release as they leave, which the submitter spins on and
+then yields on. At 8 threads that took the pool's own share of a token from 67
+per cent to 5.9 per cent (`docs/benchmarks.md`).
+
+Twenty microseconds of spinning is deliberately shorter than a job and longer
+than the serial stretch between two jobs (the activation quantization, the
+norms, the elementwise work), which is what a worker is usually waiting
+through. Past that it parks, because a spinning worker takes quota from the
+thread it is waiting for. `unpark` on a thread that is still spinning is an
+atomic store and no syscall, and it leaves a token that makes that thread's
+next `park` return at once, which closes the window where a worker parks just
+after being passed over.
+
+**The work is claimed, not split up front.** Both shapes take their work from
+an atomic counter: matvec groups in blocks of up to 64 rows, per-head jobs one
+head at a time. A static split hands equal rows to unequal lanes here: the
+cgroup quota means a thread can be descheduled in the middle of a job while the
+others wait for it, and this CPU is 8 performance cores plus 16 efficiency
+cores, so equal rows are not equal work even when nothing is descheduled. Of
+the time the submitter used to spend at the two barriers, waiting for the
+slowest worker was 23 ms per token against 6 ms for getting the workers
+started, so the imbalance was the larger half. 64 rows of the largest tensor
+here are 90 KiB of weights, which is tens of microseconds of streaming: long
+enough that the `fetch_add` is noise and the weight reads stay sequential,
+short enough that the last block does not decide the job's length.
+
+**A panic in a job is carried out of the job, not out of `run`.** Both sides
 run the job inside `catch_unwind`; the submitter resumes its panic only after
-`end.wait()`, and a worker that panicked sets a flag the submitter turns into a
-panic of its own. Letting the panic escape directly would leave every other
-thread waiting on a barrier the panicking one never reaches, and `Drop` waiting
-on the other one, so a failed assert in the forward pass would be a hang rather
-than a stack trace. The buffers are half written at that point, which is why
-this resumes the panic instead of reporting it: the caller's results are not
+every worker has left, and a worker that panicked sets a flag the submitter
+turns into a panic of its own. Letting the panic escape directly would leave
+the other threads inside a job nobody waits for and `Drop` joining threads that
+are still running, so a failed assert in the forward pass would be a hang
+rather than a stack trace. The buffers are half written at that point, which is
+why this resumes the panic instead of reporting it: the caller's results are not
 usable either way.
 
-**The split cannot change the result.** Each output row and each head is
+**The split cannot change the result.** Each output row and each head is still
 computed by exactly one worker from start to finish, so no reduction crosses a
-thread and the output does not depend on the thread count. A test asserts that
-for 1, 3 and all threads.
+thread and the output does not depend on the thread count: a block is handed out
+once, and the rows of a group are one range for one claim. That it holds is now
+a property of the claiming rather than of the arithmetic of a static split,
+which is why it needs a test of its own: `every_chunk_is_claimed_exactly_once`
+fails if a chunk is run twice or not at all at 1, 3, 4 and 8 threads, next to
+`the_thread_count_does_not_change_the_output` on the whole forward pass at 1, 3
+and all threads.
 
-**Default thread count is `available_parallelism`**, which on this box reports
-8 because the cgroup quota is 8 of the 32 cores. That default is not the
-fastest setting here. Measured, short prompt, context 1024, generation tok/s:
+**Default thread count stays `available_parallelism`**, which on this box
+reports 8 because the cgroup quota is 8 of the 32 cores. Before the three
+changes above that default was 25 to 35 per cent off the peak, which was at 3
+or 4 threads; it was left alone deliberately, pending a measurement. The
+measurement, taken at the end of the threading work, says the curve now rises
+to the quota instead of turning over inside it. Generation tok/s, context 1024,
+19-token prompt, 16 generated tokens, median of 3, in the quietest window
+measured (load average 5.0 to 6.2 on the 8-CPU quota):
 
-| threads | 1 | 2 | 3 | 4 | 5 | 6 | 8 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| tok/s | 4.83 | 8.29 | 9.56 | 9.66 | 9.17 | 8.59 | 7.09 |
+| threads | 4 | 6 | 7 | 8 |
+| --- | --- | --- | --- | --- |
+| tok/s | 11.15 | 14.02 | 14.73 | 15.23 |
+| spread | 1.0% | 8.2% | 1.7% | 0.9% |
 
-Batch-1 generation reads all 2.52 GiB of weights per token, so the ceiling is
-memory bandwidth and it is reached at three or four threads; past that the
-barriers cost more than the extra lanes earn, and on a shared box a thread that
-is descheduled at a barrier holds up all of them. Tuning this, and finding what
-the bandwidth ceiling actually is, is the throughput ticket's job; the default
-stays the honest one.
+So 8 threads is the fastest setting, 37 per cent ahead of 4, where it used to be
+the slowest. The measurement is repeated in `docs/benchmarks.md` with the other
+windows, and they qualify it rather than contradict it: when this shared box is
+oversubscribed, 6, 7 and 8 threads are indistinguishable (alternating passes of
+8 and 6 give 10.04/9.99/8.89 against 10.73/9.70/9.93, spreads up to 54 per
+cent), and in one window of four the peak was 6 threads. No window measured had
+a setting below the quota that was faster than the quota by more than its own
+spread.
+
+That is why the default is not a fraction of the quota. The streaming
+measurement shows memory saturating at 6 or 7 threads of the 8, so an argument
+for a default of 6 or 7 exists on paper, but what makes 8 lose in some windows
+is other work competing for the same bandwidth, and that is a property of this
+machine at that moment, not of the hardware. `quota - 1` or `quota * 3/4` would
+be fitting the product to our box's noise; `available_parallelism` reads the
+quota it is given on any machine, and generation reaches 79 per cent of the
+measured bandwidth ceiling there (against 29 per cent at the start of this
+branch). `--threads` is there for the case where the box is busy.
+
+AVX-512 was checked for and this machine does not have it: `/proc/cpuinfo` has
+`avx2` and `avx_vnni` and no `avx512*` flag, so there is no AVX-512 tier in the
+dispatch table. Adding one would be a kernel nobody here can run or test.
 
 **Nothing in the generation loop allocates**, measured rather than asserted. A
 counting global allocator wraps `System` in
@@ -556,11 +821,13 @@ window size only matters once someone turns it on.
 
 `rust-llm run --prompt "..."` renders the chat template, streams tokens as they
 are produced and prints the timings and the peak RSS to stderr. `--model`,
-`--tokenizer`, `--system`, `--context`, `--threads`, `--max-tokens`,
-`--think/--no-think`, `--raw`, and the sampling flags `--temperature`,
+`--tokenizer`, `--system`, `--context`, `--threads`, `--batch`, `--tier`,
+`--max-tokens`, `--think/--no-think`, `--raw`, and the sampling flags `--temperature`,
 `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n` and
-`--seed`, with the defaults above shown in `USAGE`. Arguments are parsed by
-hand: they are all `--name value`, there is no per-command grammar, and a
+`--seed`, with the defaults above shown in `USAGE`. `--batch` is the prompt's
+batch size, defaulting to the measured crossover, and `--tier` pins the kernel
+tier, which exists so that two tiers can be compared on the real model from one
+binary. Arguments are parsed by hand: they are all `--name value`, there is no per-command grammar, and a
 parser crate would be a dependency and a build-time cost for that shape.
 
 **A value that cannot be a setting is an error that names the argument.** A
@@ -579,10 +846,10 @@ is not laziness. The chat template drops the reasoning of assistant turns before
 the last user turn, so turn N+1's token prefix is not a prefix of turn N's: the
 reasoning the previous turn generated is gone from the middle of the prompt and
 everything after it has shifted. Reusing the KV cache across turns would not be
-merely stale, it would be wrong. What that costs is re-reading the prompt, which
-is the same single-token path as generation; making it cheaper is the batched
-prompt evaluation the throughput work owns, and it helps every surface at once
-rather than this one.
+merely stale, it would be wrong. What that costs is re-reading the prompt,
+which is now read in batches, so a turn pays about a third of what it used to
+per token: batched prompt evaluation helps every surface at once rather than
+this one.
 
 A conversation that no longer fits the context is reported and the turn is
 dropped, rather than generating into nothing: the runner would otherwise stop
@@ -840,6 +1107,14 @@ Omitting `RUST_LLM_GATE_ONLY` does the whole set in one command, which is about
 four minutes. Per prompt it is 20 to 35 seconds, which is the size to keep a
 check at.
 
+**Forgetting `RUST_LLM_REFERENCE_BIN` in the whole `--ignored` run costs more
+than this one test.** It panics on the missing variable, a failing test binary
+ends the `cargo test` run, and the binaries after `tests/gate.rs` then never
+run at all, `tests/weights.rs` among them: a missing variable reads as a broken
+gate and hides the rest of the set. It is the only variable the run needs,
+because the test passes `LD_LIBRARY_PATH` to the reference process itself; by
+hand the reference needs it in the environment, as above.
+
 It reads the reference's ids out of its verbose log, because `llama-completion`
 prints a generated token's text and never its id: a token's bytes are exactly
 the text between one log line and the `n_past` line after it. Inverting text
@@ -911,6 +1186,12 @@ visible.
 
 ## Baseline numbers
 
+These are M1's numbers, kept because the decisions above rest on them and
+because they are what the throughput work measures itself against.
+**`docs/benchmarks.md` holds the current ones**, the bandwidth ceiling, the
+per-operator profile and the reference at matching thread counts, and it is the
+only place new performance numbers go.
+
 Qwen3.5-4B-heretic-Q4_K_M, `avx2+vnni`, this box (8 of 32 cores by cgroup
 quota, and shared with other work, so these wobble by 10 to 20 per cent):
 
@@ -934,9 +1215,12 @@ difference between the 13-token and the 384-token run is the 25 MiB of cache
 those extra positions touch. Raising `--context` therefore costs nothing until
 the positions are used.
 
-Prompt processing is no faster per token than generation, because the prompt
-goes through the same single-token path. That is the first thing to fix for
-throughput, not a measurement error.
+Prompt processing was no faster per token than generation in those rows,
+because the prompt went through the same single-token path. That is fixed: it is
+3.2 times generation at 8 threads now, and the numbers are in
+`docs/benchmarks.md`. The peak RSS numbers above still hold to within 10 MiB,
+because the batched path's extra scratch is a few megabytes against 2.5
+gibibytes of weights.
 
 **The reference, measured properly, is in the same range**, and an earlier
 figure saying otherwise was wrong. `llama-completion` on the same file and the
@@ -950,13 +1234,20 @@ same box, same prompt, 8 generated tokens:
 The 0.10 at 32 threads is where "llama.cpp does 0.20 tok/s on this
 architecture" came from. It is not a property of llama.cpp or of this
 architecture, it is four times oversubscription against an eight-core cgroup
-quota, the same barrier effect that costs this runner half its speed at eight
-threads. Best against best, this runner is about 23 per cent ahead; at the same
-eight threads the reference is about 15 per cent ahead of it.
+quota, the same barrier effect that cost this runner half its speed at eight
+threads. Best against best, this runner was about 23 per cent ahead; at the same
+eight threads the reference was about 15 per cent ahead of it.
 
-So the reference is not a floor to walk over. The bar is memory bandwidth,
-which batch-1 generation hits by reading every weight once per token, and
-establishing where that bar actually is belongs to the throughput ticket.
+So the reference is not a floor to walk over. The bar is memory bandwidth, which
+batch-1 generation hits by reading every weight once per token. That bar is
+measured now, at about 48.6 GiB/s and so 19 generation tok/s on this box, and
+`docs/benchmarks.md` has the comparison against the reference per thread count
+from `llama-bench` rather than from one `llama-completion` run: generation is
+within 11 per cent of it at every thread count from 1 to 8 with the flags
+matched and ahead at 8, and the prompt is a factor 2.1 to 2.3 behind, down from
+the factor 4 to 7 it was before the prompt was batched. What is left on the
+prompt side is a kernel shape, not a schedule: the reference turns a batch into
+a true matrix-matrix multiply over a repacked weight layout.
 
 ## What the checks cost
 
@@ -969,14 +1260,40 @@ no signal in it. Measured on this box:
 | `cargo test --workspace --all-targets` (the default set, no weights needed) | 47 s cold, 25 s warm |
 | of which `tests/sample.rs`, `tests/sample_allocations.rs` and `tests/tiny_model.rs` | 2 s, 2 s, 3 s |
 | of which `tests/serve.rs`, which starts the server and drives both endpoints | 2 s |
-| gate: `every_next_token_matches_the_reference` | 2:01 |
-| gate: `greedy_output_is_unchanged` | 2:10 |
-| gate: `resetting_the_caches_is_the_same_as_a_fresh_runner` | 27 s |
-| gate: `the_thread_count_does_not_change_the_output` | 21 s |
-| `the_generation_loop_allocates_nothing_per_token` | 14 s |
-| fixture re-derivation, one prompt | 20 to 35 s |
-| fixture re-derivation, all ten prompts | about 4 min |
+| the whole `--ignored` set, one test at a time, which is both gates and everything else needing weights | 4:50 |
+| of which `tests/gate.rs`, its six tests in sequence: the two gates, the reset and thread-count checks, the batched-prompt check and the fixture re-derivation against the reference | 4:33 |
+| the same six left to the harness, which runs them all at once | 6:38 |
+| of which `tests/allocations.rs`, whose ignored test is `the_generation_loop_allocates_nothing_per_token` | 16 s |
+| `rust-llm bench` at one thread count, 192-token prompt, 3 repeats | 25 s to 1:30 |
+| `rust-llm bench --threads 1,2,3,4,5,6,7,8`, the whole sweep | 5:07 |
+| `rust-llm profile`, 192-token prompt | 30 s |
+| `rust-llm profile`, 2048-token prompt (long-context attention) | 1:41 |
+| `rust-llm profile`, 4096-token prompt | 3:52 |
+| `llama-bench -p 192 -n 16 -t 1,2,3,4,5,6,7,8 -r 3`, one flag set | 2:44 |
+| writing the fixture (`RUST_LLM_WRITE_FIXTURE`), one command per prompt | 20 to 35 s a prompt, about 4 min for all ten |
 | per-layer trace comparison against the reference | 40 s |
+
+One test at a time, `--test-threads=1`, is the only way to run that set. Left to
+itself the harness starts all six of `tests/gate.rs` at once, each loading the
+model and starting a worker pool on all 8 threads of the quota, which was
+measured at 40 threads and 17 GiB resident inside a quota of 8 CPUs: nothing
+measured next to a run like that means anything. It is also slower, and the two
+numbers above are the same six tests on the same build, as the harness itself
+reported them: 4:33 in sequence against 6:38 at once.
+
+The rows are per test binary, because that is what the harness reports. A single
+test run on its own costs its own model load on top, so the set in sequence is
+cheaper than the tests that make it up added together.
+
+A tok/s figure printed by one of those tests is not a speed measurement even
+then: the gates measure agreement with the timers incidental, and
+`docs/benchmarks.md` measures speed.
+
+The measurement rows are there because the budget rule is per step: nothing in
+that list is a wait with no signal in it, and the two longest ones are the price
+of a prompt that fills the context, which is the only way attention shows up at
+all. A configuration that does not fit in ten minutes is measured smaller and
+the file says what the run was.
 
 The default `cargo test` holds no weights and no reference, so it is the same
 35 seconds in CI. The gate tests are `#[ignore]`d because they need the model

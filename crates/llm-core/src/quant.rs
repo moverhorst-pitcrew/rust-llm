@@ -246,24 +246,58 @@ impl Default for ActBlock {
     }
 }
 
-/// Reusable int8 activation scratch.
+/// One row of int8 activations as a kernel sees it.
 ///
-/// Allocated once from the largest `K` in the model and refilled per matmul, so
-/// the forward pass never allocates. The tail of the last super-block is zeroed
-/// rather than special-cased: a zero activation kills whatever the weight row
-/// holds past `K`, which is what makes a `K` that is not a multiple of the
-/// block length fall out for free in every kernel.
+/// A kernel never needs to know whether its row came from a single token or
+/// out of a batch, which is why this is what [`crate::kernels::VecDot`] takes
+/// and not the scratch buffer below.
+#[derive(Clone, Copy)]
+pub struct ActRow<'a> {
+    pub blocks: &'a [ActBlock],
+    /// The `K` these blocks were quantized from. The tail of the last block is
+    /// zeroed, so this is needed only to count the blocks of a weight type
+    /// whose block length is shorter than [`QK_K`].
+    pub k: usize,
+}
+
+/// Reusable int8 activation scratch, for one row or for a batch of them.
+///
+/// Allocated once from the largest `K` in the model and the largest batch, and
+/// refilled per matmul, so the forward pass never allocates. The tail of the
+/// last super-block of every row is zeroed rather than special-cased: a zero
+/// activation kills whatever the weight row holds past `K`, which is what makes
+/// a `K` that is not a multiple of the block length fall out for free in every
+/// kernel.
+///
+/// A batch is `t` rows of the same `K`, each quantized exactly as it would be
+/// on its own: the scale is per row and per super-block, so no row's quants
+/// depend on another's. That is what makes a batched matmul produce the same
+/// bits as `t` single ones.
 pub struct Activations {
     blocks: Vec<ActBlock>,
+    /// Blocks per row, from `max_k`; row `t` starts at `t * stride`.
+    stride: usize,
+    max_t: usize,
     k: usize,
+    t: usize,
 }
 
 impl Activations {
-    /// Allocates scratch for up to `max_k` activations.
+    /// Allocates scratch for one row of up to `max_k` activations.
     pub fn new(max_k: usize) -> Self {
+        Self::with_batch(max_k, 1)
+    }
+
+    /// Allocates scratch for up to `max_t` rows of up to `max_k` activations.
+    pub fn with_batch(max_k: usize, max_t: usize) -> Self {
+        let stride = max_k.div_ceil(QK_K);
+        let max_t = max_t.max(1);
         Self {
-            blocks: vec![ActBlock::default(); max_k.div_ceil(QK_K)],
+            blocks: vec![ActBlock::default(); stride * max_t],
+            stride,
+            max_t,
             k: 0,
+            t: 1,
         }
     }
 
@@ -271,31 +305,69 @@ impl Activations {
         self.k
     }
 
-    pub fn blocks(&self) -> &[ActBlock] {
-        &self.blocks[..self.k.div_ceil(QK_K)]
+    /// Rows in the batch currently quantized here.
+    pub fn t(&self) -> usize {
+        self.t
     }
 
-    /// Quantizes `x` into the scratch. Panics if `x` is longer than the scratch
-    /// was sized for, because growing it would allocate in the hot loop.
+    pub fn max_t(&self) -> usize {
+        self.max_t
+    }
+
+    /// The first row, which is the only one a single-token pass fills.
+    pub fn blocks(&self) -> &[ActBlock] {
+        self.row(0).blocks
+    }
+
+    pub fn row(&self, t: usize) -> ActRow<'_> {
+        debug_assert!(t < self.t);
+        ActRow {
+            blocks: &self.blocks[t * self.stride..][..self.k.div_ceil(QK_K)],
+            k: self.k,
+        }
+    }
+
+    /// Quantizes one row. Panics if `x` is longer than the scratch was sized
+    /// for, because growing it would allocate in the hot loop.
     pub fn quantize(&mut self, x: &[f32]) {
-        let nb = x.len().div_ceil(QK_K);
-        assert!(
-            nb <= self.blocks.len(),
-            "activation scratch holds {} values, got {}",
-            self.blocks.len() * QK_K,
+        self.quantize_batch(x, x.len());
+    }
+
+    /// Quantizes `x.len() / k` rows of `k` activations each.
+    pub fn quantize_batch(&mut self, x: &[f32], k: usize) {
+        let nb = k.div_ceil(QK_K);
+        let t = x.len().checked_div(k).unwrap_or(1);
+        assert_eq!(
+            t * k,
+            x.len(),
+            "{} values are not whole rows of {k}",
             x.len()
         );
-        self.k = x.len();
-        for (b, chunk) in self.blocks[..nb].iter_mut().zip(x.chunks(QK_K)) {
-            let amax = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            b.d = amax / 127.0;
-            let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-            b.qs.fill(0);
-            for (q, v) in b.qs.iter_mut().zip(chunk) {
-                *q = (v * id).round().clamp(-127.0, 127.0) as i8;
-            }
-            for (i, s) in b.bsums.iter_mut().enumerate() {
-                *s = b.qs[i * 16..i * 16 + 16].iter().map(|&q| q as i16).sum();
+        assert!(
+            nb <= self.stride,
+            "activation scratch holds rows of {} values, got {k}",
+            self.stride * QK_K,
+        );
+        assert!(
+            t <= self.max_t,
+            "activation scratch holds {} rows, got {t}",
+            self.max_t
+        );
+        self.k = k;
+        self.t = t;
+        let stride = self.stride;
+        for (row, src) in self.blocks.chunks_mut(stride).zip(x.chunks(k)) {
+            for (b, chunk) in row[..nb].iter_mut().zip(src.chunks(QK_K)) {
+                let amax = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                b.d = amax / 127.0;
+                let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                b.qs.fill(0);
+                for (q, v) in b.qs.iter_mut().zip(chunk) {
+                    *q = (v * id).round().clamp(-127.0, 127.0) as i8;
+                }
+                for (i, s) in b.bsums.iter_mut().enumerate() {
+                    *s = b.qs[i * 16..i * 16 + 16].iter().map(|&q| q as i16).sum();
+                }
             }
         }
     }

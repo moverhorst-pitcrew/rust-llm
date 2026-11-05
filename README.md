@@ -14,6 +14,8 @@ No llama.cpp, no ggml, no C or C++ anywhere in the build.
 - `fixtures/` — committed test fixtures and the script that regenerates them.
 - `docs/models.md` — which model, where to get it, and what is inside the file.
 - `docs/decisions.md` — every crate and data-layout choice with its reason.
+- `docs/benchmarks.md` — the machine, the measured bandwidth ceiling, and every
+  performance number with the command that produced it.
 
 ## Building
 
@@ -157,11 +159,63 @@ weights by a tiny committed model the tests write themselves. With the real
 model on disk (see `docs/models.md`):
 
 ```sh
-cargo test --workspace --release -- --ignored --nocapture
+cargo test --workspace --release -- --ignored --nocapture --test-threads=1
 ```
+
+`--test-threads=1` is not optional for that set. Every test in it loads the
+model and starts a worker pool on all cores, so the harness's default of running
+them in parallel oversubscribes the machine several times over: it makes the run
+slower, it multiplies the resident memory by the number of tests, and any
+measurement taken at the same time is meaningless.
+
+One test in that set, `the_fixture_is_still_what_the_reference_produces`, also
+needs a built reference runner and fails without one: point
+`RUST_LLM_REFERENCE_BIN` at the directory holding `llama-completion`, which is
+the only variable the test needs because it passes `LD_LIBRARY_PATH` to the
+reference itself. Forgetting it does not cost only that test: the failing test
+binary ends the whole run, so the binaries after `tests/gate.rs` never run and
+the red is the missing variable rather than a broken gate. The build recipe is
+in `docs/decisions.md` under "The reference harness".
 
 Kernel microbenchmark:
 
 ```sh
 cargo run --release -p llm-core --example bench_kernels
 ```
+
+## Measuring
+
+Throughput, as a median of repeated runs with the spread reported, per thread
+count:
+
+```sh
+rust-llm bench --context 1024 --threads 1,2,3,4,5,6,7,8 --prompt-tokens 192 \
+  --max-tokens 16 --repeats 3
+```
+
+The prompt is a fixed text truncated to exactly `--prompt-tokens` tokens, or
+repeated if more are asked for than its 204, and generation runs exactly
+`--max-tokens` tokens through the forward pass and ignores stop tokens, so two
+runs measure the same work. The prompt is read in batches of `--batch` tokens,
+16 by default, which is what makes it faster per token than generation; a prompt
+of fewer tokens than the batch is one batch. The first run of each
+thread count is a warm-up and is not counted. Every configuration prints its
+thread count, context, prompt length, generated tokens, kernel tier, the cgroup
+CPU quota and the load average before and after, because this box is shared and
+a number without those is not comparable with another one.
+
+Where the time goes, per operator, for the prompt phase and for generation:
+
+```sh
+rust-llm profile --context 1024 --threads 8 --prompt-tokens 192 --max-tokens 8
+```
+
+What the machine can stream from memory, which is the ceiling batch-1
+generation runs into:
+
+```sh
+cargo run --release -p llm-core --example bench_bandwidth
+```
+
+`docs/benchmarks.md` holds the numbers these produce on the development box,
+with llama.cpp on the same file at matching thread counts.

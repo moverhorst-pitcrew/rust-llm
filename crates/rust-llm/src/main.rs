@@ -11,15 +11,17 @@ use std::process::ExitCode;
 use rust_llm::chat::{ChatOptions, Message};
 use rust_llm::forward::Runner;
 use rust_llm::model::Model;
-use rust_llm::sample::{Sampler, Sampling, entropy_seed};
-use rust_llm::{Stop, Tokenizer, generate};
+use rust_llm::sample::{self, Sampler, Sampling, entropy_seed};
+use rust_llm::{Stop, Tokenizer, bench, default_threads, generate, peak_rss_kib};
 
-use llm_core::Gguf;
+use llm_core::{Gguf, Kernels, Tier};
 
 const USAGE: &str = "\
 rust-llm run --prompt <text> [options]
 rust-llm chat [options]
 rust-llm serve [options]
+rust-llm bench [options]
+rust-llm profile [options]
 rust-llm trace --prompt <text> [options]
 
   run     generate from the prompt and stream the result
@@ -29,6 +31,10 @@ rust-llm trace --prompt <text> [options]
   serve   an OpenAI-compatible HTTP server: POST /v1/chat/completions
           and POST /v1/completions, streaming and not. One request is
           answered at a time; the options below are its defaults.
+  bench   prompt and generation tok/s, median of repeated runs, per thread
+          count (see docs/benchmarks.md)
+  profile where the time goes per operator, one table for the prompt phase
+          and one for generation (see docs/benchmarks.md)
   trace   print one per-layer activation sum per line, for comparison
           against a reference runner (see docs/decisions.md)
 
@@ -38,8 +44,14 @@ options
   --prompt <text>       the user message (required by run and trace)
   --system <text>       a system message, placed first
   --context <n>         positions to allocate for the KV cache (default 4096)
-  --threads <n>         worker threads (default: all cores)
-  --max-tokens <n>      stop after this many generated tokens (default 512)
+  --threads <n>[,<n>..] worker threads; bench takes a list and runs each
+                        (default: all cores)
+  --max-tokens <n>      stop after this many generated tokens (default 512,
+                        bench 16, and bench generates exactly this many)
+  --batch <n>           tokens per batch while reading the prompt (default:
+                        see docs/decisions.md; 1 reads it token by token)
+  --tier <name>         pin the kernel tier (scalar, avx2+fma, avx2+vnni)
+                        instead of taking the strongest the CPU reports
   --think, --no-think   thinking mode, on by default, as the template is
   --raw                 take --prompt as the prompt verbatim, no chat template
   --host <addr>         serve: address to listen on (default 127.0.0.1)
@@ -55,6 +67,13 @@ sampling
   --repeat-penalty <f>  1 is off (default 1)
   --repeat-last-n <n>   tokens the penalty looks back over (default 64)
   --seed <n>            default: from entropy, printed to stderr
+
+bench and profile
+  --prompt-tokens <n>   prompt length, taken from a fixed text (default 19)
+
+bench only
+  --repeats <n>         timed runs per thread count, after one warm-up that
+                        is not counted (default 5)
 ";
 
 struct Args {
@@ -64,8 +83,14 @@ struct Args {
     prompt: String,
     system: Option<String>,
     context: usize,
-    threads: usize,
-    max_tokens: usize,
+    /// One for every command but `bench`, which runs them all.
+    threads: Vec<usize>,
+    /// `None` is the command's own default: 512 for `run`, 16 for `bench`.
+    max_tokens: Option<usize>,
+    batch: usize,
+    tier: Option<String>,
+    prompt_tokens: usize,
+    repeats: usize,
     thinking: bool,
     raw: bool,
     sampling: Sampling,
@@ -104,12 +129,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let gguf = Gguf::open(&args.model)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
     tokenizer.verify_against_weights(&gguf)?;
-    let model = Model::load(&gguf)?;
-    let mut runner = Runner::new(&model, args.context, args.threads);
+    let model = match &args.tier {
+        None => Model::load(&gguf)?,
+        Some(name) => {
+            let tier = Tier::parse(name).ok_or_else(|| {
+                format!(
+                    "unknown --tier {name:?}; one of {}",
+                    Tier::ALL.map(|t| t.as_str()).join(", ")
+                )
+            })?;
+            let kernels = Kernels::for_tier(tier)
+                .ok_or_else(|| format!("this CPU cannot run the {name} kernels"))?;
+            Model::with_kernels(&gguf, kernels)?
+        }
+    };
     let load = load.elapsed();
 
+    // Before the runner: each of these builds its own, one per thread count.
+    if args.command == "bench" {
+        return bench(&model, &tokenizer, &args, load);
+    }
+    if args.command == "profile" {
+        return profile(&model, &tokenizer, &args);
+    }
+
+    let mut runner = Runner::with_batch(&model, args.context, args.threads[0], args.batch);
+
     eprintln!(
-        "model {} ({} blocks, {} full attention, {} linear), kernels {}, {} threads, context {}",
+        "model {} ({} blocks, {} full attention, {} linear), kernels {}, {} threads, context {}, prompt batch {}",
         args.model.display(),
         model.config.n_blocks,
         model.config.n_full_blocks(),
@@ -117,6 +164,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         runner.kernels().tier().as_str(),
         runner.threads(),
         runner.context(),
+        runner.max_batch(),
     );
 
     if args.command == "trace" {
@@ -249,7 +297,8 @@ fn stream(
 ) -> Result<(Vec<u32>, Stop, generate::Timings), Box<dyn std::error::Error>> {
     let mut stdout = std::io::stdout();
     let mut streamed_a_broken_character = false;
-    let (ids, stop, timings) = generate::generate(runner, sampler, tokens, args.max_tokens, |id| {
+    let max_tokens = args.max_tokens.unwrap_or(512);
+    let (ids, stop, timings) = generate::generate(runner, sampler, tokens, max_tokens, |id| {
         if let Ok(text) = tokenizer.decode(&[id], false) {
             streamed_a_broken_character |= text.contains(char::REPLACEMENT_CHARACTER);
             let _ = stdout.write_all(text.as_bytes());
@@ -291,7 +340,7 @@ fn serve(
             )
             .into_owned(),
         system: args.system.clone(),
-        max_tokens: args.max_tokens,
+        max_tokens: args.max_tokens.unwrap_or(512),
         thinking: args.thinking,
         sampling: args.sampling,
         seed: args.seed,
@@ -408,8 +457,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
         prompt: String::new(),
         system: None,
         context: 4096,
-        threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
-        max_tokens: 512,
+        threads: vec![default_threads()],
+        max_tokens: None,
+        batch: rust_llm::forward::DEFAULT_BATCH,
+        tier: None,
+        prompt_tokens: 19,
+        repeats: 5,
         thinking: true,
         raw: false,
         sampling: Sampling::default(),
@@ -444,8 +497,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
                     .map_err(|_| format!("--port needs a port number, got {v:?}"))?;
             }
             "--context" => out.context = number(&value()?, "--context")?,
-            "--threads" => out.threads = number(&value()?, "--threads")?.max(1),
-            "--max-tokens" => out.max_tokens = number(&value()?, "--max-tokens")?,
+            "--threads" => out.threads = thread_list(&value()?)?,
+            "--max-tokens" => out.max_tokens = Some(number(&value()?, "--max-tokens")?),
+            "--batch" => out.batch = number(&value()?, "--batch")?.max(1),
+            "--tier" => out.tier = Some(value()?),
+            "--prompt-tokens" => out.prompt_tokens = number(&value()?, "--prompt-tokens")?.max(1),
+            "--repeats" => out.repeats = number(&value()?, "--repeats")?.max(1),
             "--temperature" => {
                 out.sampling.temperature = positive(&value()?, "--temperature", true)?
             }
@@ -474,7 +531,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     if out.command.is_empty() {
         return Ok(None);
     }
-    if !matches!(out.command.as_str(), "run" | "chat" | "serve" | "trace") {
+    if !matches!(
+        out.command.as_str(),
+        "run" | "chat" | "serve" | "bench" | "profile" | "trace"
+    ) {
         return Err(format!("unknown command {:?}\n\n{USAGE}", out.command));
     }
     if matches!(out.command.as_str(), "run" | "trace") && !seen_prompt {
@@ -528,11 +588,136 @@ fn positive(s: &str, what: &str, zero_allowed: bool) -> Result<f32, String> {
     Ok(v)
 }
 
-/// `VmHWM` from `/proc/self/status`, where it exists.
-fn peak_rss_kib() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("VmHWM:")?.split_whitespace().next())
-        .and_then(|v| v.parse().ok())
+/// `rust-llm bench`: the fixed prompt, truncated to an exact token count, run
+/// at every thread count the sweep asks for.
+///
+/// The prompt is truncated in token space rather than in characters, so
+/// `--prompt-tokens 19` is 19 tokens and not "about 19": the comparison
+/// between two commits is only worth something if the amount of work is the
+/// same on both sides.
+fn bench(
+    model: &Model<'_>,
+    tokenizer: &Tokenizer,
+    args: &Args,
+    load: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let generate = args.max_tokens.unwrap_or(16);
+    if args.prompt_tokens + generate > args.context {
+        return Err(format!(
+            "prompt {} plus {generate} generated tokens does not fit a context of {}",
+            args.prompt_tokens, args.context
+        )
+        .into());
+    }
+    let prompt = bench_prompt(tokenizer, args.prompt_tokens)?;
+    let prompt = &prompt[..];
+
+    eprintln!(
+        "model {} ({} blocks), loaded in {:.2}s",
+        args.model.display(),
+        model.config.n_blocks,
+        load.as_secs_f64(),
+    );
+    bench::sweep(
+        model,
+        prompt,
+        &args.threads,
+        &bench::Options {
+            context: args.context,
+            generate,
+            repeats: args.repeats,
+            batch: args.batch,
+        },
+    );
+    Ok(())
+}
+
+/// `rust-llm profile`: one table for the prompt phase and one for generation,
+/// over the same fixed text `bench` uses so the two commands describe the same
+/// work.
+///
+/// The warm-up is not in either table: it runs before the timers are cleared.
+fn profile(
+    model: &Model<'_>,
+    tokenizer: &Tokenizer,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let generate = args.max_tokens.unwrap_or(16);
+    let prompt = bench_prompt(tokenizer, args.prompt_tokens)?;
+    let prompt = &prompt[..];
+    // The same check `bench` makes, and for the same reason: without it the
+    // run ends in the forward pass's assert instead of saying what to change.
+    if prompt.len() + generate > args.context {
+        return Err(format!(
+            "prompt {} plus {generate} generated tokens does not fit a context of {}",
+            prompt.len(),
+            args.context
+        )
+        .into());
+    }
+    let mut runner = Runner::with_batch(model, args.context, args.threads[0], args.batch);
+
+    eprintln!(
+        "quota {}, load {:.2}",
+        bench::cpu_quota().unwrap_or_else(|| "unknown".into()),
+        bench::load_average().unwrap_or(f64::NAN),
+    );
+
+    // One pass with the timers off, so page faults and thread start-up are
+    // not in the table.
+    bench::warm_up(&mut runner, prompt, generate);
+    runner.enable_profile();
+
+    runner.clear_profile();
+    runner.reset();
+    let mut read = 0;
+    while read < prompt.len() {
+        let take = (prompt.len() - read).min(runner.max_batch());
+        runner.forward_batch(&prompt[read..read + take]);
+        read += take;
+    }
+    print!("{}", runner.profile_report("prompt", prompt.len()));
+
+    let mut next = sample::argmax(runner.logits());
+    runner.clear_profile();
+    for _ in 0..generate {
+        next = sample::argmax(runner.forward(next));
+    }
+    println!();
+    print!("{}", runner.profile_report("generation", generate));
+    Ok(())
+}
+
+/// Exactly `n` tokens of the fixed bench text, repeated if `n` is more than it
+/// holds.
+///
+/// Repeating rather than refusing, because the long-context configurations
+/// need a prompt that fills the context and the measurement does not care what
+/// the text says: what matters is that two runs read the same `n` tokens, so
+/// the work being compared is the same. The copies are joined with a space, so
+/// a copy boundary is an ordinary word boundary rather than a token that exists
+/// nowhere else in the text.
+fn bench_prompt(tokenizer: &Tokenizer, n: usize) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let mut ids = tokenizer.encode(bench::FILLER, true)?;
+    if n > ids.len() {
+        let copies = n.div_ceil(ids.len());
+        ids = tokenizer.encode(&vec![bench::FILLER; copies].join(" "), true)?;
+    }
+    assert!(
+        ids.len() >= n,
+        "{n} tokens asked for, the repeated bench text gives {}",
+        ids.len()
+    );
+    ids.truncate(n);
+    Ok(ids)
+}
+
+/// `4` or `1,2,3,4`: one thread count for `run`, a sweep for `bench`.
+///
+/// Always at least one count: `split` yields one empty part for an empty
+/// argument, and that fails in [`number`].
+fn thread_list(s: &str) -> Result<Vec<usize>, String> {
+    s.split(',')
+        .map(|part| number(part.trim(), "--threads").map(|n| n.max(1)))
+        .collect()
 }

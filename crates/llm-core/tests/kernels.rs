@@ -310,6 +310,81 @@ fn weight_lanes_past_k_do_not_contribute() {
     }
 }
 
+/// The batched kernel has to agree with the single one **bit for bit**, not
+/// just within a tolerance.
+///
+/// It is a restructuring, not a different algorithm: the same products are
+/// accumulated in the same order, and all that moves is where the weight block
+/// is unpacked. Checking it against the scalar reference with a tolerance would
+/// pass a batched kernel that reorders the accumulation, and that would change
+/// the runner's output when a prompt is read in batches, which is exactly what
+/// the correctness gate forbids.
+///
+/// Batch sizes deliberately straddle [`Kernels::BATCH_GROUP`]: a batch longer
+/// than one group is run as several, and a group that is not full is the
+/// remainder of every batch that is not a multiple of it.
+#[test]
+fn the_batched_kernel_is_bit_identical_to_the_single_one() {
+    let group = Kernels::BATCH_GROUP;
+    let batches = [1usize, 2, 7, group - 1, group, group + 1, 2 * group + 3];
+    for &ty in &TYPES {
+        for &(k, rows) in AWKWARD_SHAPES.iter().chain(&[(2560, 64), (9216, 48)]) {
+            let nb = k.div_ceil(ty.block_len());
+            let stride = ty.bytes_for(k as u64).expect("fits") as usize;
+            let mut rng = Rng::new(0xba7c4 + k as u64);
+            let w = random_weights(ty, &mut rng, nb * rows);
+            for &t in &batches {
+                // One buffer of `t` rows, and the same rows one at a time.
+                let x: Vec<f32> = (0..t * k).map(|_| rng.signed() * 3.0).collect();
+                let mut batch = Activations::with_batch(k, t);
+                batch.quantize_batch(&x, k);
+                let mut single = Activations::new(k);
+                for (tier, kernels) in available_tiers() {
+                    let batched = kernels.vec_dot_batch(ty);
+                    for r in 0..rows {
+                        let row = &w[r * stride..(r + 1) * stride];
+                        let mut got = vec![0.0f32; t];
+                        let mut from = 0;
+                        while from < t {
+                            let n = (t - from).min(group);
+                            match batched {
+                                Some(dot) => dot(row, &batch, from, &mut got[from..from + n]),
+                                // No batched kernel on this tier: then the
+                                // batch runs through the single one, which is
+                                // trivially identical, and this loop still
+                                // checks that the batch's quantization of row
+                                // `t` is the single path's.
+                                None => {
+                                    for (j, o) in got[from..from + n].iter_mut().enumerate() {
+                                        *o = kernels.vec_dot(ty).expect("kernel")(
+                                            row,
+                                            batch.row(from + j),
+                                        );
+                                    }
+                                }
+                            }
+                            from += n;
+                        }
+                        for (j, &got) in got.iter().enumerate() {
+                            single.quantize(&x[j * k..(j + 1) * k]);
+                            let mut want = [f32::NAN];
+                            kernels
+                                .matvec(ty, row, k, &single, &mut want)
+                                .expect("kernel");
+                            assert_eq!(
+                                got, want[0],
+                                "{ty:?} {tier:?} k={k} t={t} row={r} batch row {j}: \
+                                 batched {got} against single {}",
+                                want[0]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn unsupported_types_are_refused() {
     let kernels = Kernels::detect();

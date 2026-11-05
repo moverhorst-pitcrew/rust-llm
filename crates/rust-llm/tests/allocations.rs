@@ -113,7 +113,11 @@ fn the_generation_loop_allocates_nothing_per_token() {
     let tokenizer =
         Tokenizer::from_file(format!("{FIXTURES}/tokenizer.json")).expect("tokenizer.json");
     let prompt = prompt_tokens(&tokenizer);
-    let mut runner = Runner::new(&model, 256, 4);
+    // The largest batch this test uses, so `Runner::new` sizes the scratch for
+    // all of them and the batched windows below are measured against buffers
+    // that already exist.
+    const BATCH: usize = 8;
+    let mut runner = Runner::with_batch(&model, 256, 4, BATCH);
 
     // The prompt is the warm-up: it runs every block of both kinds, fills the
     // conv and delta-net states and writes the first KV positions, so anything
@@ -136,6 +140,32 @@ fn the_generation_loop_allocates_nothing_per_token() {
          entirely out of buffers allocated by Runner::new"
     );
     println!("{tokens} forward passes, {n} allocations");
+
+    // The same for the batched prompt path, which has its own scratch: `t`
+    // rows of every buffer and `t` rows of activation blocks, all sized by
+    // `Runner::new`. Several batch sizes, because what would allocate is a
+    // buffer sized from the batch rather than from the maximum, and a batch
+    // smaller than the maximum would not catch that.
+    let mut batched = Vec::new();
+    for batch in [1usize, 3, BATCH] {
+        runner.reset();
+        let mut read = 0;
+        let n = allocations(|| {
+            while read < prompt.len() {
+                let take = (prompt.len() - read).min(batch);
+                runner.forward_batch(&prompt[read..read + take]);
+                read += take;
+            }
+        });
+        batched.push((batch, read, n));
+    }
+    for (batch, read, n) in &batched {
+        println!("batch {batch}: {read} prompt tokens, {n} allocations");
+    }
+    assert!(
+        batched.iter().all(|&(_, _, n)| n == 0),
+        "a batched prompt allocated: {batched:?}"
+    );
 
     // Greedy and the full pipeline, because what the sampler costs is a
     // per-call budget too: every one of its buffers comes out of
