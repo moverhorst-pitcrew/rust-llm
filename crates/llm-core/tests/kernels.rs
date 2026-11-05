@@ -323,10 +323,33 @@ fn weight_lanes_past_k_do_not_contribute() {
 /// Batch sizes deliberately straddle [`Kernels::BATCH_GROUP`]: a batch longer
 /// than one group is run as several, and a group that is not full is the
 /// remainder of every batch that is not a multiple of it.
+///
+/// They also straddle the kernels' internal token sub-group, which is where the
+/// accumulators that stay live across the sub-blocks are bounded by the register
+/// file. That size is not public, so rather than couple the test to it every
+/// count from 1 to 9 is here along with the ones around `BATCH_GROUP`: whichever
+/// sub-group the kernels pick out of the register file, this list has a batch
+/// one short of it, exactly it, and one past it, and so exercises the tail that
+/// is shorter than a sub-group.
 #[test]
 fn the_batched_kernel_is_bit_identical_to_the_single_one() {
     let group = Kernels::BATCH_GROUP;
-    let batches = [1usize, 2, 7, group - 1, group, group + 1, 2 * group + 3];
+    let batches = [
+        1usize,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        group - 1,
+        group,
+        group + 1,
+        2 * group + 3,
+    ];
     for &ty in &TYPES {
         for &(k, rows) in AWKWARD_SHAPES.iter().chain(&[(2560, 64), (9216, 48)]) {
             let nb = k.div_ceil(ty.block_len());

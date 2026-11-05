@@ -10,7 +10,8 @@
 use std::arch::x86_64::*;
 
 use super::avx2::{
-    hsum_i32, q4k_imin, q4k_mins_vec, q4k_unpack, q6k_bias, q6k_scales_vec, q6k_unpack,
+    SUB_GROUP, act_blocks, hsum_i32, q4k_finish, q4k_imin, q4k_mins_vec, q4k_unpack, q6k_bias,
+    q6k_finish, q6k_scales_vec, q6k_unpack,
 };
 use crate::quant::{
     ActBlock, ActRow, Activations, Q4_K_BYTES, Q6_K_BYTES, QK_K, q4k_scale_min, read_f16,
@@ -49,26 +50,52 @@ unsafe fn q4k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
             );
         }
         let mins_vec = q4k_mins_vec(&mins);
-        for (j, o) in out.iter_mut().enumerate() {
-            let ab = &a.row(t0 + j).blocks[ib];
-            let aqs = ab.qs.as_ptr();
-            let mut acc = zero;
-            for (t, &scv) in scv.iter().enumerate() {
-                let dp0 = _mm256_dpbusd_avx_epi32(
-                    zero,
-                    _mm256_loadu_si256(qw.as_ptr().add(64 * t).cast()),
-                    _mm256_loadu_si256(aqs.add(64 * t).cast()),
-                );
+        in_sub_groups!(a, t0, ib, out, |abs, o| q4k_sub_group(
+            &qw, &scv, mins_vec, d, dmin, abs, o
+        ));
+    }
+}
+
+/// One sub-group of tokens against one unpacked `Q4_K` super-block.
+///
+/// The sub-block-pair loop is the outer one, so its two weight vectors are
+/// loaded once for the whole sub-group instead of once per token. Register
+/// pressure is higher here than on the AVX2 tier: `N` accumulators plus two
+/// weight vectors, the scale vector and the two `VPDPBUSD` results that go into
+/// `VPACKSSDW`, which is what keeps `SUB_GROUP` where it is.
+///
+/// Every token's accumulator still collects the same four scaled sub-block pairs
+/// in the same order, and the f32 line still runs once per super-block.
+#[inline]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn q4k_sub_group<const N: usize>(
+    qw: &[u8; QK_K],
+    scv: &[__m256i; 4],
+    mins_vec: __m256i,
+    d: f32,
+    dmin: f32,
+    abs: [&ActBlock; N],
+    out: &mut [f32],
+) {
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let mut acc = [zero; N];
+        for (t, &scv) in scv.iter().enumerate() {
+            let w0 = _mm256_loadu_si256(qw.as_ptr().add(64 * t).cast());
+            let w1 = _mm256_loadu_si256(qw.as_ptr().add(64 * t + 32).cast());
+            for (acc, ab) in acc.iter_mut().zip(&abs) {
+                let aqs = ab.qs.as_ptr();
+                let dp0 =
+                    _mm256_dpbusd_avx_epi32(zero, w0, _mm256_loadu_si256(aqs.add(64 * t).cast()));
                 let dp1 = _mm256_dpbusd_avx_epi32(
                     zero,
-                    _mm256_loadu_si256(qw.as_ptr().add(64 * t + 32).cast()),
+                    w1,
                     _mm256_loadu_si256(aqs.add(64 * t + 32).cast()),
                 );
-                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_packs_epi32(dp0, dp1), scv));
+                *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(_mm256_packs_epi32(dp0, dp1), scv));
             }
-            let imin = q4k_imin(mins_vec, &ab.bsums);
-            *o += ab.d * (d * hsum_i32(acc) as f32 - dmin * imin as f32);
         }
+        q4k_finish(out, &abs, acc, mins_vec, d, dmin);
     }
 }
 
@@ -96,21 +123,35 @@ unsafe fn q6k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
             *v = _mm256_set_epi32(s1, s1, s1, s1, s0, s0, s0, s0);
         }
         let scales_vec = q6k_scales_vec(sc);
-        for (j, o) in out.iter_mut().enumerate() {
-            let ab = &a.row(t0 + j).blocks[ib];
-            let aqs = ab.qs.as_ptr();
-            let mut acc = zero;
-            for (g, &scv) in scv.iter().enumerate() {
-                let dp = _mm256_dpbusd_avx_epi32(
-                    zero,
-                    _mm256_loadu_si256(qw.as_ptr().add(32 * g).cast()),
-                    _mm256_loadu_si256(aqs.add(32 * g).cast()),
-                );
-                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(dp, scv));
+        in_sub_groups!(a, t0, ib, out, |abs, o| q6k_sub_group(
+            &qw, &scv, scales_vec, d, abs, o
+        ));
+    }
+}
+
+/// One sub-group of tokens against one unpacked `Q6_K` super-block, as above.
+#[inline]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn q6k_sub_group<const N: usize>(
+    qw: &[u8; QK_K],
+    scv: &[__m256i; 8],
+    scales_vec: __m256i,
+    d: f32,
+    abs: [&ActBlock; N],
+    out: &mut [f32],
+) {
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let mut acc = [zero; N];
+        for (g, &scv) in scv.iter().enumerate() {
+            let wv = _mm256_loadu_si256(qw.as_ptr().add(32 * g).cast());
+            for (acc, ab) in acc.iter_mut().zip(&abs) {
+                let av = _mm256_loadu_si256(ab.qs.as_ptr().add(32 * g).cast());
+                let dp = _mm256_dpbusd_avx_epi32(zero, wv, av);
+                *acc = _mm256_add_epi32(*acc, _mm256_mullo_epi32(dp, scv));
             }
-            let bias = q6k_bias(scales_vec, &ab.bsums);
-            *o += ab.d * d * (hsum_i32(acc) - 32 * bias) as f32;
         }
+        q6k_finish(out, &abs, acc, scales_vec, d);
     }
 }
 
