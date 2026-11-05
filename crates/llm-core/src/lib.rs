@@ -11,4 +11,4 @@ pub mod qwen35;
 
 pub use gguf::{Gguf, GgufError, TensorView, Value};
 pub use kernels::{KernelError, Kernels, Tier};
-pub use quant::{Activations, GgmlType};
+pub use quant::{Activations, GgmlType, can_dequantize, dequantize_row};

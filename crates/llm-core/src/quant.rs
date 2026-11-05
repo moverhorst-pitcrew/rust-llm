@@ -121,6 +121,91 @@ pub(crate) fn read_f16(b: &[u8], off: usize) -> f32 {
     f16::from_bits(u16::from_le_bytes([b[off], b[off + 1]])).to_f32()
 }
 
+/// `true` where [`dequantize_row`] knows the layout of `ty`.
+///
+/// The model loader calls this once, so the forward pass can dequantize
+/// without a type check it cannot act on.
+pub fn can_dequantize(ty: GgmlType) -> bool {
+    use GgmlType::*;
+    matches!(ty, F32 | F16 | BF16 | Q4_K | Q6_K)
+}
+
+/// Expands one weight row into `out`.
+///
+/// This exists for the embedding lookup, which is the single place the product
+/// path needs a weight as f32: the row it wants is selected by a token id, not
+/// dotted with anything. Everything else meets the quantized bytes with int8
+/// activations and never materialises an f32 weight.
+///
+/// Panics on a type it does not know, which the loader has already rejected
+/// through [`can_dequantize`].
+pub fn dequantize_row(ty: GgmlType, w: &[u8], out: &mut [f32]) {
+    match ty {
+        GgmlType::F32 => {
+            for (o, b) in out.iter_mut().zip(w.as_chunks::<4>().0) {
+                *o = f32::from_le_bytes(*b);
+            }
+        }
+        GgmlType::F16 => {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = read_f16(w, i * 2);
+            }
+        }
+        GgmlType::BF16 => {
+            for (o, b) in out.iter_mut().zip(w.as_chunks::<2>().0) {
+                *o = f32::from_bits((u16::from_le_bytes(*b) as u32) << 16);
+            }
+        }
+        GgmlType::Q4_K => {
+            for (ib, chunk) in out.chunks_mut(QK_K).enumerate() {
+                let b = &w[ib * Q4_K_BYTES..(ib + 1) * Q4_K_BYTES];
+                let d = read_f16(b, 0);
+                let dmin = read_f16(b, 2);
+                let (scales, qs) = (&b[4..16], &b[16..]);
+                for (j, sub) in chunk.chunks_mut(32).enumerate() {
+                    let (sc, m) = q4k_scale_min(j, scales);
+                    // Sub-block 2t is the low nibbles of qs[32t..32t+32] and
+                    // 2t+1 the high nibbles of the same bytes.
+                    let qw = &qs[(j / 2) * 32..(j / 2) * 32 + 32];
+                    let shift = if j % 2 == 0 { 0 } else { 4 };
+                    for (o, &q) in sub.iter_mut().zip(qw) {
+                        *o = d * sc as f32 * ((q >> shift) & 0xF) as f32 - dmin * m as f32;
+                    }
+                }
+            }
+        }
+        GgmlType::Q6_K => {
+            for (ib, chunk) in out.chunks_mut(QK_K).enumerate() {
+                let b = &w[ib * Q6_K_BYTES..(ib + 1) * Q6_K_BYTES];
+                let (ql, qh, sc) = (&b[0..128], &b[128..192], &b[192..208]);
+                let d = read_f16(b, 208);
+                // Two halves of 128 values, each with 64 low-nibble bytes, 32
+                // high-bit bytes and 8 scales.
+                for h in 0..2 {
+                    let (ql_h, qh_h) = (&ql[h * 64..], &qh[h * 32..]);
+                    for g in 0..4 {
+                        for l in 0..32 {
+                            let low = match g {
+                                0 => ql_h[l] & 0xF,
+                                1 => ql_h[32 + l] & 0xF,
+                                2 => ql_h[l] >> 4,
+                                _ => ql_h[32 + l] >> 4,
+                            };
+                            let q = (low | (((qh_h[l] >> (2 * g)) & 3) << 4)) as i32 - 32;
+                            let s = sc[h * 8 + 2 * g + l / 16] as i8 as i32;
+                            let at = h * 128 + g * 32 + l;
+                            if at < chunk.len() {
+                                chunk[at] = d * (s * q) as f32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        other => panic!("dequantize_row does not know {other:?}"),
+    }
+}
+
 /// Unpacks the `j`-th 6-bit scale and min out of a `Q4_K` 12-byte scale block.
 ///
 /// This is the `get_scale_min_k4` packing from ggml: the first four pairs are

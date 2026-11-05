@@ -259,3 +259,145 @@ place for an image part to be dropped silently.
 The tests compare the renderer against all fifteen fixture prompts byte for
 byte, and the fixture records the template's sha256, so a different template
 fails rather than being rendered by the old rules.
+## The forward pass
+
+**One token at a time, for the prompt as much as for generation.** The
+delta-net recurrence is sequential over tokens, so a batched prompt path would
+only help the eight full-attention blocks and the feed-forward halves, and it
+would be a second code path through the twenty-four linear blocks. One path
+also makes the hand-over free: the state generation starts from is, by
+construction, the state the prompt produced, because it is the same buffer and
+nothing re-reads the prompt. Batched prompt evaluation belongs with the rest of
+the throughput work.
+
+**Every buffer is allocated by `Runner::new`, from the config.** The pass
+quantizes activations into scratch it owns, hands row ranges to the pool and
+writes into buffers that already exist. Buffers are shared between the two
+block kinds where their shapes allow it (`qkv` is sized for the larger of the
+query-and-gate projection and the conv dimension, `heads` for the larger of the
+attention output and the delta-net inner size), because there are only ever a
+few live at once and sizing each one separately would cost tens of megabytes
+for nothing.
+
+**The arithmetic deliberately copies the reference's, step for step**, and not
+in the way that is most accurate:
+
+- RMSNorm forms the squares in f32, accumulates them in f64, rounds the mean
+  back to f32 before adding `eps`, and takes an f32 root.
+- The delta net's q/k normalisation is an L2 norm reached the way the reference
+  reaches it: RMSNorm with `eps / n`, then a separate multiply by `1 / sqrt(n)`.
+  Folding the two scalings into one is a different rounding.
+- Softmax accumulates the normalising sum in f64 and rounds the reciprocal to
+  f32 before applying it.
+
+This looks like cargo-culting and is not. Quantizing activations to int8 is a
+discontinuity: a difference of 1e-7 in one activation flips a quantization
+level, and one flipped level moves every output of that matmul by about 1e-3.
+Accumulating in a strictly more accurate way therefore costs the
+token-for-token gate below, which is the thing of value here.
+
+**Full-attention block.** GQA, 16 query heads over 4 KV heads, head dim 256.
+`attn_q` is `[2560, 8192]` because the output gate is on: each head's slice
+holds the query in its first 256 lanes and the gate in its second 256, so the
+query is strided and the gate is read straight back out of the same buffer
+after attention. Per-head RMSNorm on q and k comes before RoPE. RoPE covers
+only the first 64 of the 256 head dimensions and pairs `i` with `i + 32`.
+
+The file asks for mrope with sections `[11, 11, 10, 0]`. On a text-only path
+all three position axes carry the same token position and the zero fourth
+section leaves no dimension pair for the fourth axis, so plain partial RoPE is
+exact. That is not something to take on trust, because it is silent when wrong:
+a unit test replays the reference's interleaved sector-to-axis selection and
+asserts no pair reaches the fourth axis.
+
+**Linear-attention block** (gated delta net). `attn_qkv` splits into q 16x128,
+k 16x128 and v 32x128, two value heads per key head; a value head reads its key
+head as `vh % n_k_heads`, which is the broadcast the reference does. The
+depthwise causal convolution keeps `kernel - 1` samples per channel, oldest
+first, and the state comes out holding the newest ones.
+
+The recurrent state is stored transposed, as the reference stores it: row `j`
+of a head's `[d_state, d_state]` state is `S[..][j]`. That is what lets one
+pass over a row do the decay, the delta update and the readout for output
+component `j`, with the row in cache once. `ssm_a` is already `-exp(A_log)` in
+the file, so the per-head decay is `softplus(alpha + dt_bias) * a` and `exp` of
+it lands in `(0, 1)` without a sign fix.
+
+## Caches
+
+**KV cache**, for the eight full-attention blocks only, laid out
+`[block][k, v][kv head][position][head dim]`. Position-major within a head, so
+a head's keys for the whole context are contiguous and the score loop walks
+them forwards. At the default context of 4096 it is 256 MiB, which is a tenth
+of the weights.
+
+**Recurrent state**, for the twenty-four linear blocks: the convolution
+history (`3 x 8192` f32) and the delta-net state (`32 x 128 x 128` f32), 2.1
+MiB per block, 50 MiB in total and independent of the context length.
+
+Both are allocated once by `Runner::new` and never reallocated. `reset` zeroes
+them and sets the position back to 0; zeroing is the whole reset, because the
+recurrence starts from a zero state, the convolution from zero history, and the
+KV cache is only ever read up to the current position.
+
+`resetting_the_caches_is_the_same_as_a_fresh_runner` tests that rather than
+reasoning about it, and it compares **logits**, not tokens. Leftover state is
+not a small effect in the logits, but the decay makes it a small effect in the
+tokens: dropping the delta-net state from `reset` leaves the generated tokens
+of a 24-token run completely unchanged, because the state is multiplied by a
+factor below 1 at every step and a stale one has faded below what it takes to
+move an argmax long before the first token comes out. Comparing tokens would
+have passed that mutation; comparing the first token's logit vector catches it
+on all 248320 entries.
+
+The hand-over from prompt to generation is checked in the same test by feeding
+the prompt plus all but the last generated token as one long prompt and
+requiring it to predict that last token. Today that is close to tautological,
+since both paths are the same `forward` over the same positions, and it is
+written down as such: it is the property a batched prompt path would break, and
+it is free to keep nailed down until then. What checks the hand-over against
+something outside this runner is the next-token gate below, which feeds the
+reference's tokens.
+
+## Threading
+
+**One persistent pool, built at load time**, with the submitting thread as one
+of its workers. A job is published once, run by everyone, and `run` returns
+only after every thread has passed the second barrier; that is what lets a job
+borrow the caller's stack and write into disjoint pieces of a caller-owned
+slice without allocating. At 32 cores and a few hundred matmuls per token,
+spawning per matmul would cost more than the work.
+
+Two shapes of work cover the whole pass: matmul rows split over the threads,
+and per-head chunks where one attention head or one delta-net value head owns
+one output chunk and one piece of scratch. Everything else is elementwise and
+cheaper than a barrier.
+
+**The split cannot change the result.** Each output row and each head is
+computed by exactly one worker from start to finish, so no reduction crosses a
+thread and the output does not depend on the thread count. A test asserts that
+for 1, 3 and all threads.
+
+**Default thread count is `available_parallelism`**, which on this box reports
+8 because the cgroup quota is 8 of the 32 cores. That default is not the
+fastest setting here. Measured, short prompt, context 1024, generation tok/s:
+
+| threads | 1 | 2 | 3 | 4 | 5 | 6 | 8 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| tok/s | 4.83 | 8.29 | 9.56 | 9.66 | 9.17 | 8.59 | 7.09 |
+
+Batch-1 generation reads all 2.52 GiB of weights per token, so the ceiling is
+memory bandwidth and it is reached at three or four threads; past that the
+barriers cost more than the extra lanes earn, and on a shared box a thread that
+is descheduled at a barrier holds up all of them. Tuning this, and finding what
+the bandwidth ceiling actually is, is the throughput ticket's job; the default
+stays the honest one.
+
+**Nothing in the generation loop allocates**, measured rather than asserted. A
+counting global allocator wraps `System` in
+`crates/rust-llm/tests/allocations.rs` and opens a window around the loop: 24
+forward passes make 0 allocations, and `generate` around them makes exactly 2
+whatever the token count, the output vector and the copy of the stop-token set,
+both before the loop starts. It is one test and not two because the counter is
+global and a second test in the harness's thread pool would be charged to the
+same window.
