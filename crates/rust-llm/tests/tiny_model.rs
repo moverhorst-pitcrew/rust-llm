@@ -292,12 +292,7 @@ fn the_seed_taken_from_entropy_is_printed_and_replays() {
     ];
     let out = run(&tiny.model, &args, "");
     let text = out.ok("a run with no seed").to_string();
-    let seed = out
-        .stderr
-        .lines()
-        .find_map(|l| l.rsplit_once("seed "))
-        .map(|(_, s)| s.to_string())
-        .unwrap_or_else(|| panic!("no effective seed on stderr:\n{}", out.stderr));
+    let seed = printed_seed(&out);
 
     let mut replay: Vec<&str> = args.to_vec();
     replay.extend(["--seed", &seed]);
@@ -309,12 +304,26 @@ fn the_seed_taken_from_entropy_is_printed_and_replays() {
     );
 
     // Two runs from entropy pick different seeds, or the seed is not random.
+    // It has to be the seed and not the whole of stderr: that carries the
+    // timings, so it differs between any two runs and would pass with a
+    // hard-coded seed, which is the one thing this is here to catch.
     let other = run(&tiny.model, &args, "");
     other.ok("a second run with no seed");
     assert_ne!(
-        out.stderr, other.stderr,
+        seed,
+        printed_seed(&other),
         "two runs from entropy used the same seed"
     );
+}
+
+/// The effective seed off the `sampling:` line, which is the only way to replay
+/// a run that took its seed from entropy.
+fn printed_seed(out: &Run) -> String {
+    out.stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("sampling: ")?.rsplit_once("seed "))
+        .map(|(_, s)| s.to_string())
+        .unwrap_or_else(|| panic!("no effective seed on stderr:\n{}", out.stderr))
 }
 
 /// Every sampling flag reaches the sampler, and a value that cannot be a
