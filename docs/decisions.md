@@ -424,6 +424,55 @@ every token and streaming nothing.
 `rust-llm trace` runs the same pass with the activation tracer on and prints
 one node per line, which is the input to the reference comparison below.
 
+## The reference harness
+
+llama.cpp on the **same GGUF file**, so quantization is out of the comparison.
+It is a reference only: it is never linked into the product and does not appear
+in the workspace's dependency tree. There is no system `cmake` and no root on
+this box, so `cmake` comes from a venv:
+
+```sh
+python3 -m venv /paperclip/models/ref/venv
+/paperclip/models/ref/venv/bin/pip install cmake
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /paperclip/models/ref/llama.cpp
+cd /paperclip/models/ref/llama.cpp
+PATH=/paperclip/models/ref/venv/bin:$PATH cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_NATIVE=ON
+PATH=/paperclip/models/ref/venv/bin:$PATH cmake --build build -j 32 \
+  --target llama-completion llama-tokenize llama-bench llama-eval-callback
+```
+
+Binaries land in `build/bin` and need `LD_LIBRARY_PATH` pointing at that
+directory. Two traps: at commit `3259ab6` the `llama-app` target fails to link
+unless examples are enabled, so use `llama-completion`; and CMake caches
+`LLAMA_BUILD_EXAMPLES`, so a second configure does not pick up a changed value
+unless it is passed again.
+
+**Per-layer comparison**, which is how a wrong block in a 32-block hybrid gets
+found at all. Both implementations dump every node of one forward pass and
+`scripts/compare-reference.py` walks them in graph order:
+
+```sh
+rust-llm trace --raw --prompt Hello > ours.txt
+llama-eval-callback -m <model.gguf> -p Hello -n 1 -t 4 -c 512 \
+  --no-repack -fa off -ctk f32 -ctv f32 > ref.log
+scripts/compare-reference.py ref.log ours.txt
+```
+
+The reference flags are not optional. With its defaults it repacks the weights,
+keeps an f16 KV cache and runs flash attention, none of which this runner does,
+and the comparison then measures the difference between two optimisations.
+
+Read the **first** block of the table, not the last. Through block 0 the two
+agree in every digit the reference prints, with element sums within 1e-6. From
+block 1 on they drift, reaching 1e-2 by block 3 and staying there, for the
+reason given above: the first activation to land on the other side of an int8
+rounding boundary moves a whole matmul by 1e-3, and it compounds. On this model
+the first such flip is in `linear_attn_qkv_mixed-1`. The script is a bisection
+tool, so look for the step out of a quiet neighbourhood, not for the absolute
+value; whether the two implementations agree is settled by the gate, not by the
+bottom of that table.
+
 ## Baseline numbers
 
 Qwen3.5-4B-heretic-Q4_K_M, `avx2+vnni`, this box (8 of 32 cores by cgroup
