@@ -11,6 +11,10 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # The whole job is a few minutes. The cap is here so that a server or a
+    # child process that never comes up fails the run instead of holding a
+    # runner until GitHub's own six-hour limit.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +31,12 @@ jobs:
       # The model weights are not in the repository, so the tests that need
       # them carry #[ignore]. Run those locally with:
       #   cargo test --workspace --release -- --ignored --nocapture
+      #
+      # The rest, the command line and the HTTP surface included, is covered
+      # against a tiny model the tests write themselves, so this step needs
+      # nothing from the runner but a loopback port: tests/serve.rs spawns the
+      # binary with --port 0, takes whatever is free, and kills it on every
+      # path out. Its own waits are capped at a minute and the job at 15.
       - run: cargo test --workspace --all-targets
 
       # Pure Rust is a hard requirement: no C or C++ toolchain anywhere in the
