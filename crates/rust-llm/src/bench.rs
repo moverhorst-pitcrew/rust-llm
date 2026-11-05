@@ -44,6 +44,9 @@ pub struct Options {
     pub context: usize,
     pub generate: usize,
     pub repeats: usize,
+    /// Tokens per batch in the prompt phase. The generation phase is batch-1
+    /// whatever this says, because there is no second token to batch with.
+    pub batch: usize,
 }
 
 /// One timed pass: the prompt, then a fixed number of generated tokens.
@@ -61,7 +64,7 @@ struct Timed {
 pub fn sweep(model: &Model<'_>, prompt: &[u32], threads: &[usize], opts: &Options) {
     let quota = cpu_quota().unwrap_or_else(|| "unknown".to_string());
     for &nth in threads {
-        let mut runner = Runner::new(model, opts.context, nth);
+        let mut runner = Runner::with_batch(model, opts.context, nth, opts.batch);
         // Not counted: the first pass faults in the pages this configuration
         // touches and starts the pool's threads.
         once(&mut runner, prompt, opts.generate);
@@ -72,9 +75,10 @@ pub fn sweep(model: &Model<'_>, prompt: &[u32], threads: &[usize], opts: &Option
         let load_after = load_average().unwrap_or(f64::NAN);
 
         println!(
-            "threads {nth}  context {}  prompt {} tok  generate {} tok  tier {}  quota {quota}  repeats {}  load {load_before:.2} -> {load_after:.2}",
+            "threads {nth}  context {}  prompt {} tok  batch {}  generate {} tok  tier {}  quota {quota}  repeats {}  load {load_before:.2} -> {load_after:.2}",
             opts.context,
             prompt.len(),
+            runner.max_batch(),
             opts.generate,
             runner.kernels().tier().as_str(),
             opts.repeats,
@@ -109,11 +113,11 @@ fn once(runner: &mut Runner<'_>, prompt: &[u32], generate: usize) -> Timed {
     runner.reset();
     let start = Instant::now();
     let mut next = 0u32;
-    for (i, &t) in prompt.iter().enumerate() {
-        let logits = runner.forward(t);
-        if i + 1 == prompt.len() {
-            next = argmax(logits);
-        }
+    let mut read = 0;
+    while read < prompt.len() {
+        let take = (prompt.len() - read).min(runner.max_batch());
+        next = argmax(runner.forward_batch(&prompt[read..read + take]));
+        read += take;
     }
     let prompt_time = start.elapsed();
 

@@ -10,11 +10,11 @@
 use std::arch::x86_64::*;
 
 use super::avx2::hsum_i32;
-use crate::quant::{ActBlock, Activations, Q4_K_BYTES, Q6_K_BYTES, q4k_scale_min, read_f16};
+use crate::quant::{ActBlock, ActRow, Q4_K_BYTES, Q6_K_BYTES, q4k_scale_min, read_f16};
 
-pub(super) fn q4k_dot(w: &[u8], a: &Activations) -> f32 {
+pub(super) fn q4k_dot(w: &[u8], a: ActRow<'_>) -> f32 {
     let mut sum = 0.0f32;
-    for (ib, ab) in a.blocks().iter().enumerate() {
+    for (ib, ab) in a.blocks.iter().enumerate() {
         sum += unsafe { q4k_block(&w[ib * Q4_K_BYTES..(ib + 1) * Q4_K_BYTES], ab) };
     }
     sum
@@ -64,9 +64,9 @@ unsafe fn q4k_block(b: &[u8], ab: &ActBlock) -> f32 {
     ab.d * (d * isum as f32 - dmin * imin as f32)
 }
 
-pub(super) fn q6k_dot(w: &[u8], a: &Activations) -> f32 {
+pub(super) fn q6k_dot(w: &[u8], a: ActRow<'_>) -> f32 {
     let mut sum = 0.0f32;
-    for (ib, ab) in a.blocks().iter().enumerate() {
+    for (ib, ab) in a.blocks.iter().enumerate() {
         sum += unsafe { q6k_block(&w[ib * Q6_K_BYTES..(ib + 1) * Q6_K_BYTES], ab) };
     }
     sum

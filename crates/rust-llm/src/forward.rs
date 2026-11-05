@@ -1,15 +1,24 @@
-//! The hybrid forward pass, one token at a time, plus the caches and the
-//! scratch it runs on.
+//! The hybrid forward pass, plus the caches and the scratch it runs on.
 //!
 //! Both caches and every buffer are allocated once, by [`Runner::new`], from
-//! the config. The pass itself allocates nothing: it quantizes activations into
-//! scratch, hands row ranges to the pool and writes into buffers it already
-//! owns.
+//! the config and a maximum batch size. The pass itself allocates nothing: it
+//! quantizes activations into scratch, hands row ranges to the pool and writes
+//! into buffers it already owns.
 //!
-//! Tokens go through one at a time, for the prompt as much as for generation.
-//! The delta-net recurrence is sequential over tokens anyway, and a single path
-//! means the state generation starts from is, by construction, the state the
-//! prompt produced. Batched prompt evaluation is a separate change.
+//! [`Runner::forward_batch`] takes `t` tokens at once and is the only forward
+//! pass there is; [`Runner::forward`] is it with `t = 1`. Reading a prompt as
+//! batches is what makes it faster than generating: a weight row crosses the
+//! memory bus once for the whole batch instead of once per token, and batch-1
+//! generation is bounded by exactly that traffic. Every buffer is token-major,
+//! `t` rows of the width the single-token path used, and everything elementwise
+//! loops over the rows.
+//!
+//! What does *not* batch is the delta net's recurrence, which is sequential
+//! over tokens by construction, and the depthwise convolution, which reads the
+//! tokens before it. Both run token by token inside the batch, over the same
+//! state in the same order, so the state a batch leaves behind is the state the
+//! single-token path would have left: see `docs/decisions.md`, "Batched prompt
+//! evaluation".
 
 use std::time::Instant;
 
@@ -220,7 +229,8 @@ struct Caches {
     pos: usize,
 }
 
-/// Every intermediate the pass writes to.
+/// Every intermediate the pass writes to, each `max_batch` rows of the width
+/// one token needs, token-major.
 struct Buffers {
     x: Vec<f32>,
     xn: Vec<f32>,
@@ -231,6 +241,10 @@ struct Buffers {
     z: Vec<f32>,
     conv: Vec<f32>,
     heads: Vec<f32>,
+    /// The delta net's readout, head-major (`[value head][token][d_state]`),
+    /// because one value head owns one recurrent state and runs the whole
+    /// batch over it; the gated norm transposes it into `heads`.
+    dn: Vec<f32>,
     scores: Vec<f32>,
     ffn_a: Vec<f32>,
     ffn_b: Vec<f32>,
@@ -240,11 +254,18 @@ struct Buffers {
     logits: Vec<f32>,
 }
 
+/// Tokens per batch when the caller does not say.
+///
+/// Taken from the measured crossover rather than from a round number: see
+/// `docs/benchmarks.md`, "What batched prompt evaluation moved".
+pub const DEFAULT_BATCH: usize = 16;
+
 /// A loaded model plus the threads, caches and scratch to run it.
 pub struct Runner<'a> {
     model: &'a Model<'a>,
     pool: Pool,
     context: usize,
+    max_batch: usize,
     caches: Caches,
     bufs: Buffers,
     acts: Activations,
@@ -253,14 +274,32 @@ pub struct Runner<'a> {
 }
 
 impl<'a> Runner<'a> {
-    /// Allocates for `context` positions and `threads` threads.
+    /// Allocates for `context` positions, `threads` threads and batches of up
+    /// to [`DEFAULT_BATCH`] tokens.
     pub fn new(model: &'a Model<'a>, context: usize, threads: usize) -> Self {
+        Self::with_batch(model, context, threads, DEFAULT_BATCH)
+    }
+
+    /// The same with the maximum batch size spelled out, which is what
+    /// `--batch` and the tests that compare batch sizes need.
+    ///
+    /// Every buffer is sized from `max_batch` here, so nothing in
+    /// [`Runner::forward_batch`] allocates however long the batch is.
+    pub fn with_batch(
+        model: &'a Model<'a>,
+        context: usize,
+        threads: usize,
+        max_batch: usize,
+    ) -> Self {
         let c = &model.config;
         let context = context.max(1);
+        // A batch longer than the context could never be run.
+        let b = max_batch.clamp(1, context);
         let vocab = model.vocab();
         Self {
             pool: Pool::new(threads),
             context,
+            max_batch: b,
             caches: Caches {
                 kv: vec![0.0; c.n_full_blocks() * 2 * c.n_head_kv * context * c.head_dim],
                 conv: vec![0.0; c.n_linear_blocks() * c.conv_dim() * (c.conv_kernel - 1)],
@@ -268,23 +307,24 @@ impl<'a> Runner<'a> {
                 pos: 0,
             },
             bufs: Buffers {
-                x: vec![0.0; c.n_embd],
-                xn: vec![0.0; c.n_embd],
-                y: vec![0.0; c.n_embd],
-                qkv: vec![0.0; c.qg_dim().max(c.conv_dim())],
-                kb: vec![0.0; c.kv_dim()],
-                vb: vec![0.0; c.kv_dim()],
-                z: vec![0.0; c.d_inner],
-                conv: vec![0.0; c.conv_dim()],
-                heads: vec![0.0; c.attn_dim().max(c.d_inner)],
-                scores: vec![0.0; c.n_head * context],
-                ffn_a: vec![0.0; c.n_ff],
-                ffn_b: vec![0.0; c.n_ff],
-                decay: vec![0.0; c.n_v_heads],
-                beta: vec![0.0; c.n_v_heads],
+                x: vec![0.0; b * c.n_embd],
+                xn: vec![0.0; b * c.n_embd],
+                y: vec![0.0; b * c.n_embd],
+                qkv: vec![0.0; b * c.qg_dim().max(c.conv_dim())],
+                kb: vec![0.0; b * c.kv_dim()],
+                vb: vec![0.0; b * c.kv_dim()],
+                z: vec![0.0; b * c.d_inner],
+                conv: vec![0.0; b * c.conv_dim()],
+                heads: vec![0.0; b * c.attn_dim().max(c.d_inner)],
+                dn: vec![0.0; b * c.d_inner],
+                scores: vec![0.0; b * c.n_head * context],
+                ffn_a: vec![0.0; b * c.n_ff],
+                ffn_b: vec![0.0; b * c.n_ff],
+                decay: vec![0.0; b * c.n_v_heads],
+                beta: vec![0.0; b * c.n_v_heads],
                 logits: vec![0.0; vocab],
             },
-            acts: Activations::new(c.n_embd.max(c.n_ff).max(c.d_inner).max(c.attn_dim())),
+            acts: Activations::with_batch(c.n_embd.max(c.n_ff).max(c.d_inner).max(c.attn_dim()), b),
             model,
             tracer: Tracer::default(),
             profile: Profile::default(),
@@ -326,15 +366,36 @@ impl<'a> Runner<'a> {
         self.tracer.clear();
     }
 
+    /// Tokens this runner can take in one [`Runner::forward_batch`].
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
     /// Runs one token and returns the logits for the next one.
     ///
     /// Panics if the context is full; the caller decides what to do about that
     /// long before a cache write could run off the end.
     pub fn forward(&mut self, token: u32) -> &[f32] {
+        self.forward_batch(&[token])
+    }
+
+    /// Runs `tokens` as one batch and returns the logits for the token after
+    /// the last of them.
+    ///
+    /// The batch takes the positions `pos..pos + tokens.len()`, so the caches
+    /// and the recurrent state come out exactly as feeding the same tokens one
+    /// at a time would have left them. Only the last token's logits are
+    /// produced: the output head is a sixth of a token's work and a prompt
+    /// throws every other position's logits away.
+    ///
+    /// Panics if the batch is longer than the scratch was sized for or does not
+    /// fit the remaining context, both of which are the caller's to check.
+    pub fn forward_batch(&mut self, tokens: &[u32]) -> &[f32] {
         let Self {
             model,
             pool,
             context,
+            max_batch,
             caches,
             bufs,
             acts,
@@ -346,25 +407,46 @@ impl<'a> Runner<'a> {
         let model: &'a Model<'a> = model;
         let c = &model.config;
         let context = *context;
-        assert!(caches.pos < context, "context of {context} tokens is full");
+        let t = tokens.len();
+        let ne = c.n_embd;
+        assert!(t > 0, "a batch of no tokens");
+        assert!(
+            t <= *max_batch,
+            "batch of {t} tokens, but the scratch was sized for {max_batch}"
+        );
+        assert!(
+            caches.pos + t <= context,
+            "context of {context} tokens holds {} and cannot take {t} more",
+            caches.pos
+        );
 
         let mut ex = Exec {
             model,
             pool,
             context,
+            t,
             acts,
             tracer,
             profile,
         };
 
-        ex.embed(token, &mut bufs.x);
-        ex.tracer.node("model.input_embed", None, &bufs.x);
+        for (i, &token) in tokens.iter().enumerate() {
+            ex.embed(token, &mut bufs.x[i * ne..][..ne]);
+        }
+        ex.tracer.node("model.input_embed", None, &bufs.x[..t * ne]);
 
         for il in 0..c.n_blocks {
-            let t = ex.profile.start();
-            rms_norm(&bufs.x, model.blocks[il].attn_norm, c.rms_eps, &mut bufs.xn);
-            ex.profile.add(Op::Norms, t);
-            ex.tracer.node("attn_norm", Some(il), &bufs.xn);
+            let at = ex.profile.start();
+            for i in 0..t {
+                rms_norm(
+                    &bufs.x[i * ne..][..ne],
+                    model.blocks[il].attn_norm,
+                    c.rms_eps,
+                    &mut bufs.xn[i * ne..][..ne],
+                );
+            }
+            ex.profile.add(Op::Norms, at);
+            ex.tracer.node("attn_norm", Some(il), &bufs.xn[..t * ne]);
 
             match &model.blocks[il].attn {
                 Attn::Full(b) => {
@@ -381,40 +463,55 @@ impl<'a> Runner<'a> {
                 }
             }
 
-            let t = ex.profile.start();
-            for (x, y) in bufs.x.iter_mut().zip(&bufs.y) {
+            let at = ex.profile.start();
+            for (x, y) in bufs.x[..t * ne].iter_mut().zip(&bufs.y[..t * ne]) {
                 *x += y;
             }
-            ex.profile.add(Op::Elementwise, t);
-            ex.tracer.node("attn_residual", Some(il), &bufs.x);
+            ex.profile.add(Op::Elementwise, at);
+            ex.tracer.node("attn_residual", Some(il), &bufs.x[..t * ne]);
 
-            let t = ex.profile.start();
-            rms_norm(
-                &bufs.x,
-                model.blocks[il].post_attn_norm,
-                c.rms_eps,
-                &mut bufs.xn,
-            );
-            ex.profile.add(Op::Norms, t);
-            ex.tracer.node("attn_post_norm", Some(il), &bufs.xn);
+            let at = ex.profile.start();
+            for i in 0..t {
+                rms_norm(
+                    &bufs.x[i * ne..][..ne],
+                    model.blocks[il].post_attn_norm,
+                    c.rms_eps,
+                    &mut bufs.xn[i * ne..][..ne],
+                );
+            }
+            ex.profile.add(Op::Norms, at);
+            ex.tracer
+                .node("attn_post_norm", Some(il), &bufs.xn[..t * ne]);
             ex.ffn(&model.blocks[il], il, bufs);
-            let t = ex.profile.start();
-            for (x, y) in bufs.x.iter_mut().zip(&bufs.y) {
+            let at = ex.profile.start();
+            for (x, y) in bufs.x[..t * ne].iter_mut().zip(&bufs.y[..t * ne]) {
                 *x += y;
             }
-            ex.profile.add(Op::Elementwise, t);
-            ex.tracer.node("l_out", Some(il), &bufs.x);
+            ex.profile.add(Op::Elementwise, at);
+            ex.tracer.node("l_out", Some(il), &bufs.x[..t * ne]);
         }
 
-        let t = ex.profile.start();
-        rms_norm(&bufs.x, model.output_norm, c.rms_eps, &mut bufs.xn);
-        ex.profile.add(Op::Norms, t);
-        ex.tracer.node("result_norm", None, &bufs.xn);
+        let at = ex.profile.start();
+        rms_norm(
+            &bufs.x[(t - 1) * ne..][..ne],
+            model.output_norm,
+            c.rms_eps,
+            &mut bufs.xn[..ne],
+        );
+        ex.profile.add(Op::Norms, at);
+        ex.tracer.node("result_norm", None, &bufs.xn[..ne]);
+        // The batch is over here: what follows is one row, the last token's.
+        ex.t = 1;
         // Tied embeddings: the table that read the token in is the output head.
-        ex.matmul(Op::Head, &model.token_embd, &bufs.xn, &mut bufs.logits);
+        ex.matmul(
+            Op::Head,
+            &model.token_embd,
+            &bufs.xn[..ne],
+            &mut bufs.logits,
+        );
         ex.tracer.node("result_output", None, &bufs.logits);
 
-        caches.pos += 1;
+        caches.pos += t;
         &bufs.logits
     }
 
@@ -500,6 +597,8 @@ struct Exec<'m, 'r> {
     model: &'m Model<'m>,
     pool: &'r Pool,
     context: usize,
+    /// Tokens in the batch being run, which is how wide every buffer is.
+    t: usize,
     acts: &'r mut Activations,
     tracer: &'r mut Tracer,
     profile: &'r mut Profile,
@@ -534,6 +633,9 @@ impl Exec<'_, '_> {
     /// this is one pair of barriers where the separate matmuls were `N`, and
     /// the activations are quantized once. It changes no result, because a row
     /// is still one worker's work from start to finish.
+    ///
+    /// `x` is `self.t` rows of `K` and every output is `self.t` rows of that
+    /// weight's row count, token-major.
     fn matmul_group<const N: usize>(
         &mut self,
         op: Op,
@@ -541,10 +643,12 @@ impl Exec<'_, '_> {
         group: [(&TensorView<'_>, &mut [f32]); N],
     ) {
         let at = self.profile.start();
-        self.acts.quantize(x);
+        let k = x.len() / self.t;
+        self.acts.quantize_batch(x, k);
+        let t = self.t;
         let group = group.map(|(w, out)| {
-            debug_assert_eq!(w.dims[0] as usize, x.len());
-            debug_assert_eq!(w.dims[1] as usize, out.len());
+            debug_assert_eq!(w.dims[0] as usize, k);
+            debug_assert_eq!(w.dims[1] as usize * t, out.len());
             Matvec {
                 ty: w.ty,
                 w: w.data,
@@ -552,13 +656,15 @@ impl Exec<'_, '_> {
             }
         });
         self.pool
-            .matvec_group(&self.model.kernels, x.len(), self.acts, group)
+            .matvec_group(&self.model.kernels, k, self.acts, group)
             .expect("every weight type was checked when the model loaded");
         self.profile.add(op, at);
     }
 
     /// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
     fn ffn(&mut self, block: &crate::model::Block<'_>, il: usize, bufs: &mut Buffers) {
+        let c = &self.model.config;
+        let (t, ne, n_ff) = (self.t, c.n_embd, c.n_ff);
         let Buffers {
             xn,
             y,
@@ -566,10 +672,11 @@ impl Exec<'_, '_> {
             ffn_b,
             ..
         } = bufs;
+        let (ffn_a, ffn_b) = (&mut ffn_a[..t * n_ff], &mut ffn_b[..t * n_ff]);
         self.matmul_group(
             Op::FfnGateUp,
-            xn,
-            [(&block.ffn_gate, &mut ffn_a[..]), (&block.ffn_up, ffn_b)],
+            &xn[..t * ne],
+            [(&block.ffn_gate, ffn_a), (&block.ffn_up, ffn_b)],
         );
         self.tracer.node("ffn_gate", Some(il), ffn_a);
         self.tracer.node("ffn_up", Some(il), ffn_b);
@@ -579,12 +686,19 @@ impl Exec<'_, '_> {
         }
         self.profile.add(Op::Elementwise, at);
         self.tracer.node("ffn_swiglu", Some(il), ffn_a);
-        self.matmul(Op::FfnDown, &block.ffn_down, ffn_a, y);
-        self.tracer.node("ffn_out", Some(il), y);
+        self.matmul(Op::FfnDown, &block.ffn_down, ffn_a, &mut y[..t * ne]);
+        self.tracer.node("ffn_out", Some(il), &y[..t * ne]);
     }
 
     /// GQA attention with per-head q/k RMSNorm, partial RoPE and an output
     /// gate taken from the second half of the query projection.
+    ///
+    /// A batch takes the positions `pos..pos + t`. Its keys and values go into
+    /// the cache before any score is formed, and token `i` then attends over
+    /// `pos + i + 1` positions: everything that was already cached plus the
+    /// tokens of this batch up to and including itself. That is the causal
+    /// mask, and it needs no masking step because the score loop simply stops
+    /// there.
     fn full_attn(
         &mut self,
         b: &FullBlock<'_>,
@@ -598,6 +712,8 @@ impl Exec<'_, '_> {
         let (hd, n_head, n_kv_head) = (c.head_dim, c.n_head, c.n_head_kv);
         let group = n_head / n_kv_head;
         let context = self.context;
+        let t = self.t;
+        let (ne, qg_dim, kv_dim, attn_dim) = (c.n_embd, c.qg_dim(), c.kv_dim(), c.attn_dim());
         let Buffers {
             xn,
             y,
@@ -608,12 +724,14 @@ impl Exec<'_, '_> {
             scores,
             ..
         } = bufs;
-        let qg = &mut qkv[..c.qg_dim()];
+        let qg = &mut qkv[..t * qg_dim];
+        let kb = &mut kb[..t * kv_dim];
+        let vb = &mut vb[..t * kv_dim];
 
         self.matmul_group(
             Op::FullQkv,
-            xn,
-            [(&b.qg, qg), (&b.v, &mut vb[..]), (&b.k, &mut kb[..])],
+            &xn[..t * ne],
+            [(&b.qg, qg), (&b.v, vb), (&b.k, kb)],
         );
         self.tracer.node("Qcur_full", Some(il), qg);
         self.tracer.node("Vcur", Some(il), vb);
@@ -622,78 +740,102 @@ impl Exec<'_, '_> {
         // The query occupies the first half of each head's slice of `attn_q`
         // and the gate the second half, so the query is strided.
         let at = self.profile.start();
-        for h in 0..n_head {
-            let q = &mut qg[h * 2 * hd..h * 2 * hd + hd];
-            rms_norm_in_place(q, b.q_norm, c.rms_eps);
-            rope(q, pos, c.n_rot, c.rope_theta);
-        }
-        for h in 0..n_kv_head {
-            let k = &mut kb[h * hd..(h + 1) * hd];
-            rms_norm_in_place(k, b.k_norm, c.rms_eps);
-            rope(k, pos, c.n_rot, c.rope_theta);
+        for i in 0..t {
+            let p = pos + i;
+            let qg = &mut qg[i * qg_dim..][..qg_dim];
+            for h in 0..n_head {
+                let q = &mut qg[h * 2 * hd..h * 2 * hd + hd];
+                rms_norm_in_place(q, b.q_norm, c.rms_eps);
+                rope(q, p, c.n_rot, c.rope_theta);
+            }
+            let kb = &mut kb[i * kv_dim..][..kv_dim];
+            for h in 0..n_kv_head {
+                let k = &mut kb[h * hd..(h + 1) * hd];
+                rms_norm_in_place(k, b.k_norm, c.rms_eps);
+                rope(k, p, c.n_rot, c.rope_theta);
+            }
         }
         self.profile.add(Op::Norms, at);
         self.tracer.node("Kcur_roped", Some(il), kb);
 
-        // Append this token's keys and values, then read the cache shared.
+        // Append the batch's keys and values, then read the cache shared.
         let at = self.profile.start();
         let (k_cache, v_cache) = kv.split_at_mut(n_kv_head * context * hd);
-        for h in 0..n_kv_head {
-            let at = (h * context + pos) * hd;
-            k_cache[at..at + hd].copy_from_slice(&kb[h * hd..(h + 1) * hd]);
-            v_cache[at..at + hd].copy_from_slice(&vb[h * hd..(h + 1) * hd]);
+        for i in 0..t {
+            for h in 0..n_kv_head {
+                let to = (h * context + pos + i) * hd;
+                let from = i * kv_dim + h * hd;
+                k_cache[to..to + hd].copy_from_slice(&kb[from..from + hd]);
+                v_cache[to..to + hd].copy_from_slice(&vb[from..from + hd]);
+            }
         }
         let (k_cache, v_cache) = (&*k_cache, &*v_cache);
         self.profile.add(Op::Elementwise, at);
 
         let at = self.profile.start();
         let scale = 1.0 / (hd as f32).sqrt();
-        let n_kv = pos + 1;
         let qg = &*qg;
+        // One chunk per (token, head): chunk `i * n_head + h` owns the output
+        // at `i * attn_dim + h * hd`, which is where it lands in a token-major
+        // buffer, and its own score row.
         self.pool.chunks(
-            &mut heads[..c.attn_dim()],
+            &mut heads[..t * attn_dim],
             hd,
-            scores,
+            &mut scores[..t * n_head * context],
             context,
-            |h, out, scores| {
+            |chunk, out, scores| {
+                let (i, h) = (chunk / n_head, chunk % n_head);
                 let kh = h / group;
-                let q = &qg[h * 2 * hd..h * 2 * hd + hd];
-                let scores = &mut scores[..n_kv];
-                for (t, s) in scores.iter_mut().enumerate() {
-                    let k = &k_cache[(kh * context + t) * hd..][..hd];
+                let q = &qg[i * qg_dim + h * 2 * hd..][..hd];
+                let scores = &mut scores[..pos + i + 1];
+                for (p, s) in scores.iter_mut().enumerate() {
+                    let k = &k_cache[(kh * context + p) * hd..][..hd];
                     *s = dot(q, k) * scale;
                 }
                 softmax(scores);
                 out.fill(0.0);
-                for (t, &p) in scores.iter().enumerate() {
-                    let v = &v_cache[(kh * context + t) * hd..][..hd];
+                for (p, &w) in scores.iter().enumerate() {
+                    let v = &v_cache[(kh * context + p) * hd..][..hd];
                     for (o, &vd) in out.iter_mut().zip(v) {
-                        *o += p * vd;
+                        *o += w * vd;
                     }
                 }
             },
         );
         self.profile.add(Op::Attention, at);
         self.tracer
-            .node("attn_pregate", Some(il), &heads[..c.attn_dim()]);
+            .node("attn_pregate", Some(il), &heads[..t * attn_dim]);
 
         let at = self.profile.start();
-        for h in 0..n_head {
-            let gate = &qg[h * 2 * hd + hd..(h + 1) * 2 * hd];
-            for (o, &g) in heads[h * hd..(h + 1) * hd].iter_mut().zip(gate) {
-                *o *= sigmoid(g);
+        for i in 0..t {
+            for h in 0..n_head {
+                let gate = &qg[i * qg_dim + h * 2 * hd + hd..][..hd];
+                for (o, &g) in heads[i * attn_dim + h * hd..][..hd].iter_mut().zip(gate) {
+                    *o *= sigmoid(g);
+                }
             }
         }
         self.profile.add(Op::Elementwise, at);
         self.tracer
-            .node("attn_gated", Some(il), &heads[..c.attn_dim()]);
+            .node("attn_gated", Some(il), &heads[..t * attn_dim]);
 
-        self.matmul(Op::AttnOut, &b.o, &heads[..c.attn_dim()], y);
-        self.tracer.node("attn_output", Some(il), y);
+        self.matmul(Op::AttnOut, &b.o, &heads[..t * attn_dim], &mut y[..t * ne]);
+        self.tracer.node("attn_output", Some(il), &y[..t * ne]);
     }
 
     /// The gated delta net: a depthwise causal convolution over the q/k/v
     /// projection, then the delta rule against a per-head recurrent state.
+    ///
+    /// The projections, the norms and the output batch; the convolution and the
+    /// recurrence do not, and run token by token inside the batch. The
+    /// convolution is token-sequential because tap `j` of token `i` is token
+    /// `i - kernel + 1 + j`, which inside a batch is an earlier row of the same
+    /// batch and before it is the history buffer; running it in order over the
+    /// same rolling state is what makes the two the same thing. The recurrence
+    /// is token-sequential because the state token `i` reads is the state token
+    /// `i - 1` wrote. The parallelism there is over value heads, each of which
+    /// owns one state and runs the whole batch over it, so a batch is one pool
+    /// job where it used to be `t` of them.
     fn linear_attn(
         &mut self,
         b: &LinearBlock<'_>,
@@ -705,7 +847,8 @@ impl Exec<'_, '_> {
         let model = self.model;
         let c = &model.config;
         let (s, n_kh, n_vh) = (c.d_state, c.n_k_heads, c.n_v_heads);
-        let key_dim = c.key_dim();
+        let (ne, key_dim, conv_dim, d_inner) = (c.n_embd, c.key_dim(), c.conv_dim(), c.d_inner);
+        let t = self.t;
         let Buffers {
             xn,
             y,
@@ -713,30 +856,37 @@ impl Exec<'_, '_> {
             z,
             conv,
             heads,
+            dn,
             decay,
             beta,
             ..
         } = bufs;
-        let qkv = &mut qkv[..c.conv_dim()];
+        let qkv = &mut qkv[..t * conv_dim];
+        let z = &mut z[..t * d_inner];
+        let decay = &mut decay[..t * n_vh];
+        let beta = &mut beta[..t * n_vh];
+        let conv = &mut conv[..t * conv_dim];
 
         self.matmul_group(
             Op::LinearQkv,
-            xn,
+            &xn[..t * ne],
             [
                 (&b.qkv, qkv),
-                (&b.gate, &mut z[..]),
-                (&b.alpha, &mut decay[..]),
-                (&b.beta, &mut beta[..]),
+                (&b.gate, z),
+                (&b.alpha, decay),
+                (&b.beta, beta),
             ],
         );
         self.tracer.node("linear_attn_qkv_mixed", Some(il), qkv);
         self.tracer.node("z", Some(il), z);
         self.tracer.node("alpha", Some(il), decay);
         let at = self.profile.start();
-        for (d, (&bias, &a)) in decay.iter_mut().zip(b.dt_bias.iter().zip(b.a)) {
-            // `ssm_a` is already `-exp(A_log)`, so this is the log of the
-            // decay and `exp` of it lands in (0, 1).
-            *d = softplus(*d + bias) * a;
+        for row in decay.chunks_exact_mut(n_vh) {
+            for (d, (&bias, &a)) in row.iter_mut().zip(b.dt_bias.iter().zip(b.a)) {
+                // `ssm_a` is already `-exp(A_log)`, so this is the log of the
+                // decay and `exp` of it lands in (0, 1).
+                *d = softplus(*d + bias) * a;
+            }
         }
         self.profile.add(Op::Elementwise, at);
         self.tracer.node("gate", Some(il), decay);
@@ -749,7 +899,15 @@ impl Exec<'_, '_> {
         self.tracer.node("beta_sigmoid", Some(il), beta);
 
         let at = self.profile.start();
-        depthwise_conv(qkv, b.conv1d, c.conv_kernel, conv_state, conv);
+        for i in 0..t {
+            depthwise_conv(
+                &qkv[i * conv_dim..][..conv_dim],
+                b.conv1d,
+                c.conv_kernel,
+                conv_state,
+                &mut conv[i * conv_dim..][..conv_dim],
+            );
+        }
         self.profile.add(Op::Conv, at);
         self.tracer.node("conv_output_raw", Some(il), conv);
         let at = self.profile.start();
@@ -761,9 +919,10 @@ impl Exec<'_, '_> {
 
         // q and k are L2-normalised per head; v is used as it comes out.
         let at = self.profile.start();
-        let (qk, _) = conv.split_at_mut(2 * key_dim);
-        for h in 0..2 * n_kh {
-            l2_norm_in_place(&mut qk[h * s..(h + 1) * s], c.rms_eps);
+        for row in conv.chunks_exact_mut(conv_dim) {
+            for h in 0..2 * n_kh {
+                l2_norm_in_place(&mut row[h * s..(h + 1) * s], c.rms_eps);
+            }
         }
         let conv = &*conv;
         self.profile.add(Op::Norms, at);
@@ -772,57 +931,78 @@ impl Exec<'_, '_> {
         let scale = 1.0 / (s as f32).sqrt();
         let decay = &*decay;
         let beta = &*beta;
+        // One chunk per value head, holding that head's whole batch: the state
+        // is sequential over tokens, so the tokens cannot be split, and the
+        // readout therefore comes out head-major and is transposed by the
+        // gated norm below.
         self.pool.chunks(
-            &mut heads[..c.d_inner],
-            s,
+            &mut dn[..n_vh * t * s],
+            t * s,
             ssm_state,
             s * s,
             |vh, out, state| {
                 // Several value heads share one key head, taken modulo the key
                 // head count as the reference broadcasts it.
                 let kh = vh % n_kh;
-                let q = &conv[kh * s..][..s];
-                let k = &conv[key_dim + kh * s..][..s];
-                let v = &conv[2 * key_dim + vh * s..][..s];
-                let g = decay[vh].exp();
-                let beta = beta[vh];
-                // Row `j` of the state is `S[..][j]`, so one pass over it per
-                // output component does the decay, the delta and the readout.
-                for (j, row) in state.chunks_exact_mut(s).enumerate() {
-                    let mut sk = 0.0f32;
-                    for (r, &ki) in row.iter_mut().zip(k) {
-                        *r *= g;
-                        sk += *r * ki;
+                for i in 0..t {
+                    let row = &conv[i * conv_dim..][..conv_dim];
+                    let q = &row[kh * s..][..s];
+                    let k = &row[key_dim + kh * s..][..s];
+                    let v = &row[2 * key_dim + vh * s..][..s];
+                    let g = decay[i * n_vh + vh].exp();
+                    let beta = beta[i * n_vh + vh];
+                    let out = &mut out[i * s..][..s];
+                    // Row `j` of the state is `S[..][j]`, so one pass over it
+                    // per output component does the decay, the delta and the
+                    // readout.
+                    for (j, srow) in state.chunks_exact_mut(s).enumerate() {
+                        let mut sk = 0.0f32;
+                        for (r, &ki) in srow.iter_mut().zip(k) {
+                            *r *= g;
+                            sk += *r * ki;
+                        }
+                        let d = (v[j] - sk) * beta;
+                        let mut o = 0.0f32;
+                        for ((r, &ki), &qi) in srow.iter_mut().zip(k).zip(q) {
+                            *r += d * ki;
+                            o += *r * qi;
+                        }
+                        out[j] = o * scale;
                     }
-                    let d = (v[j] - sk) * beta;
-                    let mut o = 0.0f32;
-                    for ((r, &ki), &qi) in row.iter_mut().zip(k).zip(q) {
-                        *r += d * ki;
-                        o += *r * qi;
-                    }
-                    out[j] = o * scale;
                 }
             },
         );
         self.profile.add(Op::DeltaNet, at);
+        // Head-major and token-major are the same thing at `t = 1`, which is
+        // what `trace` runs, so this node is still the vector the reference
+        // prints.
         self.tracer
-            .node("attn_output", Some(il), &heads[..c.d_inner]);
+            .node("attn_output", Some(il), &dn[..t * d_inner]);
 
-        // The gated norm: RMSNorm per value head, then the sigmoid-linear gate.
+        // The gated norm: RMSNorm per value head, then the sigmoid-linear
+        // gate. This is also where the readout turns from head-major into the
+        // token-major layout the output projection reads.
         let at = self.profile.start();
-        for h in 0..n_vh {
-            let head = &mut heads[h * s..(h + 1) * s];
-            rms_norm_in_place(head, b.norm, c.rms_eps);
-            for (o, &g) in head.iter_mut().zip(&z[h * s..(h + 1) * s]) {
-                *o *= silu(g);
+        for i in 0..t {
+            for h in 0..n_vh {
+                let head = &mut heads[i * d_inner + h * s..][..s];
+                rms_norm(&dn[(h * t + i) * s..][..s], b.norm, c.rms_eps, head);
+                for (o, &g) in head.iter_mut().zip(&z[i * d_inner + h * s..][..s]) {
+                    *o *= silu(g);
+                }
             }
         }
         self.profile.add(Op::Norms, at);
         self.tracer
-            .node("final_output", Some(il), &heads[..c.d_inner]);
+            .node("final_output", Some(il), &heads[..t * d_inner]);
 
-        self.matmul(Op::LinearOut, &b.out, &heads[..c.d_inner], y);
-        self.tracer.node("linear_attn_out", Some(il), y);
+        self.matmul(
+            Op::LinearOut,
+            &b.out,
+            &heads[..t * d_inner],
+            &mut y[..t * ne],
+        );
+        self.tracer.node("linear_attn_out", Some(il), &y[..t * ne]);
     }
 }
 
@@ -1024,6 +1204,45 @@ mod tests {
         }
         // The history is the last three samples, oldest first.
         assert_eq!(state, [2.0, 3.0, 4.0]);
+    }
+
+    /// The tap a batch crosses: inside a batch, token `i`'s older samples are
+    /// the earlier rows of the same batch, and before those the history buffer.
+    ///
+    /// Getting that boundary wrong is silent, because the convolution's taps
+    /// decay into the residual rather than producing anything obviously wrong,
+    /// so the four outputs here are hand-computed from the taps rather than
+    /// compared against another run of the same loop.
+    #[test]
+    fn the_convolution_crosses_a_batch_boundary() {
+        // One channel, kernel 4, taps [1, 10, 100, 1000] oldest to newest.
+        let w = [1.0f32, 10.0, 100.0, 1000.0];
+        let mut state = [0.0f32; 3];
+        let mut out = [0.0f32];
+        // Three tokens before the batch, so the history is full and not zero.
+        for x in [1.0f32, 2.0, 3.0] {
+            depthwise_conv(&[x], &w, 4, &mut state, &mut out);
+        }
+        assert_eq!(state, [1.0, 2.0, 3.0]);
+
+        // A batch of four, as `linear_attn` runs it: one call per row over the
+        // same rolling state. Each output is the four newest samples against
+        // the taps, which for the first rows means samples from before the
+        // batch.
+        let batch = [4.0f32, 5.0, 6.0, 7.0];
+        let want = [
+            1.0 * 1.0 + 10.0 * 2.0 + 100.0 * 3.0 + 1000.0 * 4.0,
+            1.0 * 2.0 + 10.0 * 3.0 + 100.0 * 4.0 + 1000.0 * 5.0,
+            1.0 * 3.0 + 10.0 * 4.0 + 100.0 * 5.0 + 1000.0 * 6.0,
+            1.0 * 4.0 + 10.0 * 5.0 + 100.0 * 6.0 + 1000.0 * 7.0,
+        ];
+        let mut got = [0.0f32; 4];
+        for (i, &x) in batch.iter().enumerate() {
+            depthwise_conv(&[x], &w, 4, &mut state, &mut got[i..i + 1]);
+        }
+        assert_eq!(got, want);
+        // And the history the next batch starts from is the newest three.
+        assert_eq!(state, [5.0, 6.0, 7.0]);
     }
 
     #[test]

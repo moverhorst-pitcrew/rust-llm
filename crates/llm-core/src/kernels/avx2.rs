@@ -8,12 +8,12 @@
 use std::arch::x86_64::*;
 
 use crate::quant::{
-    ActBlock, Activations, Q4_K_BYTES, Q6_K_BYTES, Q8_0_BYTES, QK_K, QK8_0, q4k_scale_min, read_f16,
+    ActBlock, ActRow, Q4_K_BYTES, Q6_K_BYTES, Q8_0_BYTES, QK_K, QK8_0, q4k_scale_min, read_f16,
 };
 
-pub(super) fn q4k_dot(w: &[u8], a: &Activations) -> f32 {
+pub(super) fn q4k_dot(w: &[u8], a: ActRow<'_>) -> f32 {
     let mut sum = 0.0f32;
-    for (ib, ab) in a.blocks().iter().enumerate() {
+    for (ib, ab) in a.blocks.iter().enumerate() {
         sum += unsafe { q4k_block(&w[ib * Q4_K_BYTES..(ib + 1) * Q4_K_BYTES], ab) };
     }
     sum
@@ -55,9 +55,9 @@ unsafe fn q4k_block(b: &[u8], ab: &ActBlock) -> f32 {
     ab.d * (d * isum as f32 - dmin * imin as f32)
 }
 
-pub(super) fn q6k_dot(w: &[u8], a: &Activations) -> f32 {
+pub(super) fn q6k_dot(w: &[u8], a: ActRow<'_>) -> f32 {
     let mut sum = 0.0f32;
-    for (ib, ab) in a.blocks().iter().enumerate() {
+    for (ib, ab) in a.blocks.iter().enumerate() {
         sum += unsafe { q6k_block(&w[ib * Q6_K_BYTES..(ib + 1) * Q6_K_BYTES], ab) };
     }
     sum
@@ -111,17 +111,17 @@ unsafe fn q6k_block(b: &[u8], ab: &ActBlock) -> f32 {
     ab.d * d * (isum - 32 * bias) as f32
 }
 
-pub(super) fn q80_dot(w: &[u8], a: &Activations) -> f32 {
+pub(super) fn q80_dot(w: &[u8], a: ActRow<'_>) -> f32 {
     unsafe { q80_row(w, a) }
 }
 
 #[target_feature(enable = "avx2,fma")]
-unsafe fn q80_row(w: &[u8], a: &Activations) -> f32 {
+unsafe fn q80_row(w: &[u8], a: ActRow<'_>) -> f32 {
     unsafe {
-        let blocks = a.blocks();
+        let blocks = a.blocks;
         let per_super = QK_K / QK8_0;
         let mut acc = _mm256_setzero_ps();
-        for ib in 0..a.k().div_ceil(QK8_0) {
+        for ib in 0..a.k.div_ceil(QK8_0) {
             let b = &w[ib * Q8_0_BYTES..(ib + 1) * Q8_0_BYTES];
             let ab = &blocks[ib / per_super];
             let qw = _mm256_loadu_si256(b[2..].as_ptr().cast());

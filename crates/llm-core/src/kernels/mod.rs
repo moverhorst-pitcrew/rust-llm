@@ -16,18 +16,19 @@ mod avx2;
 mod vnni;
 
 use crate::quant::{
-    Activations, GgmlType, Q4_K_BYTES, Q6_K_BYTES, Q8_0_BYTES, QK_K, QK8_0, q4k_scale_min, read_f16,
+    ActRow, Activations, GgmlType, Q4_K_BYTES, Q6_K_BYTES, Q8_0_BYTES, QK_K, QK8_0, q4k_scale_min,
+    read_f16,
 };
 
 /// One slot past the highest [`GgmlType`] discriminant, so a type indexes the
 /// table directly instead of going through a match.
 const GGML_TYPE_SLOTS: usize = 31;
 
-/// Dot product of one quantized weight row with a block of int8 activations.
+/// Dot product of one quantized weight row with a row of int8 activations.
 ///
-/// The row must hold `ceil(a.k() / block_len)` blocks of the kernel's type.
-pub type VecDot = fn(w: &[u8], a: &Activations) -> f32;
-
+/// The weight row must hold `ceil(a.k / block_len)` blocks of the kernel's
+/// type.
+pub type VecDot = fn(w: &[u8], a: ActRow<'_>) -> f32;
 /// The instruction set the kernels were resolved to.
 ///
 /// Ordered weakest to strongest; [`Kernels::detect`] picks the strongest tier
@@ -144,6 +145,29 @@ impl Kernels {
         a: &Activations,
         out: &mut [f32],
     ) -> Result<(), KernelError> {
+        self.matvec_row(ty, w, k, a, 0, out)
+    }
+
+    /// The same for row `t` of a batch of activations.
+    ///
+    /// One row of the batch at a time, by design. The win of a batch is that
+    /// the weight bytes cross the memory bus once for all of them, and that is
+    /// a property of the *order* the caller walks the two loops in, not of this
+    /// function: a block of weight rows small enough to sit in cache, run
+    /// against every activation row before the next block is touched, reads
+    /// those bytes from memory once. Keeping one activation row per call is
+    /// what makes a batched matmul produce the same bits as `t` single ones,
+    /// because an output is still one row dotted with one activation row in the
+    /// one order.
+    pub fn matvec_row(
+        &self,
+        ty: GgmlType,
+        w: &[u8],
+        k: usize,
+        a: &Activations,
+        t: usize,
+        out: &mut [f32],
+    ) -> Result<(), KernelError> {
         let dot = self.vec_dot(ty)?;
         let stride = ty.bytes_for(k as u64).expect("row size fits in a u64") as usize;
         assert_eq!(a.k(), k, "activations were quantized for a different k");
@@ -154,6 +178,7 @@ impl Kernels {
             stride * out.len(),
             out.len()
         );
+        let a = a.row(t);
         for (r, o) in out.iter_mut().enumerate() {
             *o = dot(&w[r * stride..(r + 1) * stride], a);
         }
@@ -161,9 +186,9 @@ impl Kernels {
     }
 }
 
-fn q4k_dot_scalar(w: &[u8], a: &Activations) -> f32 {
+fn q4k_dot_scalar(w: &[u8], a: ActRow<'_>) -> f32 {
     let mut sum = 0.0f32;
-    for (ib, ab) in a.blocks().iter().enumerate() {
+    for (ib, ab) in a.blocks.iter().enumerate() {
         let b = &w[ib * Q4_K_BYTES..(ib + 1) * Q4_K_BYTES];
         let d = read_f16(b, 0);
         let dmin = read_f16(b, 2);
@@ -189,9 +214,9 @@ fn q4k_dot_scalar(w: &[u8], a: &Activations) -> f32 {
     sum
 }
 
-fn q6k_dot_scalar(w: &[u8], a: &Activations) -> f32 {
+fn q6k_dot_scalar(w: &[u8], a: ActRow<'_>) -> f32 {
     let mut sum = 0.0f32;
-    for (ib, ab) in a.blocks().iter().enumerate() {
+    for (ib, ab) in a.blocks.iter().enumerate() {
         let b = &w[ib * Q6_K_BYTES..(ib + 1) * Q6_K_BYTES];
         let (ql, qh, sc) = (&b[0..128], &b[128..192], &b[192..208]);
         let d = read_f16(b, 208);
@@ -219,10 +244,10 @@ fn q6k_dot_scalar(w: &[u8], a: &Activations) -> f32 {
     sum
 }
 
-fn q80_dot_scalar(w: &[u8], a: &Activations) -> f32 {
-    let blocks = a.blocks();
+fn q80_dot_scalar(w: &[u8], a: ActRow<'_>) -> f32 {
+    let blocks = a.blocks;
     let mut sum = 0.0f32;
-    for ib in 0..a.k().div_ceil(QK8_0) {
+    for ib in 0..a.k.div_ceil(QK8_0) {
         let b = &w[ib * Q8_0_BYTES..(ib + 1) * Q8_0_BYTES];
         let dw = read_f16(b, 0);
         let ab = &blocks[ib / (QK_K / QK8_0)];

@@ -276,6 +276,15 @@ impl Pool {
     ///
     /// The kernels are looked up before any thread starts, so an unsupported
     /// type is an error rather than a panic inside a job.
+    ///
+    /// With a batch of `t` activation rows in `a`, every output is `t` rows of
+    /// `rows` values, token-major, and a claimed block of weight rows is run
+    /// against all `t` of them before the next block is touched. That is where
+    /// the batch's win comes from: the block is sized to sit in cache, so its
+    /// weight bytes cross the memory bus once for the whole batch instead of
+    /// once per token. It is also why the result is the same as `t` separate
+    /// calls, bit for bit: an output is still one weight row dotted with one
+    /// activation row, in the one order.
     pub fn matvec_group<const N: usize>(
         &self,
         kernels: &Kernels,
@@ -286,12 +295,21 @@ impl Pool {
         for m in &group {
             kernels.vec_dot(m.ty)?;
         }
-        let parts = group.map(|m| Part {
-            ty: m.ty,
-            w: m.w,
-            stride: m.ty.bytes_for(k as u64).expect("row size fits in a u64") as usize,
-            rows: m.out.len(),
-            out: Scatter::new(m.out),
+        let t = a.t();
+        let parts = group.map(|m| {
+            assert_eq!(
+                m.out.len() % t,
+                0,
+                "an output of {} values is not {t} rows",
+                m.out.len()
+            );
+            Part {
+                ty: m.ty,
+                w: m.w,
+                stride: m.ty.bytes_for(k as u64).expect("row size fits in a u64") as usize,
+                rows: m.out.len() / t,
+                out: Scatter::new(m.out),
+            }
         });
         let total: usize = parts.iter().map(|p| p.rows).sum();
         let parts = &parts;
@@ -312,14 +330,7 @@ impl Pool {
                 for p in parts {
                     let (from, to) = (from.max(base), to.min(base + p.rows));
                     if from < to {
-                        let (at, len) = (from - base, to - from);
-                        // SAFETY: a row block is handed to exactly one worker,
-                        // because `claimed` is advanced atomically, and every
-                        // part has its own output slice.
-                        let chunk = unsafe { p.out.at(at, len) };
-                        kernels
-                            .matvec(p.ty, &p.w[at * p.stride..], k, a, chunk)
-                            .expect("the kernel was resolved before the threads started");
+                        p.run(kernels, k, a, from - base, to - from);
                     }
                     base += p.rows;
                 }
@@ -441,6 +452,37 @@ struct Part<'a> {
     stride: usize,
     rows: usize,
     out: Scatter,
+}
+
+impl Part<'_> {
+    /// Computes rows `at..at + len` of this part, for every row of the batch.
+    ///
+    /// One token goes straight through [`Kernels::matvec`], which is the path
+    /// generation has always taken. A batch runs one pass per token over the
+    /// same block of weight rows, which is where its win comes from: the block
+    /// is small enough to stay in cache, so its bytes cross the memory bus
+    /// once for the whole batch.
+    fn run(&self, kernels: &Kernels, k: usize, a: &Activations, at: usize, len: usize) {
+        let t = a.t();
+        if t == 1 {
+            // SAFETY: a row block is handed to exactly one worker, because
+            // `claimed` is advanced atomically, and every part has its own
+            // output slice.
+            let chunk = unsafe { self.out.at(at, len) };
+            kernels
+                .matvec(self.ty, &self.w[at * self.stride..], k, a, chunk)
+                .expect("the kernel was resolved before the threads started");
+            return;
+        }
+        for tt in 0..t {
+            // SAFETY: as above, and the `t` ranges here are one row block
+            // in `t` disjoint rows of the output.
+            let chunk = unsafe { self.out.at(tt * self.rows + at, len) };
+            kernels
+                .matvec_row(self.ty, &self.w[at * self.stride..], k, a, tt, chunk)
+                .expect("the kernel was resolved before the threads started");
+        }
+    }
 }
 
 /// A `&mut [f32]` several threads may split between them.

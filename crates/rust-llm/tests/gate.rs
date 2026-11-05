@@ -210,6 +210,8 @@ fn every_next_token_matches_the_reference() {
 
     let mut failures = Vec::new();
     let (mut positions, mut agreed) = (0usize, 0usize);
+    // How far every recorded margin has moved since the fixture was written.
+    let mut moved: Vec<f32> = Vec::new();
     for (case, want) in cases.iter().zip(expected) {
         assert_eq!(
             want["name"].as_str(),
@@ -244,8 +246,8 @@ fn every_next_token_matches_the_reference() {
                 agreed += 1;
                 continue;
             }
-            disagreed.push(at);
-            if !allowed.contains(&at) {
+            disagreed.push((at, margin));
+            if !allowed.iter().any(|&(p, _)| p == at) {
                 failures.push(format!(
                     "{}: position {at} is not recorded as indeterminate, but we predict \
                      {ours} where the reference chose {}; margin {margin:.6}",
@@ -265,8 +267,8 @@ fn every_next_token_matches_the_reference() {
                 ));
             }
         }
-        for &at in &allowed {
-            if !disagreed.contains(&at) {
+        for &(at, _) in &allowed {
+            if !disagreed.iter().any(|&(p, _)| p == at) {
                 failures.push(format!(
                     "{}: position {at} is recorded as indeterminate but now agrees; \
                      regenerate the fixture",
@@ -274,11 +276,24 @@ fn every_next_token_matches_the_reference() {
                 ));
             }
         }
+        let margins: Vec<String> = disagreed
+            .iter()
+            .map(|&(at, margin)| {
+                let was = allowed
+                    .iter()
+                    .find(|&&(p, _)| p == at)
+                    .map_or(f32::NAN, |&(_, m)| m);
+                moved.push(margin - was);
+                format!("at {at} margin {margin:.5} (fixture {was:.5})")
+            })
+            .collect();
         println!(
-            "{:28} {:3} positions, {} indeterminate, tightest margin {tightest:8.5}",
+            "{:28} {:3} positions, {} indeterminate, tightest margin {tightest:8.5}{}{}",
             case.name,
             reference.len(),
             allowed.len(),
+            if margins.is_empty() { "" } else { ": " },
+            margins.join(", "),
         );
     }
 
@@ -288,9 +303,11 @@ fn every_next_token_matches_the_reference() {
         failures.len(),
         failures.join("\n")
     );
+    let widest = moved.iter().copied().fold(0.0f32, |m, d| m.max(d.abs()));
     println!(
         "{agreed} of {positions} next-token predictions identical to the reference, \
-         the rest inside the rounding band and recorded in the fixture"
+         the rest inside the rounding band and recorded in the fixture; the \
+         recorded margins moved by at most {widest:.5}"
     );
 }
 
@@ -518,6 +535,119 @@ fn resetting_the_caches_is_the_same_as_a_fresh_runner() {
         "{} tokens, identical after a reset and when prefilled",
         first.len()
     );
+}
+
+/// A batched prompt has to leave exactly the state one token at a time would
+/// have left, and the comparison is **bit-exact**, not within a tolerance.
+///
+/// That is a property of the design rather than a hope: a batched matmul is the
+/// same products accumulated in the same order (one weight row against one
+/// activation row, the kernel test
+/// `the_batched_kernel_is_bit_identical_to_the_single_one` pins that down), the
+/// convolution and the recurrence run token by token inside the batch, and
+/// attention stops its score loop at the token's own position. So any
+/// difference at all is a bug, and a tolerance would hide the small ones:
+/// rounding is what this model's output is discontinuous in, so a difference
+/// too small to see in the logits is one flipped quantization level away from a
+/// different token.
+///
+/// What is compared is the whole 248320-entry logit vector after the prompt,
+/// *and* the tokens generated after it. The logits alone would miss a stale
+/// recurrent state that only the next token reads; the tokens alone would miss
+/// a wrong state that the decay fades below an argmax before it shows (see
+/// [`resetting_the_caches_is_the_same_as_a_fresh_runner`]).
+///
+/// Batch sizes: one that divides the prompt, several that do not, and one
+/// larger than the whole prompt. Batch 1 is the token-by-token side itself,
+/// which is what makes this also the check that the batched path has not
+/// changed the single-token path.
+#[test]
+#[ignore = "needs the model file"]
+fn a_batched_prompt_is_the_same_as_one_token_at_a_time() {
+    let case = &cases()[0];
+    let gguf = open_model();
+    let tokenizer = tokenizer();
+    let model = Model::load(&gguf).expect("load model");
+    let prompt = tokenizer.encode(&case.prompt, true).expect("encode");
+    let threads = threads();
+
+    // The token-by-token side: a runner that cannot batch at all.
+    let mut single = Runner::with_batch(&model, CONTEXT, threads, 1);
+    assert_eq!(single.max_batch(), 1);
+    let mut want_logits = Vec::new();
+    for &t in &prompt {
+        want_logits = single.forward(t).to_vec();
+    }
+    single.reset();
+    let (want_tokens, _, _) = generate(
+        &mut single,
+        &mut Sampler::greedy(model.vocab()),
+        &prompt,
+        16,
+        |_| true,
+    );
+    println!(
+        "{} prompt tokens, {} generated, tier {}, {threads} threads",
+        prompt.len(),
+        want_tokens.len(),
+        single.kernels().tier().as_str(),
+    );
+
+    let sizes = [2usize, 5, 7, prompt.len(), prompt.len() + 9];
+    // A prompt divisible by 2, 5 and 7 would be at least 70 tokens long and
+    // no prompt in the set is, so both cases are always covered; asserting it
+    // keeps that true if the prompt set changes.
+    assert!(
+        sizes.iter().any(|b| prompt.len() % b == 0),
+        "no batch size divides a prompt of {} tokens",
+        prompt.len()
+    );
+    assert!(
+        sizes.iter().any(|b| prompt.len() % b != 0),
+        "every batch size divides a prompt of {} tokens",
+        prompt.len()
+    );
+
+    for batch in sizes {
+        let mut runner = Runner::with_batch(&model, CONTEXT, threads, batch);
+        let mut read = 0;
+        let mut got = Vec::new();
+        let mut batches = 0;
+        while read < prompt.len() {
+            let take = (prompt.len() - read).min(batch);
+            got = runner.forward_batch(&prompt[read..read + take]).to_vec();
+            read += take;
+            batches += 1;
+        }
+        if let Some(d) = difference(&got, &want_logits) {
+            panic!(
+                "batch {batch} ({batches} batches over {} tokens): the prompt's last \
+                 logits differ from the token-by-token path: {d}",
+                prompt.len()
+            );
+        }
+        assert_eq!(runner.pos(), prompt.len(), "batch {batch}: wrong position");
+
+        // The hand-over: generation reads the caches and the recurrent state
+        // the prompt left, so this is where a state that is subtly wrong shows.
+        runner.reset();
+        let (ids, _, _) = generate(
+            &mut runner,
+            &mut Sampler::greedy(model.vocab()),
+            &prompt,
+            16,
+            |_| true,
+        );
+        assert_eq!(
+            ids, want_tokens,
+            "batch {batch}: generation after a batched prompt produced different \
+             tokens than after a token-by-token one"
+        );
+        println!(
+            "batch {batch:3}: {batches} batch(es), logits identical, {} tokens identical",
+            ids.len()
+        );
+    }
 }
 
 #[test]
@@ -790,12 +920,25 @@ fn ids_of(v: &serde_json::Value) -> Vec<u32> {
         .collect()
 }
 
-fn indeterminate_positions(case: &serde_json::Value) -> Vec<usize> {
+/// The positions the fixture records as indeterminate, with the margin that
+/// was measured there when it was written.
+///
+/// The margin is recorded, and printed next to the one measured now, because
+/// what matters about a disagreement is not that it is permitted but how far
+/// inside the rounding band it is. A margin that has widened is a change in
+/// the arithmetic even when the test still passes, and the only way to see
+/// that is to put the two numbers next to each other.
+fn indeterminate_positions(case: &serde_json::Value) -> Vec<(usize, f32)> {
     case["indeterminate"]
         .as_array()
         .map(|a| {
             a.iter()
-                .map(|e| e["at"].as_u64().expect("at") as usize)
+                .map(|e| {
+                    (
+                        e["at"].as_u64().expect("at") as usize,
+                        e["margin"].as_f64().unwrap_or(f64::NAN) as f32,
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default()

@@ -59,15 +59,16 @@ pub enum Stop {
 /// returns whether to keep going: `false` ends the run with [`Stop::Cancelled`]
 /// and the token it just saw is the last one in the output.
 ///
-/// The prompt's last token is the one generation starts from: its logits are
-/// the first prediction, which is also why nothing re-reads the prompt and the
-/// delta-net state generation continues from is exactly the state the prompt
-/// left behind.
+/// The prompt goes through in batches of up to [`Runner::max_batch`] tokens,
+/// which is where a prompt is faster per token than generation. The prompt's
+/// last token is still the one generation starts from: its logits are the first
+/// prediction, which is also why nothing re-reads the prompt and the delta-net
+/// state generation continues from is exactly the state the prompt left behind.
 ///
 /// Every token that goes through the model enters the sampler's recent-token
-/// window exactly once, the prompt's included: the window is what the
-/// repetition penalty reads, and a penalty that only saw the generated tokens
-/// would not notice the prompt repeating itself.
+/// window exactly once, the prompt's included and in order: the window is what
+/// the repetition penalty reads, and a penalty that only saw the generated
+/// tokens would not notice the prompt repeating itself.
 pub fn generate(
     runner: &mut Runner<'_>,
     sampler: &mut Sampler,
@@ -88,18 +89,30 @@ pub fn generate(
 
     let start = Instant::now();
     let mut next = 0u32;
-    for (i, &t) in prompt.iter().enumerate() {
-        if runner.pos() == runner.context() {
+    let mut read = 0;
+    while read < prompt.len() {
+        // The batch cannot be longer than the positions the caches hold, so
+        // the room left in the context caps it next to the scratch's own
+        // maximum.
+        let room = runner.context() - runner.pos();
+        if room == 0 {
             // What went through the model, which is not the whole prompt here:
             // the caller handed over more of it than the context holds, and a
             // count of 0 would read as a model with nothing to say.
-            timings.prompt_tokens = i;
+            timings.prompt_tokens = read;
             timings.prompt_time = start.elapsed();
             return (out, Stop::ContextFull, timings);
         }
-        let logits = runner.forward(t);
-        sampler.remember(t);
-        if i + 1 == prompt.len() {
+        let take = (prompt.len() - read).min(runner.max_batch()).min(room);
+        let batch = &prompt[read..read + take];
+        let logits = runner.forward_batch(batch);
+        // Every token of the batch, in order, exactly as the single-token path
+        // remembered them one at a time.
+        for &t in batch {
+            sampler.remember(t);
+        }
+        read += take;
+        if read == prompt.len() {
             next = sampler.sample(logits);
         }
     }

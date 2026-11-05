@@ -48,6 +48,8 @@ options
                         (default: all cores)
   --max-tokens <n>      stop after this many generated tokens (default 512,
                         bench 16, and bench generates exactly this many)
+  --batch <n>           tokens per batch while reading the prompt (default:
+                        see docs/decisions.md; 1 reads it token by token)
   --think, --no-think   thinking mode, on by default, as the template is
   --raw                 take --prompt as the prompt verbatim, no chat template
   --host <addr>         serve: address to listen on (default 127.0.0.1)
@@ -83,6 +85,7 @@ struct Args {
     threads: Vec<usize>,
     /// `None` is the command's own default: 512 for `run`, 16 for `bench`.
     max_tokens: Option<usize>,
+    batch: usize,
     prompt_tokens: usize,
     repeats: usize,
     thinking: bool,
@@ -134,10 +137,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return profile(&model, &tokenizer, &args);
     }
 
-    let mut runner = Runner::new(&model, args.context, args.threads[0]);
+    let mut runner = Runner::with_batch(&model, args.context, args.threads[0], args.batch);
 
     eprintln!(
-        "model {} ({} blocks, {} full attention, {} linear), kernels {}, {} threads, context {}",
+        "model {} ({} blocks, {} full attention, {} linear), kernels {}, {} threads, context {}, prompt batch {}",
         args.model.display(),
         model.config.n_blocks,
         model.config.n_full_blocks(),
@@ -145,6 +148,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         runner.kernels().tier().as_str(),
         runner.threads(),
         runner.context(),
+        runner.max_batch(),
     );
 
     if args.command == "trace" {
@@ -439,6 +443,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
         context: 4096,
         threads: vec![default_threads()],
         max_tokens: None,
+        batch: rust_llm::forward::DEFAULT_BATCH,
         prompt_tokens: 19,
         repeats: 5,
         thinking: true,
@@ -477,6 +482,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
             "--context" => out.context = number(&value()?, "--context")?,
             "--threads" => out.threads = thread_list(&value()?)?,
             "--max-tokens" => out.max_tokens = Some(number(&value()?, "--max-tokens")?),
+            "--batch" => out.batch = number(&value()?, "--batch")?.max(1),
             "--prompt-tokens" => out.prompt_tokens = number(&value()?, "--prompt-tokens")?.max(1),
             "--repeats" => out.repeats = number(&value()?, "--repeats")?.max(1),
             "--temperature" => {
@@ -610,6 +616,7 @@ fn bench(
             context: args.context,
             generate,
             repeats: args.repeats,
+            batch: args.batch,
         },
     );
     Ok(())
@@ -628,7 +635,17 @@ fn profile(
     let generate = args.max_tokens.unwrap_or(16);
     let full = tokenizer.encode(bench::FILLER, true)?;
     let prompt = &full[..args.prompt_tokens.min(full.len())];
-    let mut runner = Runner::new(model, args.context, args.threads[0]);
+    // The same check `bench` makes, and for the same reason: without it the
+    // run ends in the forward pass's assert instead of saying what to change.
+    if prompt.len() + generate > args.context {
+        return Err(format!(
+            "prompt {} plus {generate} generated tokens does not fit a context of {}",
+            prompt.len(),
+            args.context
+        )
+        .into());
+    }
+    let mut runner = Runner::with_batch(model, args.context, args.threads[0], args.batch);
 
     eprintln!(
         "quota {}, load {:.2}",
@@ -643,8 +660,11 @@ fn profile(
 
     runner.clear_profile();
     runner.reset();
-    for &t in prompt {
-        runner.forward(t);
+    let mut read = 0;
+    while read < prompt.len() {
+        let take = (prompt.len() - read).min(runner.max_batch());
+        runner.forward_batch(&prompt[read..read + take]);
+        read += take;
     }
     print!("{}", runner.profile_report("prompt", prompt.len()));
 
