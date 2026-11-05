@@ -150,16 +150,18 @@ Honest notes on that table:
   remove. The prompt keeps scaling with cores because it is compute-bound at
   every thread count.
 - **What caps the ratio is the part of a token that does not batch.** From the
-  profile below, of a 20.06 ms prompt token the delta-net recurrence is 10.0 per
-  cent, the elementwise work 5.9, the convolution 4.1 and the norms 2.5: 22.5
+  profile below, of a 21.21 ms prompt token the delta-net recurrence is 4.3 per
+  cent, the elementwise work 6.0, the convolution 5.0 and the norms 2.7: 18.2
   per cent that costs the same per token whether 1 token or 16 go through
-  together. With that fixed and the matmuls divided by the batch, 3.2 at 8
-  threads is close to what is available; the next factor would have to come out
-  of the matmul kernel, not out of the batch.
+  together. It was 22.5 per cent before the recurrence was blocked over its
+  output components. With that fixed and the matmuls divided by the batch, 3.2
+  at 8 threads is close to what is available; the next factor would have to come
+  out of the matmul kernel, not out of the batch.
 - Generation reaches 77 per cent of the measured ceiling at 8 threads. The
   remaining fifth is the output head and everything per token that is not
-  streaming weights; it is not barrier time, which is 3.8 per cent (see the
-  profile).
+  streaming weights; it is not barrier time, which was 3.8 per cent in the
+  window this sweep was taken in. (The re-run profile below shows 11.2 on a
+  busier box: that row is where another tenant's work on the quota lands.)
 - The spreads are under 5 per cent except the 8-thread prompt row at 7.1,
   which is the setting most exposed to whatever else runs on the box. Earlier
   windows gave 12 per cent there. Compare rows within a window, never across.
@@ -238,12 +240,16 @@ context so the positions are really used:
 
 | context | prompt: attention | prompt: token | generation: attention | generation: token |
 | --- | --- | --- | --- | --- |
-| 1024 | 0.27 ms (1.4%) | 20.06 ms | 0.97 ms (1.5%) | 64.50 ms |
+| 1024 | 0.33 ms (1.6%) | 21.21 ms | 1.03 ms (1.4%) | 75.91 ms |
 | 2048 | 2.92 ms (11.9%) | 24.49 ms | 12.50 ms (14.7%) | 85.11 ms |
 | 4096 | 6.49 ms (22.8%) | 28.43 ms | 18.09 ms (20.1%) | 89.83 ms |
 
-The 2048 and 4096 rows are from the commit before `1828971`, so they are the
-"before" of the pair below. Generation's attention cost is the KV cache's bytes
+The 1024 row is the re-run profile at the end of M2 and the 2048 and 4096 rows
+are from the commit before `1828971`, so those two are the "before" of the pair
+below. Three windows, three levels: what each row is for is attention's share
+of its own token, which is why the share is in the cell.
+
+Generation's attention cost is the KV cache's bytes
 and nothing else: at context 4096 one token reads 16 query heads times 4096
 positions times 256 lanes times 4 bytes, for keys and for values, over the eight
 full-attention blocks, which is 1.07 GB and 22 ms at the measured ceiling
@@ -300,6 +306,69 @@ linearly while the values it is weighed against grow linearly too, and the row
 stays in L2 until about context 32768 (128 KiB per query). There is no context
 at which the saved pass over the scores becomes the larger term.
 
+## Blocking the delta-net recurrence
+
+The recurrence was the largest non-matmul row of a prompt token and was left
+alone for a long time, on the grounds that vectorizing it meant reassociating an
+f32 sum and so changing the result of the one operator whose arithmetic was
+copied from the reference step for step. That turned out to be a mix-up about
+*which* sum. The two reductions over the contracted dimension are serial and
+cannot be reassociated, and they are not the ones that had to be vectorized:
+the `d_state` output components are independent of each other, each with its own
+decay-and-contract, its own delta and its own readout. A block of components
+therefore puts one whole scalar sequence in every lane, in the original order,
+and the result is bit-identical by construction rather than within a tolerance.
+What it cost was the state's layout, `[i][j]` per head instead of `[j][i]`,
+which is internal: nothing outside the recurrence reads it, the reset only
+zeroes it and no tracer node dumps it.
+
+`50bb149`, against `4ebb916`'s binary alternated in one window, three passes,
+context 1024, 192-token prompt, 8 threads, batch 16, tier `avx2+vnni`, load 1.8
+to 7.5:
+
+| | before | after |
+| --- | --- | --- |
+| the operator, prompt | 2.24 ms/token | 0.93 ms/token |
+| the whole prompt token | 22.59 ms | 21.29 ms |
+| prompt | 45.03 tok/s | 46.61 tok/s |
+| the operator, generation | 3.07 ms/token | 2.35 ms/token |
+| generation | 13.51 tok/s | 13.69 tok/s |
+
+**Generation does not move, and could not have.** The recurrent state is 48 MiB
+and the recurrence reads and writes all of it once per token, so 96 MiB against
+the 48.6 GiB/s this box streams is a 2.0 ms floor under a row that measured
+2.2 to 3.1: there was never more than a few tenths of a millisecond in it, and
+the pair above is inside the spread on the token even though it is up in all
+three passes. The prompt is where the win is for the mirror-image reason: a
+batch of 16 reuses one head's 64 KiB of state out of cache across all 16 tokens,
+so the traffic floor there is about 0.13 ms and what the loop was paying instead
+was the latency of its serial chain.
+
+The block is 64 components, picked on the whole token and not on the operator's
+own row. Four binaries alternated over a 1024-token prompt, both orders so the
+load drift inside a pass cancels, prompt phase in ms/token:
+
+| block | this operator | the convolution | the whole token |
+| --- | --- | --- | --- |
+| scalar | 2.04 | 0.78 | 21.80 |
+| 16 | 0.96 | 0.83 | 20.93 |
+| 32 | 0.84 | 0.99 | 21.14 |
+| 64 | 0.87 | 0.86 | 20.72 |
+
+A block of 32 is the fastest row by 0.03 ms and the slowest of the three on the
+token, because it reproducibly costs the convolution next to it 0.2 ms. The
+convolution's loop is untouched by any of this and the cost does not grow with
+the number of blocks a head is walked in, which is what a cache explanation
+would predict, so it is read as the code layout of that one build rather than
+as something to tune against. A block of 16 is too narrow to amortise the load
+of the two inputs over.
+
+Measuring this needed a longer prompt than the 192 tokens the rest of this file
+uses. At 192 the prompt phase is under four seconds and `bench` cannot separate
+the two builds at all: one window gave 43.21 against 47.51 tok/s and a quieter
+one gave 47.71 against 47.45. The operator's own row is stable to 0.02 ms across
+every window, which is why it is the number of record here.
+
 ## KV-cache dtype: measured, not taken
 
 An f16 KV cache halves the bytes generation's attention reads, and that operator
@@ -309,13 +378,31 @@ is measured above: 20.1 per cent of a generation token at context 4096, 14.7 at
 measurable at 1024, before anything is paid for converting f16 to f32 in the
 score loop.
 
-It is also a rounding change in the attention scores, which is what the gate
-measures, and it would move the fixture that records the four permitted
-disagreements. That fixture moves with a decision that is written down, not as
-a side effect of a change made for speed, so this is not taken here; the number
-above is what such a decision needs. The
-reference's own default is an f16 cache, which is part of why its `tg16` column
-below is ahead of its matched-flags column.
+Those percentages are measured with the cache **filled** to the context. The
+attention cost follows the positions actually in use and not the allocation, so
+the default `--context 4096` with a short conversation in it sits on the 1024
+row, where the win is nothing measurable. The configuration the upper bound
+applies to is a context that is genuinely full.
+
+The reason it is not taken is the gate, and not the fixture moving. The gate
+pins the reference to `-ctk f32 -ctv f32` because, in its own words, f16 keys
+are a different model and not a different rounding. Taking an f16 cache here
+means moving the reference's flags with it, and then the gate is no longer
+comparing two roundings of one model, which is the whole thing it exists to do.
+A fixture that moves is a decision someone writes down; a gate that stops
+measuring what it claims to measure is not a decision, it is the loss of the
+instrument.
+
+The memory is not the argument either way: an f16 cache saves 90 to 180 MiB of
+a 2.75 to 3.00 GiB peak, of which 2.52 GiB is the mapped model file. See
+"Memory" above.
+
+What would reopen it: a requirement for generation throughput at a full long
+context, arriving as a `--kv-dtype` option with f32 the gated default rather
+than as a replacement, with its own fixture, both dtypes measured, and the
+indeterminate band re-derived for the f16 path. The reference's own default is
+an f16 cache, which is part of why its `tg16` column below is ahead of its
+matched-flags column.
 
 ## Memory
 
@@ -454,52 +541,64 @@ argmax over 248320 logits.
 
 ### Now, at the end of M2
 
+Re-run on the final head of the branch, so the shares match what ships. Both
+tables are one invocation, at a load of 4.1 on a box that had other work on it;
+the same command earlier in the day gave a 20.06 ms prompt token and a 64.50 ms
+generation token. **Read the shares, not the level.** The level here is this
+window's, and generation is the half that shows it: it is bandwidth-bound, so
+the workers get descheduled and the pool's join row absorbs the difference. The
+comparable thing is a pair measured in one window, and the only operator this
+branch's last change moves has its pair under "Blocking the delta-net
+recurrence" below, where `4ebb916` gave 75.82 ms against the 75.91 here.
+
 ```
 profile: prompt, 192 tokens, 8 threads, context 1024, batch 16, tier avx2+vnni
 operator                           calls/t   ms/token       %
-ffn: gate and up matmul                2.0       5.35    26.7
-ffn: down matmul                       2.0       3.78    18.8
-linear: qkv, gate, alpha, beta matmul    1.5       2.88    14.4
-linear: delta-net recurrence           1.5       2.00    10.0
-linear: output matmul                  1.5       1.36     6.8
-elementwise                           11.5       1.18     5.9
-linear: convolution                    1.5       0.83     4.1
-full: qg, k and v matmul               0.5       0.79     3.9
-output head matmul                     0.1       0.68     3.4
-norms and rope                         7.6       0.51     2.5
-full: output matmul                    0.5       0.43     2.1
-full: attention                        0.5       0.27     1.4
+ffn: gate and up matmul                2.0       5.96    28.1
+ffn: down matmul                       2.0       4.17    19.7
+linear: qkv, gate, alpha, beta matmul     1.5       3.29    15.5
+linear: output matmul                  1.5       1.53     7.2
+elementwise                           11.5       1.28     6.0
+linear: convolution                    1.5       1.07     5.0
+linear: delta-net recurrence           1.5       0.92     4.3
+full: qg, k and v matmul               0.5       0.87     4.1
+output head matmul                     0.1       0.71     3.3
+norms and rope                         7.6       0.58     2.7
+full: output matmul                    0.5       0.51     2.4
+full: attention                        0.5       0.33     1.6
 embed                                  1.0       0.00     0.0
-measured total                                  20.06   100.0
-of which pool hand-out                10.1       0.84     4.2
-of which pool join (last worker)      10.1       0.80     4.0
+measured total                                  21.21   100.0
+of which pool hand-out                10.1       1.03     4.9
+of which pool join (last worker)      10.1       1.20     5.7
 ```
 
 ```
 profile: generation, 8 tokens, 8 threads, context 1024, tier avx2+vnni
 operator                           calls/t   ms/token       %
-ffn: gate and up matmul               32.0      17.90    27.7
-ffn: down matmul                      32.0      12.34    19.1
-linear: qkv, gate, alpha, beta matmul   24.0      10.88    16.9
-output head matmul                     1.0      10.58    16.4
-linear: output matmul                 24.0       3.35     5.2
-full: qg, k and v matmul               8.0       2.59     4.0
-linear: delta-net recurrence          24.0       2.22     3.4
-elementwise                          184.0       1.17     1.8
-full: output matmul                    8.0       1.12     1.7
-full: attention                        8.0       0.97     1.5
-linear: convolution                   24.0       0.82     1.3
-norms and rope                       121.0       0.56     0.9
+ffn: gate and up matmul               32.0      21.19    27.9
+ffn: down matmul                      32.0      15.22    20.1
+linear: qkv, gate, alpha, beta matmul    24.0      12.34    16.3
+output head matmul                     1.0      11.05    14.6
+linear: output matmul                 24.0       3.86     5.1
+linear: delta-net recurrence          24.0       3.13     4.1
+full: qg, k and v matmul               8.0       3.12     4.1
+full: output matmul                    8.0       1.80     2.4
+elementwise                          184.0       1.52     2.0
+full: attention                        8.0       1.03     1.4
+linear: convolution                   24.0       1.02     1.3
+norms and rope                       121.0       0.61     0.8
 embed                                  1.0       0.00     0.0
-measured total                                  64.50   100.0
-of which pool hand-out               161.0       0.78     1.2
-of which pool join (last worker)     161.0       2.46     3.8
+measured total                                  75.91   100.0
+of which pool hand-out               161.0       3.02     4.0
+of which pool join (last worker)     161.0       8.50    11.2
 ```
 
 The `calls/t` column in the prompt table is per token, so a batch of 16 shows
 the 32 feed-forward jobs of a token as 2 and the one output head as 0.1: ten
-jobs per token instead of 161, which is where the pool's share went from 5.9 to
-8.2 per cent of a much smaller token without growing in absolute terms.
+jobs per token instead of 161. The pool costs 2.23 ms of a prompt token against
+11.52 ms of a generation token for that reason, and its *share* is the larger
+one on generation here only because this window's load lands on the join row;
+in a quiet window the two are 1.64 and 3.24 ms, which is the same story.
 
 What is left to win, in order:
 
@@ -511,12 +610,11 @@ What is left to win, in order:
 - **The output head is 16.4 per cent of a generation token** and 3.4 of a prompt
   token, because a batch computes it once. It is a single 2560 x 248320 matmul
   over the whole embedding table and it cannot be fused with anything.
-- **The delta-net recurrence is 10 per cent of a prompt token**, up from 3.4 per
-  cent of a generation token, because it is the one operator a batch does not
-  make cheaper: it is sequential over tokens by construction. Its inner loops
-  carry an f32 reduction, so they do not vectorize without reassociating the
-  sum, which would change the result. That is why it is not on this branch; see
-  "What was measured and not kept".
+- **The delta-net recurrence is 4.3 per cent of a prompt token**, down from 10
+  before it was blocked over its output components; see "Blocking the delta-net
+  recurrence" below. It is still the one operator a batch does not make cheaper,
+  because it is sequential over tokens by construction, and what is left of it
+  on generation is the state's own memory traffic rather than the loop.
 - Attention is 1.4 per cent at this context and 20 per cent at 4096; see
   "Attention" above.
 
@@ -609,15 +707,8 @@ records at 0.00937, 0.01035, 0.04748 and 0.12625, to the last digit.
   token at the context where attention matters most, against a rounding change
   in the softmax.
 - **An f16 KV cache**: see "KV-cache dtype" above. Upper bound 10 per cent of a
-  generation token at context 4096, nothing measurable at 1024, and a rounding
-  change in the scores.
-- **Vectorizing the delta-net recurrence**: not implemented. Its inner loops
-  accumulate `sk` and the readout in f32, which is a serial dependency the
-  compiler cannot vectorize without reassociating the sum, and reassociating it
-  changes the result of the operator the reference's own arithmetic was copied
-  for. It is 10 per cent of a prompt token, so there is something there, but it
-  is a change to the arithmetic and belongs with a decision about the gate
-  rather than inside a tuning commit.
+  generation token at a full context 4096, nothing measurable at 1024, against
+  a gate that would stop comparing two roundings of one model.
 - **A batch larger than 16 as the default**: measured, 8 per cent more prompt
   tok/s at batch 64 for four times the scratch. See the batch-size curve.
 - **A batched Q8_0 kernel**: not written. This file holds no `Q8_0` tensor, so
