@@ -77,6 +77,16 @@ Memory saturates at about 48.6 GiB/s, which it reaches at 6 or 7 threads of the
 8 the quota allows. So the memory system is full before the CPU quota is, and
 above 6 threads a lane adds no bandwidth.
 
+These numbers are a slight **under**estimate, by 1 to 3 per cent. A thread
+checks the deadline between whole passes over its region, so it stops up to one
+pass early and then idles while the others finish theirs, while the elapsed time
+counted is the whole scope's. A pass is 68 ms of the 2-second window at 1 thread
+and 23 ms at 8. A low ceiling makes the "fraction of the ceiling" rows below
+read high, so they are flattering by about that much and not conservative: the
+79 per cent at the end of this branch is nearer 77. Taking the elapsed time per
+thread instead of per scope would remove it, and belongs with the kernel work on
+this branch rather than in a docs change.
+
 ## The runner against that ceiling
 
 Context 1024, 19-token prompt, 16 generated tokens, tier `avx2+vnni`, quota 8
