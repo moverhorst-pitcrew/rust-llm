@@ -19,12 +19,16 @@ use llm_core::Gguf;
 const USAGE: &str = "\
 rust-llm run --prompt <text> [options]
 rust-llm chat [options]
+rust-llm serve [options]
 rust-llm trace --prompt <text> [options]
 
   run     generate from the prompt and stream the result
   chat    an interactive conversation, streamed. /reset starts over,
           /exit or Ctrl-D quits. No line editing and no history: that
           would be a readline dependency for a development surface.
+  serve   an OpenAI-compatible HTTP server: POST /v1/chat/completions
+          and POST /v1/completions, streaming and not. One request is
+          answered at a time; the options below are its defaults.
   trace   print one per-layer activation sum per line, for comparison
           against a reference runner (see docs/decisions.md)
 
@@ -38,6 +42,9 @@ options
   --max-tokens <n>      stop after this many generated tokens (default 512)
   --think, --no-think   thinking mode, on by default, as the template is
   --raw                 take --prompt as the prompt verbatim, no chat template
+  --host <addr>         serve: address to listen on (default 127.0.0.1)
+  --port <n>            serve: port to listen on, 0 picks a free one
+                        (default 8080)
 
 sampling
   --temperature <f>     0 is greedy argmax (default 0.6)
@@ -63,6 +70,8 @@ struct Args {
     raw: bool,
     sampling: Sampling,
     seed: Option<u64>,
+    host: String,
+    port: u16,
 }
 
 fn main() -> ExitCode {
@@ -128,6 +137,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(out, "{}\t{:.6}\t{}", node.name, node.sum, edges.join(","))?;
         }
         return Ok(());
+    }
+
+    // Before the seed is resolved below: the server resolves one per request,
+    // so that every answer it gives can be replayed on its own.
+    if args.command == "serve" {
+        return serve(&args, &tokenizer, model.vocab(), &mut runner, load);
     }
 
     // The seed is resolved here and printed, because a run taken from entropy
@@ -240,6 +255,7 @@ fn stream(
             let _ = stdout.write_all(text.as_bytes());
             let _ = stdout.flush();
         }
+        true
     });
     println!();
 
@@ -249,6 +265,59 @@ fn stream(
         println!("{text}");
     }
     Ok((ids, stop, timings))
+}
+
+/// The HTTP surface.
+///
+/// Every option above becomes a per-request default; a request overrides the
+/// fields it sends and keeps the rest. See `rust_llm::serve` and
+/// `docs/decisions.md`.
+fn serve(
+    args: &Args,
+    tokenizer: &Tokenizer,
+    vocab: usize,
+    runner: &mut Runner<'_>,
+    load: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = std::net::TcpListener::bind((args.host.as_str(), args.port))
+        .map_err(|e| format!("cannot listen on {}:{}: {e}", args.host, args.port))?;
+    let defaults = rust_llm::serve::Defaults {
+        model: args
+            .model
+            .file_name()
+            .map_or_else(
+                || args.model.as_os_str().to_string_lossy(),
+                |name| name.to_string_lossy(),
+            )
+            .into_owned(),
+        system: args.system.clone(),
+        max_tokens: args.max_tokens,
+        thinking: args.thinking,
+        sampling: args.sampling,
+        seed: args.seed,
+    };
+    eprintln!(
+        "loaded in {:.2}s. defaults: max-tokens {}, thinking {}, temperature {}, \
+         top-k {}, top-p {}, min-p {}, repeat penalty {} over {}, seed {}",
+        load.as_secs_f64(),
+        defaults.max_tokens,
+        defaults.thinking,
+        defaults.sampling.temperature,
+        defaults.sampling.top_k,
+        defaults.sampling.top_p,
+        defaults.sampling.min_p,
+        defaults.sampling.repeat_penalty,
+        defaults.sampling.repeat_last_n,
+        match defaults.seed {
+            Some(seed) => seed.to_string(),
+            None => "from entropy, per request".to_string(),
+        },
+    );
+    // Last, and with the address the listener actually got, so that `--port 0`
+    // is usable and a client can treat this line as "the server is up".
+    eprintln!("listening on http://{}", listener.local_addr()?);
+    rust_llm::serve::serve(&listener, runner, tokenizer, vocab, &defaults)?;
+    Ok(())
 }
 
 /// The interactive surface.
@@ -345,6 +414,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
         raw: false,
         sampling: Sampling::default(),
         seed: None,
+        // Loopback: this server has no authentication and runs a model that
+        // answers whatever it is asked, so it is not something to put on a
+        // network by default.
+        host: "127.0.0.1".to_string(),
+        port: 8080,
     };
     let mut args = args.peekable();
     let mut seen_prompt = false;
@@ -361,6 +435,13 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
             "--prompt" => {
                 out.prompt = value()?;
                 seen_prompt = true;
+            }
+            "--host" => out.host = value()?,
+            "--port" => {
+                let v = value()?;
+                out.port = v
+                    .parse()
+                    .map_err(|_| format!("--port needs a port number, got {v:?}"))?;
             }
             "--context" => out.context = number(&value()?, "--context")?,
             "--threads" => out.threads = number(&value()?, "--threads")?.max(1),
@@ -393,10 +474,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     if out.command.is_empty() {
         return Ok(None);
     }
-    if !matches!(out.command.as_str(), "run" | "chat" | "trace") {
+    if !matches!(out.command.as_str(), "run" | "chat" | "serve" | "trace") {
         return Err(format!("unknown command {:?}\n\n{USAGE}", out.command));
     }
-    if out.command != "chat" && !seen_prompt {
+    if matches!(out.command.as_str(), "run" | "trace") && !seen_prompt {
         return Err(format!(
             "--prompt is required by {}\n\n{USAGE}",
             out.command

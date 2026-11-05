@@ -161,14 +161,15 @@ fn the_generation_loop_allocates_nothing_per_token() {
         // One throwaway call first, so a lazily initialised anything inside
         // the standard library is not charged to the measurements below.
         runner.reset();
-        generate(&mut runner, &mut sampler, &prompt, 2, |_| {});
+        generate(&mut runner, &mut sampler, &prompt, 2, |_| true);
 
         let mut counts = Vec::new();
         for max_tokens in [4usize, 32] {
             runner.reset();
             let mut produced = 0;
             let n = allocations(|| {
-                let (ids, _, _) = generate(&mut runner, &mut sampler, &prompt, max_tokens, |_| {});
+                let (ids, _, _) =
+                    generate(&mut runner, &mut sampler, &prompt, max_tokens, |_| true);
                 produced = ids.len();
             });
             counts.push((max_tokens, produced, n));

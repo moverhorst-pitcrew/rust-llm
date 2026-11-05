@@ -577,7 +577,7 @@ fn the_generation_loop_runs_on_the_fixture() {
         runner.reset();
         let mut sampler = Sampler::new(model.vocab(), set);
         let (ids, stop, timings) =
-            generate::generate(&mut runner, &mut sampler, &prompt, 16, |_| {});
+            generate::generate(&mut runner, &mut sampler, &prompt, 16, |_| true);
         assert!(
             !ids.is_empty(),
             "{set:?} generated nothing, stopped {stop:?}"

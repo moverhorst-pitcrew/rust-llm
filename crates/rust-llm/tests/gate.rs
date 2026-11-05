@@ -326,7 +326,7 @@ fn greedy_output_is_unchanged() {
             &mut Sampler::greedy(model.vocab()),
             &prompt,
             case.max_tokens,
-            |_| {},
+            |_| true,
         );
         let committed = ids_of(&want["tokens"]);
         let reference = ids_of(&want["reference_tokens"]);
@@ -402,7 +402,7 @@ fn the_thread_count_does_not_change_the_output() {
             &mut Sampler::greedy(model.vocab()),
             &prompt,
             24,
-            |_| {},
+            |_| true,
         );
         println!("{threads} threads: {ids:?}");
         outputs.push((threads, ids));
@@ -471,7 +471,7 @@ fn resetting_the_caches_is_the_same_as_a_fresh_runner() {
         &mut Sampler::greedy(model.vocab()),
         &prompt,
         24,
-        |_| {},
+        |_| true,
     );
 
     runner.reset();
@@ -492,7 +492,7 @@ fn resetting_the_caches_is_the_same_as_a_fresh_runner() {
         &mut Sampler::greedy(model.vocab()),
         &prompt,
         24,
-        |_| {},
+        |_| true,
     );
     assert_eq!(
         first, second,
@@ -584,7 +584,7 @@ fn the_fixture_is_still_what_the_reference_produces() {
             &mut Sampler::greedy(model.vocab()),
             &prompt_ids,
             case.max_tokens,
-            |_| {},
+            |_| true,
         );
 
         runner.reset();

@@ -7,6 +7,9 @@ publish.workspace = true
 
 [dependencies]
 llm-core.workspace = true
+# The HTTP surface parses and builds its bodies with it. Already in the tree
+# through tokenizers.
+serde_json.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
 
@@ -14,4 +17,3 @@ tokenizers.workspace = true
 # Only the test fixture writer needs it, to put f16 block scales in a GGUF
 # it builds byte by byte. It is already in the tree through llm-core.
 half.workspace = true
-serde_json.workspace = true

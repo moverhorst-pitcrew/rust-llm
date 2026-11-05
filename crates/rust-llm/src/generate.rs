@@ -45,13 +45,19 @@ pub enum Stop {
     MaxTokens,
     /// The context filled up; the caller asked for more than it allocated.
     ContextFull,
+    /// `on_token` asked to stop. The HTTP surface uses it when the client it
+    /// was streaming to went away: every further token costs every core and
+    /// nobody will read it.
+    Cancelled,
 }
 
 /// Reads the prompt, then generates until a stop token, `max_tokens` or the
 /// end of the context.
 ///
 /// `on_token` sees every generated token as it is produced, before the next
-/// forward pass, so a caller can stream. Stop tokens are not passed to it.
+/// forward pass, so a caller can stream. Stop tokens are not passed to it. It
+/// returns whether to keep going: `false` ends the run with [`Stop::Cancelled`]
+/// and the token it just saw is the last one in the output.
 ///
 /// The prompt's last token is the one generation starts from: its logits are
 /// the first prediction, which is also why nothing re-reads the prompt and the
@@ -67,7 +73,7 @@ pub fn generate(
     sampler: &mut Sampler,
     prompt: &[u32],
     max_tokens: usize,
-    mut on_token: impl FnMut(u32),
+    mut on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Stop, Timings) {
     assert!(!prompt.is_empty(), "the prompt is empty");
     let eos = runner.config().eos.clone();
@@ -95,7 +101,9 @@ pub fn generate(
             break Stop::Eos(next);
         }
         out.push(next);
-        on_token(next);
+        if !on_token(next) {
+            break Stop::Cancelled;
+        }
         if out.len() >= max_tokens {
             break Stop::MaxTokens;
         }
