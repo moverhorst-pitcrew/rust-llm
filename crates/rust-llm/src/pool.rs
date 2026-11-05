@@ -12,8 +12,8 @@
 //! every time.
 
 use std::cell::UnsafeCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -23,23 +23,89 @@ use llm_core::{KernelError, Kernels};
 /// A job as the workers see it: `(worker index, worker count)`.
 type Job = dyn Fn(usize, usize) + Sync;
 
+/// How long a thread spins before it gives the CPU up.
+///
+/// `spin_loop` is tens of cycles, so this is roughly twenty microseconds:
+/// longer than the serial stretch between two jobs, which is what a worker is
+/// usually waiting through, and short enough that a thread which has to wait
+/// for a real reason parks instead of burning quota that the thread it waits
+/// for needs. The forward pass runs 161 jobs per token, so this is the knob
+/// that decides whether the threads stay hot between them.
+const SPINS: u32 = 2000;
+
 struct Shared {
-    /// Every thread, the submitter included, meets here before the job runs.
-    start: Barrier,
-    /// And here when it is done, which is what bounds the job's lifetime.
-    end: Barrier,
-    /// Written by the submitter before `start`, read by the workers after it.
-    /// The barrier is the only synchronisation this needs.
+    /// Incremented once per published job. A worker waits for it to change,
+    /// which is both the hand-out and the release of the job pointer below.
+    seq: AtomicU64,
+    /// Workers still inside the current job. The submitter waits for zero.
+    pending: AtomicUsize,
+    /// Written by the submitter before `seq` is bumped, read by the workers
+    /// after they observe the bump, which is what orders the two.
     job: UnsafeCell<Option<*const Job>>,
     stop: AtomicBool,
-    /// Set by a worker whose job panicked, read by the submitter after `end`.
+    /// Set by a worker whose job panicked, read by the submitter once
+    /// `pending` is zero.
     failed: AtomicBool,
 }
 
-// SAFETY: `job` is only written between two barriers that every thread passes
-// through, so no two threads ever touch it at the same time.
+// SAFETY: `job` is written while every worker is waiting for `seq` to change,
+// and read only after that bump has been observed, so no two threads ever
+// touch it at the same time.
 unsafe impl Sync for Shared {}
 unsafe impl Send for Shared {}
+
+impl Shared {
+    /// Hands out a job: release the pointer through `seq`, then make sure a
+    /// worker that has already parked comes back.
+    ///
+    /// `unpark` on a thread that is still spinning is an atomic store and no
+    /// syscall, and it leaves a token that makes that thread's next `park`
+    /// return at once, which the loop in `wait_for_job` re-checks. That is why
+    /// this does not have to know which workers are parked, and why there is
+    /// no window in which a worker parks just after being skipped.
+    fn publish(&self, workers: &[JoinHandle<()>]) {
+        self.seq.fetch_add(1, Ordering::Release);
+        for w in workers {
+            w.thread().unpark();
+        }
+    }
+
+    /// Waits for a job newer than `seen` and returns the new sequence number.
+    fn wait_for_job(&self, seen: u64) -> u64 {
+        for _ in 0..SPINS {
+            let now = self.seq.load(Ordering::Acquire);
+            if now != seen {
+                return now;
+            }
+            std::hint::spin_loop();
+        }
+        loop {
+            let now = self.seq.load(Ordering::Acquire);
+            if now != seen {
+                return now;
+            }
+            std::thread::park();
+        }
+    }
+
+    /// Waits until every worker is out of the current job.
+    ///
+    /// The submitter spins and then yields rather than parking: it is waiting
+    /// for threads that are running, and under a CPU quota what they need is
+    /// the quota back, which `yield_now` gives them while keeping the wake-up
+    /// free.
+    fn wait_for_workers(&self) {
+        for _ in 0..SPINS {
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        while self.pending.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+    }
+}
 
 pub struct Pool {
     threads: usize,
@@ -50,13 +116,12 @@ pub struct Pool {
 
 /// What the submitter spends on getting a job run, as opposed to running it.
 ///
-/// Two numbers, because they say different things. `wake` is how long the
-/// submitter waits for every worker to arrive at the first barrier, which is
-/// the cost of getting threads back on a CPU under a quota. `join` is how long
-/// it waits at the second one after finishing its own share, which is the
-/// slowest worker plus the barrier itself. Off they are one relaxed load per
-/// job; on they are four `Instant::now()` calls, against a job that is tens of
-/// microseconds.
+/// Two numbers, because they say different things. `hand out` is publishing
+/// the job and waking whoever parked, which the submitter pays before it
+/// starts its own share. `join` is what it waits after finishing that share:
+/// the slowest worker, including however long that worker took to wake up.
+/// Off they are one relaxed load per job; on they are four `Instant::now()`
+/// calls, against a job that is tens of microseconds.
 #[derive(Default)]
 pub struct Stats {
     on: AtomicBool,
@@ -88,8 +153,8 @@ impl Pool {
     pub fn new(threads: usize) -> Self {
         let threads = threads.max(1);
         let shared = Arc::new(Shared {
-            start: Barrier::new(threads),
-            end: Barrier::new(threads),
+            seq: AtomicU64::new(0),
+            pending: AtomicUsize::new(0),
             job: UnsafeCell::new(None),
             stop: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -126,12 +191,12 @@ impl Pool {
 
     /// Runs `f` on every thread and waits for all of them.
     ///
-    /// A panic in `f` is carried across the barrier rather than out of it. If
-    /// the panic escaped here directly, this thread would never reach `end`,
-    /// the workers would wait on it forever and `Drop` would then wait on
-    /// `start`, so an index error in the forward pass would be a hang instead
-    /// of a stack trace. The panic is therefore caught, every thread is let
-    /// through `end`, and only then is it resumed. The buffers the job was
+    /// A panic in `f` is carried out of the job rather than out of this
+    /// function directly. If the panic escaped here, the workers would be left
+    /// inside a job nobody waits for and `Drop` would join threads that are
+    /// still running, so an index error in the forward pass would be a hang
+    /// instead of a stack trace. The panic is therefore caught, every thread
+    /// is waited for, and only then is it resumed. The buffers the job was
     /// writing are left half finished, which is why this resumes rather than
     /// reporting: the caller's results are not usable either way.
     pub fn run(&self, f: &(dyn Fn(usize, usize) + Sync)) {
@@ -140,18 +205,21 @@ impl Pool {
             return;
         }
         let borrowed: *const (dyn Fn(usize, usize) + Sync + '_) = f;
-        // SAFETY: the pointer is published while this thread is inside the two
-        // barriers below, and this function does not return until every worker
-        // has passed `end`, so `f` outlives every use of it. That is what the
-        // cast to `'static` stands on; nothing else writes the cell between
-        // those barriers.
+        // SAFETY: the pointer is published after every worker has left the
+        // previous job, and this function does not return until every worker
+        // has left this one, so `f` outlives every use of it. That is what the
+        // cast to `'static` stands on; nothing else writes the cell in
+        // between.
         unsafe {
             let erased: *const Job = std::mem::transmute(borrowed);
             *self.shared.job.get() = Some(erased);
         }
         let timed = self.stats.on.load(Ordering::Relaxed);
         let at = timed.then(Instant::now);
-        self.shared.start.wait();
+        self.shared
+            .pending
+            .store(self.threads - 1, Ordering::Relaxed);
+        self.shared.publish(&self.workers);
         if let Some(at) = at {
             self.stats
                 .wake_ns
@@ -159,7 +227,7 @@ impl Pool {
         }
         let mine = catch(|| f(0, self.threads));
         let at = timed.then(Instant::now);
-        self.shared.end.wait();
+        self.shared.wait_for_workers();
         if let Some(at) = at {
             self.stats
                 .join_ns
@@ -315,9 +383,10 @@ impl Drop for Pool {
             return;
         }
         self.shared.stop.store(true, Ordering::Relaxed);
-        // The workers are parked on `start`; releasing it lets them see `stop`
-        // and return. They do not reach `end`, so this thread must not either.
-        self.shared.start.wait();
+        // The workers are waiting for the next job; one more bump of `seq`
+        // lets them see `stop` and return. They never look at the job
+        // pointer, and nothing waits for `pending` here.
+        self.shared.publish(&self.workers);
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
@@ -336,21 +405,25 @@ fn catch<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
 }
 
 fn worker(shared: &Shared, ith: usize, nth: usize) {
+    let mut seen = 0;
     loop {
-        shared.start.wait();
+        seen = shared.wait_for_job(seen);
         if shared.stop.load(Ordering::Relaxed) {
             return;
         }
-        // SAFETY: see `Pool::run`. The job was published before this barrier
-        // and stays alive until every thread has passed `end`.
+        // SAFETY: see `Pool::run`. The job was published before the bump of
+        // `seq` this thread has just observed, and stays alive until every
+        // thread has left it, which is what `pending` below reports.
         let job = unsafe { (*shared.job.get()).expect("a job was published") };
         if catch(|| unsafe { (*job)(ith, nth) }).is_err() {
-            // The submitter turns this into its own panic after `end`. This
-            // thread must stay alive and reach the barrier, or everyone else
-            // waits on it forever.
+            // The submitter turns this into its own panic once every worker is
+            // out. This thread must stay alive and report itself out, or the
+            // submitter waits on it forever.
             shared.failed.store(true, Ordering::Relaxed);
         }
-        shared.end.wait();
+        // Release, so that whatever the job wrote, and the flag above, are
+        // visible to the submitter as soon as it sees this.
+        shared.pending.fetch_sub(1, Ordering::Release);
     }
 }
 

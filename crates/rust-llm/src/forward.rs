@@ -439,9 +439,11 @@ impl<'a> Runner<'a> {
     /// The profile table for the `tokens` tokens since the last clear.
     ///
     /// The two pool rows are *inside* the matmul rows above them, not extra:
-    /// a matmul is a job, and the time the submitter spends waiting for the
-    /// other threads is part of what that matmul cost. They are listed
-    /// separately because they are the part a scheduling change can remove.
+    /// a matmul is a job, and the time the submitter spends on the other
+    /// threads is part of what that matmul cost. They are listed separately
+    /// because they are the part a scheduling change can remove: handing the
+    /// job out and waking whoever parked, and then waiting for the slowest
+    /// worker after the submitter has finished its own share.
     pub fn profile_report(&self, what: &str, tokens: usize) -> String {
         let mut out = String::new();
         let per = |ns: u64| ns as f64 / tokens as f64 / 1e6;
@@ -474,8 +476,8 @@ impl<'a> Runner<'a> {
         let (jobs, wake, join) = self.pool.stats().read();
         if jobs > 0 {
             for (label, ns) in [
-                ("of which pool wake (barrier in)", wake),
-                ("of which pool join (barrier out)", join),
+                ("of which pool hand-out", wake),
+                ("of which pool join (last worker)", join),
             ] {
                 out.push_str(&format!(
                     "{label:34}{:>8.1}{:>11.2}{:>8.1}\n",
