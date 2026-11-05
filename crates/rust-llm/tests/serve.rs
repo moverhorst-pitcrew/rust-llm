@@ -24,6 +24,9 @@ const WAIT: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_TOKENS: u64 = 3;
 const DEFAULT_SEED: &str = "7";
 const DEFAULT_SYSTEM: &str = "Answer in one word.";
+/// Small on purpose: it is the ceiling a request cannot ask past, so a case
+/// that tests the ceiling has to be able to reach it in a moment.
+const CONTEXT: u64 = 192;
 const CHAT: &str = "/v1/chat/completions";
 
 #[test]
@@ -320,6 +323,46 @@ fn the_http_surface_answers_both_endpoints_and_refuses_bad_input() {
     let (code, error) = post(addr, "/v1/completions", "{}");
     assert_eq!(code, 400, "a text completion with no prompt: {error}");
 
+    // ------------------------------------------ the context is the ceiling
+    // A max_tokens no run could reach is capped rather than refused: the
+    // context ends the run at the same token either way, and reserving for the
+    // number as sent is what used to panic the whole server.
+    let (code, answer) = post(
+        addr,
+        CHAT,
+        r#"{"messages":[{"role":"user","content":"hello"}],
+            "max_tokens":18446744073709551615,"temperature":0}"#,
+    );
+    assert_eq!(
+        code, 200,
+        "max_tokens above the context is capped, not refused: {answer}"
+    );
+    assert!(
+        answer["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("completion_tokens")
+            <= CONTEXT,
+        "nothing can generate past the context: {answer}"
+    );
+
+    // A prompt the context cannot hold is refused, because generating into it
+    // produces a 200 with an empty answer and no counts, which a client cannot
+    // tell from a model that had nothing to say.
+    let too_long = format!(
+        r#"{{"prompt":{:?},"max_tokens":4}}"#,
+        "word ".repeat(CONTEXT as usize)
+    );
+    let (code, error) = post(addr, "/v1/completions", &too_long);
+    assert_eq!(code, 400, "a prompt the context cannot hold: {error}");
+    let message = error["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string();
+    assert!(
+        message.contains(&CONTEXT.to_string()) && message.contains("prompt"),
+        "the message has to name the prompt and the context: {message}"
+    );
+
     // -------------- a client that drops mid-stream ends that request only
     {
         let mut dropped = connect(addr);
@@ -373,6 +416,7 @@ fn start(tiny: &support::Tiny) -> Server {
         // run for a number, and reads back what it got.
         .args(["--host", "127.0.0.1", "--port", "0"])
         .args(["--max-tokens", "3", "--temperature", "0.8"])
+        .args(["--context", &CONTEXT.to_string()])
         .args(["--seed", DEFAULT_SEED, "--system", DEFAULT_SYSTEM])
         .arg("--model")
         .arg(&tiny.model)

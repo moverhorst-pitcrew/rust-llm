@@ -140,7 +140,13 @@ impl Server<'_, '_> {
         };
         let body: Value = serde_json::from_slice(&request.body)
             .map_err(|e| Fail::bad(format!("the request body is not JSON: {e}")))?;
-        let parsed = Parsed::read(&body, chat, self.tokenizer, self.defaults)?;
+        let parsed = Parsed::read(
+            &body,
+            chat,
+            self.tokenizer,
+            self.defaults,
+            self.runner.context(),
+        )?;
 
         let head = format!(
             "{} {} {}",
@@ -417,6 +423,7 @@ impl Parsed {
         chat: bool,
         tokenizer: &Tokenizer,
         defaults: &Defaults,
+        context: usize,
     ) -> Result<Self, Fail> {
         if !body.is_object() {
             return Err(Fail::bad("the request body must be a JSON object"));
@@ -444,10 +451,17 @@ impl Parsed {
             None => defaults.seed.unwrap_or_else(entropy_seed),
         };
 
+        // Capped at the context rather than refused above it. The context is
+        // the ceiling on prompt plus generated tokens, so a larger number
+        // cannot change what comes back: the run would end at `ContextFull` at
+        // exactly the same token. Clients send whatever their own configuration
+        // says without knowing this server's context, and refusing a request
+        // this server can answer perfectly well would be interop for nothing.
+        // It is also what keeps the number a caller can reach bounded.
         let max_tokens = match whole(body, "max_tokens")? {
             Some(0) => return Err(Fail::bad("max_tokens must be at least 1")),
-            Some(n) => n as usize,
-            None => defaults.max_tokens,
+            Some(n) => n.min(context as u64) as usize,
+            None => defaults.max_tokens.min(context),
         };
 
         let prompt = if chat {
@@ -492,6 +506,19 @@ impl Parsed {
             return Err(Fail::bad(
                 "the prompt is empty, so there is nothing to generate from",
             ));
+        }
+        // Refused here rather than generated into. A prompt the context cannot
+        // hold would otherwise come back as a 200 with an empty answer, a
+        // `finish_reason` of `length` and no counts at all, which a client
+        // cannot tell from a model that had nothing to say. Both numbers are in
+        // the message, because the client cannot see either of them otherwise.
+        if prompt.len() >= context {
+            return Err(Fail::bad(format!(
+                "the prompt is {} tokens and the context holds {context}, \
+                 so there is no room to answer it; send a shorter prompt, or \
+                 start the server with a larger --context",
+                prompt.len(),
+            )));
         }
 
         Ok(Self {

@@ -649,7 +649,7 @@ it sends and keeps the rest. Honoured:
 | `prompt` | `/v1/completions` only, and it goes to the model verbatim, as `--raw` does |
 | `temperature`, `top_p`, `top_k`, `min_p` | the sampler, checked the way the flags are |
 | `repetition_penalty` | `--repeat-penalty`; the name vLLM and Qwen clients send |
-| `max_tokens` | `--max-tokens`, which is where the default of 512 comes from |
+| `max_tokens` | `--max-tokens`, which is where the default of 512 comes from, capped at the context |
 | `seed` | per request, so one answer can be replayed on its own |
 | `stream` | `text/event-stream` instead of one object |
 | `chat_template_kwargs.enable_thinking` | the thinking toggle, where Qwen clients put it |
@@ -657,6 +657,25 @@ it sends and keeps the rest. Honoured:
 `--seed` is the one default with a twist: given, every request without a seed of
 its own replays that same seed; not given, each request draws a fresh one from
 entropy and the server logs it, so any answer can still be reproduced.
+
+**The context is the ceiling, and it is the one field that is capped rather than
+refused.** `--context` bounds the prompt plus the answer together, so a
+`max_tokens` above it cannot change what comes back: the run ends at
+`ContextFull` at exactly the same token. Clients send whatever their own
+configuration says without knowing this server's context, so refusing a request
+this server can answer perfectly well would be an interop failure for nothing,
+and the general rule about refusing rather than clamping exists for values that
+*would* silently change the answer. It also keeps the number bounded: `generate`
+reserves its output vector for the smaller of `max_tokens` and the context, and
+a reservation sized by whatever a request asked for is a panic, or an abort
+where the allocation is refused, and the accept loop is the main thread.
+
+A prompt of `--context` tokens or more is the opposite case and is refused with
+a 400 naming both numbers. Generating into it would answer 200 with an empty
+completion, a `finish_reason` of `length` and no counts at all, which a client
+cannot tell from a model that had nothing to say. `chat` already refuses the
+same thing for the same reason, and `generate` now also reports the tokens that
+did go through the model when it stops there, instead of zero.
 
 **Everything else in the body is deliberately ignored**, which is the OpenAI
 convention for unknown fields and the instruction this was built to. `n`,
@@ -688,7 +707,7 @@ backlog for all of it.
 
 | | |
 | --- | --- |
-| 400 | a body that is not JSON or not an object, a sampler value that cannot be a setting, `max_tokens` of 0, a `messages` array that is missing or malformed, a role this runner does not implement (`tool`, `function`), a system message that is not first, message content that is not a string, a missing `prompt` |
+| 400 | a body that is not JSON or not an object, a sampler value that cannot be a setting, `max_tokens` of 0, a prompt of `--context` tokens or more, a `messages` array that is missing or malformed, a role this runner does not implement (`tool`, `function`), a system message that is not first, message content that is not a string, a missing `prompt` |
 | 404 | any other path, with the two it does serve in the message |
 | 405 | anything but `POST` on the two paths, with `Allow: POST` |
 | 408 | the connection closed before a whole request arrived |

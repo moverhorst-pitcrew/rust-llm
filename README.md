@@ -96,6 +96,12 @@ and `chat_template_kwargs.enable_thinking` for the thinking toggle. Anything
 else in the body is ignored, `stop` and `n` included; `docs/decisions.md` says
 why.
 
+`--context` is the ceiling on the prompt plus the answer, so a `max_tokens`
+above it is capped at it: no run could reach the larger number anyway. A prompt
+that is `--context` tokens or longer leaves nothing to answer with and is
+refused with a 400 naming both numbers, rather than answered with an empty
+completion.
+
 A chat completion:
 
 ```sh

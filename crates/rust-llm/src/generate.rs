@@ -78,12 +78,23 @@ pub fn generate(
     assert!(!prompt.is_empty(), "the prompt is empty");
     let eos = runner.config().eos.clone();
     let mut timings = Timings::default();
-    let mut out = Vec::with_capacity(max_tokens);
+    // The context is the ceiling on prompt plus generated tokens, so no run can
+    // produce more than that many and reserving for a larger `max_tokens` is
+    // space that could never be used. It is also what keeps the reservation
+    // bounded: `max_tokens` arrives from a command line or an HTTP request, and
+    // `with_capacity` of a number that size is a panic, or an abort where the
+    // allocation is refused.
+    let mut out = Vec::with_capacity(max_tokens.min(runner.context()));
 
     let start = Instant::now();
     let mut next = 0u32;
     for (i, &t) in prompt.iter().enumerate() {
         if runner.pos() == runner.context() {
+            // What went through the model, which is not the whole prompt here:
+            // the caller handed over more of it than the context holds, and a
+            // count of 0 would read as a model with nothing to say.
+            timings.prompt_tokens = i;
+            timings.prompt_time = start.elapsed();
             return (out, Stop::ContextFull, timings);
         }
         let logits = runner.forward(t);
