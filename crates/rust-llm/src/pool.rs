@@ -12,7 +12,7 @@
 //! every time.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -227,22 +227,34 @@ impl Pool {
         });
         let total: usize = parts.iter().map(|p| p.rows).sum();
         let parts = &parts;
-        self.run(&|ith, nth| {
-            let (lo, hi) = split(total, ith, nth);
-            let mut base = 0;
-            for p in parts {
-                let (from, to) = (lo.max(base), hi.min(base + p.rows));
-                if from < to {
-                    let (at, len) = (from - base, to - from);
-                    // SAFETY: the ranges `split` hands out are disjoint, and
-                    // every part has its own output slice, so no two threads
-                    // write the same rows.
-                    let chunk = unsafe { p.out.at(at, len) };
-                    kernels
-                        .matvec(p.ty, &p.w[at * p.stride..], k, a, chunk)
-                        .expect("the kernel was resolved before the threads started");
+        // The block the workers claim. Small enough that the last one does
+        // not decide the job's length, large enough that the weight stream
+        // stays sequential and the atomic is noise: 64 rows of this model's
+        // largest tensor are 90 KiB of weights, tens of microseconds.
+        let block = (total / (self.threads * 4)).clamp(1, 64);
+        let claimed = AtomicUsize::new(0);
+        self.run(&|_ith, _nth| {
+            loop {
+                let from = claimed.fetch_add(block, Ordering::Relaxed);
+                if from >= total {
+                    return;
                 }
-                base += p.rows;
+                let to = (from + block).min(total);
+                let mut base = 0;
+                for p in parts {
+                    let (from, to) = (from.max(base), to.min(base + p.rows));
+                    if from < to {
+                        let (at, len) = (from - base, to - from);
+                        // SAFETY: a row block is handed to exactly one worker,
+                        // because `claimed` is advanced atomically, and every
+                        // part has its own output slice.
+                        let chunk = unsafe { p.out.at(at, len) };
+                        kernels
+                            .matvec(p.ty, &p.w[at * p.stride..], k, a, chunk)
+                            .expect("the kernel was resolved before the threads started");
+                    }
+                    base += p.rows;
+                }
             }
         });
         Ok(())
@@ -276,11 +288,15 @@ impl Pool {
         );
         let out = Scatter::new(out);
         let work = Scatter::new(work);
-        self.run(&|ith, nth| {
-            let (lo, hi) = split(n, ith, nth);
-            for i in lo..hi {
-                // SAFETY: chunk `i` belongs to exactly one iteration of one
-                // thread, because `split` partitions `0..n`.
+        let claimed = AtomicUsize::new(0);
+        self.run(&|_ith, _nth| {
+            loop {
+                let i = claimed.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    return;
+                }
+                // SAFETY: chunk `i` is handed to exactly one worker, because
+                // `claimed` is advanced atomically.
                 let (o, w) = unsafe {
                     (
                         out.at(i * out_chunk, out_chunk),
@@ -390,19 +406,9 @@ impl Scatter {
     }
 }
 
-/// Worker `ith` of `nth` takes this slice of `0..n`, the remainder spread over
-/// the first few workers rather than piled onto the last one.
-fn split(n: usize, ith: usize, nth: usize) -> (usize, usize) {
-    let per = n / nth;
-    let rem = n % nth;
-    let lo = ith * per + ith.min(rem);
-    let hi = lo + per + usize::from(ith < rem);
-    (lo, hi)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Pool, split};
+    use super::Pool;
 
     /// A failing job has to come out as a panic on the submitting thread, from
     /// either side of the pool, and leave the pool usable.
@@ -437,18 +443,29 @@ mod tests {
         assert_eq!(seen, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
+    /// Every chunk is claimed by exactly one worker, whatever the thread
+    /// count. That is the property the static split used to have by
+    /// construction and the claim counter now has to be tested for: it is
+    /// what keeps one head, and one output row, the work of a single worker
+    /// from start to finish, and so what keeps the result independent of the
+    /// thread count.
     #[test]
-    fn split_partitions_the_range() {
-        for n in 0..40usize {
-            for nth in 1..9usize {
-                let mut at = 0;
-                for ith in 0..nth {
-                    let (lo, hi) = split(n, ith, nth);
-                    assert_eq!(lo, at, "n={n} nth={nth} ith={ith}");
-                    assert!(hi >= lo);
-                    at = hi;
-                }
-                assert_eq!(at, n, "n={n} nth={nth}");
+    fn every_chunk_is_claimed_exactly_once() {
+        for nth in [1usize, 3, 4, 8] {
+            let pool = Pool::new(nth);
+            for n in [1usize, 7, 37] {
+                let mut seen = vec![0.0f32; n];
+                let mut by = vec![-1.0f32; n];
+                pool.chunks(&mut seen, 1, &mut by, 1, |i, o, w| {
+                    o[0] += 1.0;
+                    w[0] = i as f32;
+                });
+                assert!(
+                    seen.iter().all(|&v| v == 1.0),
+                    "nth={nth} n={n}: a chunk was run twice or not at all: {seen:?}"
+                );
+                let want: Vec<f32> = (0..n).map(|i| i as f32).collect();
+                assert_eq!(by, want, "nth={nth} n={n}: a chunk got the wrong index");
             }
         }
     }
