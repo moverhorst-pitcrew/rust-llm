@@ -4,10 +4,17 @@
 //! them with:
 //!
 //! ```text
-//! cargo test -p llm-core --test real_model -- --ignored --nocapture
+//! cargo test -p llm-core --release --test real_model -- --ignored --nocapture
 //! ```
 //!
 //! Override the path with `RUST_LLM_MODEL` if the model lives elsewhere.
+//!
+//! **This binary holds exactly one test on purpose.** It measures resident set
+//! size, which is a property of the process, not of the test, so a second test
+//! that opened the model would be measured too: the test harness runs them in
+//! parallel threads, and the number would silently become "two copies of the
+//! metadata". Anything else that needs the model file goes in its own test
+//! binary.
 
 use std::collections::BTreeMap;
 
@@ -15,10 +22,6 @@ use llm_core::quant::GgmlType;
 use llm_core::{Gguf, qwen35};
 
 const DEFAULT_MODEL: &str = "/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf";
-
-fn model_path() -> String {
-    std::env::var("RUST_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
-}
 
 /// A `/proc/self/status` size field in KiB (`VmRSS`, `VmHWM`, ...).
 fn status_kib(field: &str) -> u64 {
@@ -34,12 +37,13 @@ fn status_kib(field: &str) -> u64 {
 #[test]
 #[ignore = "needs the model file"]
 fn opens_the_real_model() {
-    let path = model_path();
+    let path = std::env::var("RUST_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     let file_bytes = std::fs::metadata(&path).expect("model file").len();
     let before = status_kib("VmRSS");
 
     let g = Gguf::open(&path).expect("open gguf");
     let after_open = status_kib("VmRSS");
+    let open_cost = after_open.saturating_sub(before);
 
     let plan = qwen35::layer_plan(&g).expect("layer plan");
 
@@ -56,9 +60,10 @@ fn opens_the_real_model() {
         checksum += t.data[0] as u64 + t.data[t.data.len() - 1] as u64;
     }
     let after_touch = status_kib("VmRSS");
+
     println!("file:            {path}");
     println!(
-        "file size:       {:.2} GiB",
+        "file size:       {:.2} GiB ({file_bytes} bytes)",
         file_bytes as f64 / (1 << 30) as f64
     );
     println!("gguf version:    {}", g.version());
@@ -79,11 +84,13 @@ fn opens_the_real_model() {
     println!("linear attention:{:?}", plan.linear_attention_layers());
     println!("tensor checksum: {checksum}");
     println!(
-        "RSS:             {before} KiB before, {after_open} KiB after open ({:.2}% of the file), \
-         {after_touch} KiB after touching every tensor",
-        (after_open as f64 * 1024.0) / file_bytes as f64 * 100.0
+        "RSS before open: {before} KiB\n\
+         RSS after open:  {after_open} KiB, so open cost {open_cost} KiB ({:.2}% of the file)\n\
+         RSS after touch: {after_touch} KiB (first and last byte of all 426 tensors)\n\
+         peak RSS:        {} KiB",
+        (open_cost as f64 * 1024.0) / file_bytes as f64 * 100.0,
+        status_kib("VmHWM")
     );
-    println!("peak RSS:        {} KiB", status_kib("VmHWM"));
 
     assert_eq!(g.tensor_count(), 426, "tensor count");
     assert_eq!(plan.n_blocks, 32, "real block count");
@@ -98,14 +105,16 @@ fn opens_the_real_model() {
 
     // The whole point of the memory map: a 2.7 GB file must not become 2.7 GB
     // of resident memory. What `open` does keep is the metadata, and nearly all
-    // of that is the 248320-token vocabulary and the 247587 merges.
+    // of that is the 248320-token vocabulary and the 247587 merges. The assert
+    // is on what `open` itself added, not on the process total, so the baseline
+    // the harness starts with does not count against it.
     //
     // Touching tensors afterwards costs more than the bytes touched, because
     // the kernel reads ahead around every fault. That is paging working as
     // intended, so it is reported but not asserted on.
     assert!(
-        after_open * 1024 < file_bytes / 20,
-        "RSS after open is {after_open} KiB, not far below the {file_bytes} byte file"
+        open_cost * 1024 < file_bytes / 50,
+        "open cost {open_cost} KiB, not far below the {file_bytes} byte file"
     );
 
     // The typed accessors refuse a mismatch rather than reinterpreting bytes.
@@ -113,12 +122,10 @@ fn opens_the_real_model() {
     assert!(g.tensor_typed("token_embd.weight", GgmlType::Q4_K).is_err());
     assert!(g.tensor_f32("token_embd.weight").is_err());
     assert!(g.tensor_f32("output_norm.weight").is_ok());
-}
 
-#[test]
-#[ignore = "needs the model file"]
-fn dumps_metadata() {
-    let g = Gguf::open(model_path()).expect("open gguf");
+    // The metadata and a sample of the tensor map, for reading by eye. Printed
+    // last so that formatting it cannot land inside the measurement.
+    println!("\n--- metadata ---");
     for (k, v) in g.metadata() {
         let shown = match v {
             llm_core::Value::Array(a) if a.len() > 8 => {
@@ -133,6 +140,7 @@ fn dumps_metadata() {
         };
         println!("{k} = {shown}");
     }
+    println!("\n--- tensors: the globals, one linear block, one full block ---");
     for (name, t) in g.tensors() {
         if name.starts_with("blk.3.") || name.starts_with("blk.0.") || !name.starts_with("blk.") {
             println!("{name}: {:?} {:?} {} bytes", t.dims, t.ty, t.nbytes);

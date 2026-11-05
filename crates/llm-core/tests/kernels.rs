@@ -198,7 +198,7 @@ fn available_tiers() -> Vec<(Tier, Kernels)> {
 
 fn check_shape(ty: GgmlType, k: usize, rows: usize, seed: u64) {
     let nb = k.div_ceil(ty.block_len());
-    let stride = ty.bytes_for(k as u64) as usize;
+    let stride = ty.bytes_for(k as u64).expect("fits") as usize;
     let mut rng = Rng::new(seed);
     let w = random_weights(ty, &mut rng, nb * rows);
     let x: Vec<f32> = (0..k).map(|_| rng.signed() * 3.0).collect();
@@ -295,7 +295,7 @@ fn weight_lanes_past_k_do_not_contribute() {
         let mut long_out = [f32::NAN];
 
         for (tier, kernels) in available_tiers() {
-            let short_bytes = ty.bytes_for(short as u64) as usize;
+            let short_bytes = ty.bytes_for(short as u64).expect("fits") as usize;
             kernels
                 .matvec(ty, &w[..short_bytes], short, &a, &mut short_out)
                 .expect("kernel");

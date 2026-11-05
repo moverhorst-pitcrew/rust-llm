@@ -373,6 +373,35 @@ fn rejects_a_row_that_is_not_a_whole_number_of_blocks() {
 }
 
 #[test]
+fn rejects_dimensions_that_overflow_a_byte_count() {
+    // A dimension product that wraps would give a length of zero, which then
+    // passes the bounds check, and the file would open with a short tensor
+    // rather than an error naming it.
+    for dims in [
+        &[1u64 << 32, 1 << 32][..],
+        &[1 << 62][..],
+        &[u64::MAX][..],
+        &[1 << 21, 1 << 21, 1 << 22][..],
+    ] {
+        let err = Builder::default()
+            .tensor_at("w", dims, GgmlType::F32 as u32, 0)
+            .open()
+            .unwrap_err();
+        assert!(
+            matches!(err, GgufError::TensorTooLarge { .. }),
+            "{dims:?}: {err}"
+        );
+    }
+    // And the same for a quantized type, where the block rounding happens
+    // before the multiply.
+    let err = Builder::default()
+        .tensor_at("w", &[1 << 40, 1 << 40], GgmlType::Q4_K as u32, 0)
+        .open()
+        .unwrap_err();
+    assert!(matches!(err, GgufError::TensorTooLarge { .. }), "{err}");
+}
+
+#[test]
 fn rejects_a_tensor_past_the_end_of_the_data() {
     let err = Builder::default()
         .tensor_at("w", &[256], GgmlType::Q4_K as u32, 1 << 20)

@@ -102,10 +102,16 @@ impl GgmlType {
         }
     }
 
-    /// Bytes needed for `n` values, rounding up to whole blocks.
-    pub fn bytes_for(self, n: u64) -> u64 {
-        let bl = self.block_len() as u64;
-        n.div_ceil(bl) * self.block_bytes() as u64
+    /// Bytes needed for `n` values, rounding up to whole blocks, or `None` if
+    /// that does not fit in a `u64`.
+    ///
+    /// Checked rather than wrapping because the loader calls this with a
+    /// dimension product straight out of a file header: on a corrupt one, a
+    /// wrapped length would pass the bounds check and open as a short tensor
+    /// instead of failing by name.
+    pub fn bytes_for(self, n: u64) -> Option<u64> {
+        n.div_ceil(self.block_len() as u64)
+            .checked_mul(self.block_bytes() as u64)
     }
 }
 

@@ -62,9 +62,13 @@ Deliberately not taken:
 **Weights stay in the map.** The header, metadata and tensor index are parsed
 into owned structures; tensor bytes are never copied. `Gguf::tensor` returns a
 slice borrowed from the map, and the kernels read the quantized bytes in place.
-Opening the 2.7 GB file costs about 52 MB of resident memory, essentially all
-of it the 248320-token vocabulary and the 247587 merges, which is 2% of the
-file.
+Opening the 2.71 GB file adds 50312 KiB of resident memory, 1.90% of the file,
+essentially all of it the 248320-token vocabulary and the 247587 merges.
+`cargo test -p llm-core --release --test real_model -- --ignored --nocapture`
+prints it, and the number is the delta across `Gguf::open`, so the baseline the
+test harness starts with does not flatter it. That test binary deliberately
+holds one test: resident set size belongs to the process, so a second test
+opening the model in another harness thread would be measured along with it.
 
 **No self-referential struct.** `Gguf` owns the `Mmap` and stores byte offsets,
 not slices; `tensor()` resolves an offset against `&self.mmap` on each call.
@@ -88,9 +92,14 @@ from `full_attention_interval` would be arithmetic that happens to agree with
 this file.
 
 **The loader validates, the kernels assume.** Bounds, alignment, block-aligned
-row lengths and unknown type tags are all rejected at open time with an error
-that names the tensor. After that the kernels index without re-checking, which
-is what keeps the hot loop free of branches that cannot fire.
+row lengths, unknown type tags and a dimension list whose byte count does not
+fit in a `u64` are all rejected at open time with an error that names the
+tensor. The size arithmetic is checked rather than wrapping, because it runs on
+numbers straight out of a file header: dimensions of `[1 << 32, 1 << 32]` wrap
+to a length of zero, which would then pass the bounds check and open as a
+short tensor instead of failing. After that the kernels index without
+re-checking, which is what keeps the hot loop free of branches that cannot
+fire.
 
 ## Quantized kernels
 
@@ -247,6 +256,6 @@ from a string and refuses `tool` and `function` by name, which is where such a
 turn arrives from outside; `Message::content` is a `String`, so there is no
 place for an image part to be dropped silently.
 
-The tests compare the renderer against all fourteen fixture prompts byte for
+The tests compare the renderer against all fifteen fixture prompts byte for
 byte, and the fixture records the template's sha256, so a different template
 fails rather than being rendered by the old rules.

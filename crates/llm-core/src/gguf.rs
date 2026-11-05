@@ -76,6 +76,8 @@ pub enum GgufError {
         ty: GgmlType,
         block: usize,
     },
+    #[error("tensor {name:?} with dimensions {dims:?} has a size that does not fit in a u64")]
+    TensorTooLarge { name: String, dims: Vec<u64> },
     #[error("tensor {name:?} is not aligned well enough to read as {want}")]
     Misaligned { name: String, want: &'static str },
 }
@@ -293,7 +295,17 @@ impl Gguf {
                     block,
                 });
             }
-            let nbytes = ty.bytes_for(dims.iter().product());
+            // Both steps are checked: the dimensions come out of the file
+            // header, and a wrapped length would sail through the bounds check
+            // below and open as a short tensor instead of failing by name.
+            let nbytes = dims
+                .iter()
+                .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+                .and_then(|n| ty.bytes_for(n))
+                .ok_or_else(|| GgufError::TensorTooLarge {
+                    name: name.clone(),
+                    dims: dims.clone(),
+                })?;
             tensors.insert(
                 name,
                 TensorInfo {

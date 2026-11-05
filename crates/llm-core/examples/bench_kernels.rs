@@ -62,7 +62,7 @@ fn main() {
 
     for &ty in TYPES {
         for &(label, k, rows) in SHAPES {
-            let stride = ty.bytes_for(k as u64) as usize;
+            let stride = ty.bytes_for(k as u64).expect("fits") as usize;
             let mut w = vec![0u8; stride * rows];
             fill(&mut w, 0x9e37 + k as u64);
             // Scales are f16; random bits there would be infinities and NaNs,

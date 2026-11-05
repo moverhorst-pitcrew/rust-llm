@@ -145,7 +145,7 @@ impl Kernels {
         out: &mut [f32],
     ) -> Result<(), KernelError> {
         let dot = self.vec_dot(ty)?;
-        let stride = ty.bytes_for(k as u64) as usize;
+        let stride = ty.bytes_for(k as u64).expect("row size fits in a u64") as usize;
         assert_eq!(a.k(), k, "activations were quantized for a different k");
         assert!(
             w.len() >= stride * out.len(),
