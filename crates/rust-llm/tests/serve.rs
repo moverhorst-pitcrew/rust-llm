@@ -126,7 +126,7 @@ fn the_http_surface_answers_both_endpoints_and_refuses_bad_input() {
     let (response, event_before_the_end) = stream_post(
         addr,
         CHAT,
-        r#"{"messages":[{"role":"user","content":"hello"}],"max_tokens":6,"temperature":0,
+        r#"{"messages":[{"role":"user","content":"hello"}],"max_tokens":12,"temperature":0,
             "stream":true}"#,
     );
     assert_eq!(status(&response), 200, "{response}");
@@ -155,9 +155,12 @@ fn the_http_surface_answers_both_endpoints_and_refuses_bad_input() {
         .map(|event| serde_json::from_str(event).expect("a chunk is JSON"))
         .collect();
     // Tokens arrive as their own events rather than as one buffer at the end.
+    // Fewer events than tokens is not a fault: several of the fixture's tokens
+    // decode to nothing, and a token is held back until what is pending
+    // decodes into something whole.
     assert!(
         chunks.len() >= 3,
-        "six tokens were asked for and {} chunks came back: {response}",
+        "twelve tokens were asked for and only {} chunks came back: {response}",
         chunks.len()
     );
     assert_eq!(chunks[0]["object"], "chat.completion.chunk");
@@ -309,10 +312,15 @@ fn the_http_surface_answers_both_endpoints_and_refuses_bad_input() {
             r#"{"messages":[{"role":"user","content":"hello"}],"max_tokens":512,"temperature":0,
                 "stream":true}"#,
         );
-        let mut byte = [0u8; 1];
-        dropped
-            .read_exact(&mut byte)
-            .expect("the first byte of the stream");
+        // Read until a whole event has arrived, so the connection is dropped
+        // in the middle of the stream and not before it started.
+        let mut seen = Vec::new();
+        let mut buffer = [0u8; 256];
+        while !String::from_utf8_lossy(&seen).contains("\n\n") {
+            let read = dropped.read(&mut buffer).expect("read the stream");
+            assert!(read > 0, "the stream ended before an event arrived");
+            seen.extend_from_slice(&buffer[..read]);
+        }
     }
     let (code, answer) = post(
         addr,

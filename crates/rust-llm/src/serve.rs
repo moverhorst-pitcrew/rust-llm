@@ -685,7 +685,10 @@ impl<'a> Answer<'a> {
             "model": self.model,
             "choices": [choice],
         });
-        write!(out, "data: {body}\n\n")?;
+        // One write for the whole event, not one per piece of the format
+        // string: a client that goes away must not be left holding half a
+        // `data:` line, and an event is a syscall rather than four.
+        out.write_all(format!("data: {body}\n\n").as_bytes())?;
         // Per event: a client has to see tokens as they are produced, not one
         // buffer at the end.
         out.flush()
@@ -779,14 +782,17 @@ fn write_header(
     content_type: &str,
     extra: Option<&str>,
 ) -> std::io::Result<()> {
-    write!(
-        stream,
+    // Built and then written once: `write!` issues a syscall per piece of the
+    // format string, which a client that hangs up can interrupt half-way
+    // through the headers.
+    let head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\n{}{}Connection: close\r\n\r\n",
         reason(status),
         // Required on a 405, and the two routes only answer POST.
         if status == 405 { "Allow: POST\r\n" } else { "" },
         extra.unwrap_or_default(),
-    )?;
+    );
+    stream.write_all(head.as_bytes())?;
     stream.flush()
 }
 
