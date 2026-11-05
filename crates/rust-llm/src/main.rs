@@ -99,6 +99,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?
     };
     let tokens = tokenizer.encode(&prompt, true)?;
+    // Only reachable with --raw: the chat template always emits its own
+    // tokens, so an empty --prompt still renders to something.
+    if tokens.is_empty() {
+        return Err("the prompt is empty, so there is nothing to run".into());
+    }
 
     eprintln!(
         "model {} ({} blocks, {} full attention, {} linear), kernels {}, {} threads, context {}",
@@ -131,11 +136,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut stdout = std::io::stdout();
+    // A character spread over two tokens cannot be decoded from either of them
+    // alone, and the decoder leaves a replacement character where it was. That
+    // is a property of what was *streamed*, so it is recorded here rather than
+    // looked for in the clean text afterwards, which cannot contain one.
+    let mut streamed_a_broken_character = false;
     let (ids, stop, timings) = generate::generate(&mut runner, &tokens, args.max_tokens, |id| {
-        // One token at a time, decoded on its own: a multi-byte character
-        // split across two tokens would come out as a replacement
-        // character, so the whole text is decoded again at the end.
         if let Ok(text) = tokenizer.decode(&[id], false) {
+            streamed_a_broken_character |= text.contains(char::REPLACEMENT_CHARACTER);
             let _ = stdout.write_all(text.as_bytes());
             let _ = stdout.flush();
         }
@@ -143,8 +151,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let text = tokenizer.decode(&ids, false)?;
-    if text.as_bytes().contains(&0xef) {
-        // The streamed form had a split character in it; print the clean text.
+    if streamed_a_broken_character {
         eprintln!("--- decoded as a whole ---");
         println!("{text}");
     }

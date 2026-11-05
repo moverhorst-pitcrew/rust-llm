@@ -426,15 +426,19 @@ are produced and prints the timings and the peak RSS to stderr. `--model`,
 they are all `--name value`, and a parser crate would be a dependency and a
 build-time cost for that shape.
 
-A streamed token is decoded on its own, so a multi-byte character split across
-two tokens comes out as a replacement character. When that happens the whole
-output is decoded again and printed after the stream, rather than buffering
-every token and streaming nothing.
-
 **The model path has no default.** `--model`, or `RUST_LLM_MODEL`, or an error
 naming both: a path compiled in would be a path on whichever machine it was
 written on. The tests that need the weights read the same variable and say so
 when it is missing.
+
+A streamed token is decoded on its own, so a character spread over two tokens
+cannot be decoded from either and the decoder leaves a replacement character
+where it was. The streaming callback records whether it saw one, and only then
+is the whole output decoded again and printed after the stream. That is a
+property of what was streamed, so it has to be recorded while streaming: the
+clean text is decoded from all the ids at once and can never contain the
+marker. Looking for the marker's first byte in the clean text instead both
+missed every real case and fired on every character in U+F000..U+FFFF.
 
 `rust-llm trace` runs the same pass with the activation tracer on and prints
 one node per line, which is the input to the reference comparison below.
