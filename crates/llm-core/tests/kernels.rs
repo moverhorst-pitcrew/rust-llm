@@ -385,6 +385,174 @@ fn the_batched_kernel_is_bit_identical_to_the_single_one() {
     }
 }
 
+/// The saturation extremes of the lane layout, which random bytes never reach.
+///
+/// Every integer lane in these kernels has a ceiling, and the margin to it is a
+/// property of how many products the lane collects before the next step. On the
+/// VNNI tier a `VPDPBUSD` lane holds at most `4 * 15 * 127 = 7620` for `Q4_K`,
+/// which is why the pair can go through `VPACKSSDW` into i16 at all; on the AVX2
+/// tier a `VPMADDUBSW` lane holds `2 * 15 * 127 = 3810`, and `2 * 63 * 127 =
+/// 16002` for `Q6_K`. Both are inside 32767 with room to spare, and a kernel
+/// that puts more products in a lane before the pack eats that room silently: no
+/// panic, no NaN, just a wrong number on the inputs that reach the bound.
+///
+/// The weights here are therefore not random. Every nibble is `0xF`, every
+/// sub-block scale is the largest value its field can hold, and the activations
+/// are `+/-127` throughout, which is what `quantize` produces from a row of
+/// `+/-amax`. Checked both ways: each tier's batched kernel against its own
+/// single-row one with `==`, which is what a saturating tile breaks, and each
+/// tier's single-row kernel against the f64 reference, which is what a
+/// saturating single-row kernel breaks.
+#[test]
+fn the_saturation_extremes_match_the_single_kernel() {
+    let group = Kernels::BATCH_GROUP;
+    for &ty in &[GgmlType::Q4_K, GgmlType::Q6_K] {
+        // Enough k that the accumulator sees many super-blocks, and a k that is
+        // not a whole number of them, both at a row count over the row tile.
+        for &(k, rows) in &[(2560usize, 5usize), (300, 3), (256, 1)] {
+            let nb = k.div_ceil(ty.block_len());
+            let stride = ty.bytes_for(k as u64).expect("fits") as usize;
+            for (wi, w) in saturated_weights(ty, nb * rows).iter().enumerate() {
+                for (xi, x) in saturated_activations(k).iter().enumerate() {
+                    let t = x.len() / k;
+                    let mut batch = Activations::with_batch(k, t);
+                    batch.quantize_batch(x, k);
+                    // Past `k` the scratch is zeroed on purpose, so only the
+                    // real values are at the extreme.
+                    assert!(
+                        batch
+                            .blocks()
+                            .iter()
+                            .flat_map(|b| b.qs.iter())
+                            .take(k)
+                            .all(|&q| q.abs() == 127),
+                        "the activation pattern did not quantize to +/-127"
+                    );
+                    let mut single = Activations::new(k);
+                    for (tier, kernels) in available_tiers() {
+                        for r in 0..rows {
+                            let row = &w[r * stride..(r + 1) * stride];
+                            let mut got = vec![0.0f32; t];
+                            let mut from = 0;
+                            while from < t {
+                                let n = (t - from).min(group);
+                                match kernels.vec_dot_batch(ty) {
+                                    Some(dot) => dot(row, &batch, from, &mut got[from..from + n]),
+                                    None => {
+                                        for (j, o) in got[from..from + n].iter_mut().enumerate() {
+                                            *o = kernels.vec_dot(ty).expect("kernel")(
+                                                row,
+                                                batch.row(from + j),
+                                            );
+                                        }
+                                    }
+                                }
+                                from += n;
+                            }
+                            for (j, &got) in got.iter().enumerate() {
+                                let xr = &x[j * k..(j + 1) * k];
+                                single.quantize(xr);
+                                let mut want = [f32::NAN];
+                                kernels
+                                    .matvec(ty, row, k, &single, &mut want)
+                                    .expect("kernel");
+                                assert_eq!(
+                                    got, want[0],
+                                    "{ty:?} {tier:?} k={k} weights #{wi} activations #{xi} \
+                                     row={r} batch row {j}: batched {got} against single {}",
+                                    want[0]
+                                );
+                                // And the single-row kernel itself against the
+                                // reference, so a lane that saturates in both
+                                // is caught by something other than their
+                                // agreement.
+                                let (reference, magnitude) = reference_dot(ty, row, &single);
+                                let tol = (magnitude * 1e-5).max(1e-12);
+                                assert!(
+                                    (want[0] as f64 - reference).abs() <= tol,
+                                    "{ty:?} {tier:?} k={k} weights #{wi} activations #{xi} \
+                                     row={r}: single {} against reference {reference}, \
+                                     tolerance {tol}",
+                                    want[0]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `n` blocks whose quants and sub-block scales are all at their maximum
+/// magnitude, one buffer per sign the scales can take.
+///
+/// `Q4_K` scales and minima are 6-bit unsigned, and all-`0xFF` scale bytes give
+/// 63 for both through `get_scale_min_k4`'s two branches, so that type has one
+/// extreme. `Q6_K` scales are `i8`, so it has two: `127` and `-128`, and the
+/// sign decides whether the `-32` bias adds to the accumulation or cancels it.
+fn saturated_weights(ty: GgmlType, n: usize) -> Vec<Vec<u8>> {
+    let scales: &[u8] = match ty {
+        GgmlType::Q4_K => &[0xFF],
+        GgmlType::Q6_K => &[0x7F, 0x80],
+        other => panic!("no saturation fixture for {other:?}"),
+    };
+    scales
+        .iter()
+        .map(|&s| {
+            let mut o = Vec::with_capacity(n * ty.block_bytes());
+            for _ in 0..n {
+                match ty {
+                    GgmlType::Q4_K => {
+                        // d and dmin at a magnitude the f32 sum stays exact at.
+                        o.extend(f16::from_f32(0.0625).to_le_bytes());
+                        o.extend(f16::from_f32(0.0156_25).to_le_bytes());
+                        o.extend([s; 12]); // the packed 6-bit scales and minima
+                        o.extend([0xFF; 128]); // every nibble 0xF
+                    }
+                    GgmlType::Q6_K => {
+                        o.extend([0xFF; 128]); // ql: every nibble 0xF
+                        o.extend([0xFF; 64]); // qh: every 2-bit pair 0x3, so q = 63
+                        o.extend([s; 16]);
+                        o.extend(f16::from_f32(0.0625).to_le_bytes());
+                    }
+                    other => panic!("no saturation fixture for {other:?}"),
+                }
+            }
+            assert_eq!(o.len(), n * ty.block_bytes());
+            o
+        })
+        .collect()
+}
+
+/// Activation batches of `+/-1.0`, which `quantize` turns into `+/-127` exactly
+/// because the row's `amax` is 1.
+///
+/// The sign pattern decides the group sums the offset terms are a dot product
+/// with: all one sign puts every `bsum` at its own extreme `+/-2032`, and
+/// flipping per group of 16 makes neighbouring sums cancel, which is the other
+/// end of the `Q4_K` minimum and `Q6_K` bias paths. Alternating per value zeroes
+/// every group sum, which is the case where the offset term contributes nothing
+/// and the raw accumulation is on its own.
+fn saturated_activations(k: usize) -> Vec<Vec<f32>> {
+    let patterns: [fn(usize) -> f32; 4] = [
+        |_| 1.0,
+        |i| if i % 2 == 0 { 1.0 } else { -1.0 },
+        |i| if (i / 16) % 2 == 0 { 1.0 } else { -1.0 },
+        |i| if (i / 128) % 3 == 0 { -1.0 } else { 1.0 },
+    ];
+    // Batch sizes either side of a group, so the last group of a batch is a
+    // partial one here too.
+    [1usize, Kernels::BATCH_GROUP + 3]
+        .into_iter()
+        .map(|t| {
+            (0..t * k)
+                .map(|i| patterns[(i / k) % patterns.len()](i % k))
+                .collect()
+        })
+        .collect()
+}
+
 #[test]
 fn unsupported_types_are_refused() {
     let kernels = Kernels::detect();
