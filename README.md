@@ -75,8 +75,9 @@ Off by default because it is only worth it on text that repeats itself: 10 to
 29 per cent faster on a long quoted passage, boilerplate or a diff, and nothing
 on ordinary prose, where the drafts are wrong often enough to cost more than
 they save. A draft costs about 50 MiB of memory. `docs/benchmarks.md` has the
-acceptance rates per draft length and the number the default comes out of; four
-is a reasonable place to start if your text repeats.
+acceptance rates and the gains per draft length, and the number the default
+comes out of; the gains there do not order neatly by draft length, so read the
+table rather than reaching for the largest number the memory allows.
 
 Sampling, with Qwen3.5's own recommended values as the defaults. A value that
 cannot be a setting is refused by name rather than clamped:
