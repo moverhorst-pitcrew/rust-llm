@@ -222,8 +222,10 @@ struct Caches {
     kv: Vec<f32>,
     /// `[linear block][channel][conv_kernel - 1]`, oldest sample first.
     conv: Vec<f32>,
-    /// `[linear block][value head][d_state][d_state]`, transposed as the
-    /// reference stores it: row `j` of a head is `S[..][j]`.
+    /// `[linear block][value head][d_state i][d_state j]`, so one `i` of a head
+    /// is contiguous over `j` and [`delta_net`] can take a block of `j` at a
+    /// time. The layout is internal: nothing outside the recurrence reads it,
+    /// the reset only zeroes it and no tracer node dumps it.
     ssm: Vec<f32>,
     /// Tokens already in the caches, which is also the next token's position.
     pos: usize,
@@ -957,23 +959,7 @@ impl Exec<'_, '_> {
                     let g = decay[i * n_vh + vh].exp();
                     let beta = beta[i * n_vh + vh];
                     let out = &mut out[i * s..][..s];
-                    // Row `j` of the state is `S[..][j]`, so one pass over it
-                    // per output component does the decay, the delta and the
-                    // readout.
-                    for (j, srow) in state.chunks_exact_mut(s).enumerate() {
-                        let mut sk = 0.0f32;
-                        for (r, &ki) in srow.iter_mut().zip(k) {
-                            *r *= g;
-                            sk += *r * ki;
-                        }
-                        let d = (v[j] - sk) * beta;
-                        let mut o = 0.0f32;
-                        for ((r, &ki), &qi) in srow.iter_mut().zip(k).zip(q) {
-                            *r += d * ki;
-                            o += *r * qi;
-                        }
-                        out[j] = o * scale;
-                    }
+                    delta_net(state, q, k, v, g, beta, scale, out);
                 }
             },
         );
@@ -1193,6 +1179,94 @@ fn rope(x: &mut [f32], pos: usize, n_rot: usize, theta_base: f32) {
     }
 }
 
+/// Output components the delta-net recurrence takes at a time.
+///
+/// Measured, not assumed, on this model's `d_state` of 128: four binaries
+/// alternated over a 1024-token prompt at 8 threads, tier `avx2+vnni`, both
+/// orders, in `ms/token` of the prompt phase.
+///
+/// | block | this operator | whole token |
+/// | --- | --- | --- |
+/// | scalar | 2.04 | 21.80 |
+/// | 16 | 0.96 | 20.93 |
+/// | 32 | 0.84 | 21.14 |
+/// | 64 | 0.87 | 20.72 |
+///
+/// 64 it is, on the whole token rather than on this operator's own row: 16 is
+/// too narrow to amortise the load of `k[i]` and `q[i]` over, and 32 is the
+/// fastest here by 0.03 ms but reproducibly costs the convolution next to it
+/// 0.2 ms (0.78 scalar, 0.83 at 16, 0.99 at 32, 0.86 at 64). The convolution's
+/// loop is untouched by any of this, and the cost does not grow with the number
+/// of blocks a head is walked in, which is what a cache explanation would
+/// predict, so it is the code layout of that one build and not something to
+/// tune against. A block of 64 also walks a head in two passes rather than
+/// eight, and its totals are the steadiest of the four (20.70 to 20.86 over
+/// four runs).
+const J_BLOCK: usize = 64;
+
+/// One token through one value head's delta-net recurrence, blocked over the
+/// output components.
+///
+/// `state` is this head's `[i][j]` matrix, `q`, `k` and `v` are its `d_state`
+/// inputs for this token, `g` is the decay and `beta` the delta's gate. The
+/// state is read, updated and read again in place, which is why a batch cannot
+/// be split over its tokens.
+///
+/// **This is bit-identical to the scalar loop it replaces and has to stay that
+/// way.** The two reductions a component needs, `sk` over `i` and the readout
+/// `o` over `i`, are serial f32 sums that cannot be reassociated; they are not
+/// what is vectorized here. The `d_state` components `j` are independent of
+/// each other, each with its own `sk`, its own delta and its own readout, so
+/// blocking over `j` puts one whole scalar sequence in every lane, in the
+/// original order. `tests::the_blocked_recurrence_matches_one_component_at_a_time`
+/// is what holds that down.
+#[allow(clippy::too_many_arguments)]
+fn delta_net(
+    state: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: f32,
+    beta: f32,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let s = out.len();
+    let (mut sk, mut d, mut o) = ([0.0f32; J_BLOCK], [0.0f32; J_BLOCK], [0.0f32; J_BLOCK]);
+    for j0 in (0..s).step_by(J_BLOCK) {
+        let w = J_BLOCK.min(s - j0);
+        let (sk, d, o) = (&mut sk[..w], &mut d[..w], &mut o[..w]);
+        sk.fill(0.0);
+        o.fill(0.0);
+        // Pass one: decay the block's column of the state and contract it with
+        // `k`, one `i` per step so every lane accumulates in ascending `i`.
+        for (i, &ki) in k.iter().enumerate() {
+            for (r, a) in state[i * s + j0..][..w].iter_mut().zip(sk.iter_mut()) {
+                *r *= g;
+                *a += *r * ki;
+            }
+        }
+        for ((dj, &vj), &skj) in d.iter_mut().zip(&v[j0..][..w]).zip(sk.iter()) {
+            *dj = (vj - skj) * beta;
+        }
+        // Pass two: add the delta's outer product and read out against `q`,
+        // again one `i` per step and against the value just written.
+        for (i, (&ki, &qi)) in k.iter().zip(q).enumerate() {
+            for ((r, &dj), oj) in state[i * s + j0..][..w]
+                .iter_mut()
+                .zip(d.iter())
+                .zip(o.iter_mut())
+            {
+                *r += dj * ki;
+                *oj += *r * qi;
+            }
+        }
+        for (ot, &oj) in out[j0..][..w].iter_mut().zip(o.iter()) {
+            *ot = oj * scale;
+        }
+    }
+}
+
 /// Depthwise causal convolution over `conv_kernel` taps, in place over the
 /// per-channel history.
 ///
@@ -1238,6 +1312,95 @@ mod tests {
         for (p, &w) in scores.iter().enumerate() {
             for (o, &vd) in out.iter_mut().zip(&v[p * hd..][..hd]) {
                 *o += w * vd;
+            }
+        }
+    }
+
+    /// The recurrence written one output component at a time, as [`delta_net`]
+    /// is checked against.
+    ///
+    /// This is the loop the blocked version replaced, down to the `[j][i]`
+    /// state layout it read: one row of the state per component, decayed and
+    /// contracted with `k`, then updated and read out against `q`. Keeping the
+    /// old layout here rather than indexing the new one is the point, because a
+    /// reference that shared the blocking and the walk order of the thing it
+    /// checks would only assert that the code agrees with itself.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_net_scalar(
+        state: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        g: f32,
+        beta: f32,
+        scale: f32,
+        out: &mut [f32],
+    ) {
+        let s = out.len();
+        for (j, srow) in state.chunks_exact_mut(s).enumerate() {
+            let mut sk = 0.0f32;
+            for (r, &ki) in srow.iter_mut().zip(k) {
+                *r *= g;
+                sk += *r * ki;
+            }
+            let d = (v[j] - sk) * beta;
+            let mut o = 0.0f32;
+            for ((r, &ki), &qi) in srow.iter_mut().zip(k).zip(q) {
+                *r += d * ki;
+                o += *r * qi;
+            }
+            out[j] = o * scale;
+        }
+    }
+
+    /// Blocking the recurrence over its output components has to give what one
+    /// component at a time gives, **bit for bit**.
+    ///
+    /// A tolerance would be the wrong check, for the same reason as in
+    /// [`the_tiled_attention_matches_one_query_at_a_time`]: this model's output
+    /// is discontinuous in the arithmetic, so a difference too small to see in
+    /// a readout is one flipped int8 level away from a different token. The
+    /// whole claim of the rewrite is that each lane runs the original scalar
+    /// sequence in the original order, and `==` is the only check that says so.
+    ///
+    /// Several tokens per head, because the state carries from one to the next:
+    /// a blocking bug that touched an element twice or missed one would show in
+    /// the *second* token's readout and not the first. The shapes are this
+    /// model's own, `d_state` 128 over 32 value heads, plus `d_state` 32 for the
+    /// tiny test model and a 40 that is not a multiple of [`J_BLOCK`], so the
+    /// remainder block is covered too.
+    #[test]
+    fn the_blocked_recurrence_matches_one_component_at_a_time() {
+        let mut rand = noise(0xde17_a4e7);
+        for (s, heads, tokens) in [(128usize, 32usize, 4usize), (32, 1, 3), (40, 2, 3)] {
+            for h in 0..heads {
+                let mut blocked = vec![0.0f32; s * s];
+                let mut scalar = vec![0.0f32; s * s];
+                let scale = 1.0 / (s as f32).sqrt();
+                for i in 0..tokens {
+                    let q: Vec<f32> = (0..s).map(|_| rand()).collect();
+                    let k: Vec<f32> = (0..s).map(|_| rand()).collect();
+                    let v: Vec<f32> = (0..s).map(|_| rand()).collect();
+                    // The ranges the real inputs land in: the decay is `exp` of
+                    // a negative number and `beta` comes out of a sigmoid.
+                    let g = (rand().abs() * -2.0).exp();
+                    let beta = sigmoid(rand() * 4.0);
+                    let mut got = vec![0.0f32; s];
+                    let mut want = vec![0.0f32; s];
+                    delta_net(&mut blocked, &q, &k, &v, g, beta, scale, &mut got);
+                    // Transposed, because the reference keeps the old layout.
+                    delta_net_scalar(&mut scalar, &q, &k, &v, g, beta, scale, &mut want);
+                    assert_eq!(got, want, "d_state {s} head {h} token {i}: readout");
+                    for j in 0..s {
+                        for ii in 0..s {
+                            assert_eq!(
+                                blocked[ii * s + j],
+                                scalar[j * s + ii],
+                                "d_state {s} head {h} token {i}: state[{ii}][{j}]"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
