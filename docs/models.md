@@ -59,6 +59,7 @@ Read out of the file, not out of `config.json`:
 - quantization mix: 216 `Q4_K`, 33 `Q6_K`, 177 `F32`
 - `block_count = 33`, `nextn_predict_layers = 1`, and only `blk.0..blk.31`
   exist: the MTP block was stripped on conversion. The real block count is 32.
+  See "The MTP block" below.
 - hybrid attention: blocks 3, 7, 11, 15, 19, 23, 27 and 31 are full attention,
   the other 24 are linear attention (gated delta net). This comes from the
   `qwen35.attention.recurrent_layers` bool array.
@@ -72,3 +73,25 @@ Read out of the file, not out of `config.json`:
 - two stop tokens: `<|im_end|>` = 248046 (the GGUF `eos_token_id`, and what the
   chat template emits) and `<|endoftext|>` = 248044 (what `config.json` calls
   `eos_token_id`). Generation stops on both.
+
+## The MTP block
+
+The file says `nextn_predict_layers = 1`, so these weights were trained with a
+multi-token-prediction head, and `blk.32` would be it. It is not in the file: the
+conversion dropped it, which is what llama.cpp's converter did for this
+architecture at the time. So the speculative decoding this runner has drafts from
+the prompt and the text generated so far and not from a head (`docs/decisions.md`,
+"Speculative decoding").
+
+**An MTP-preserved Heretic 4B GGUF does now exist, and it is a different set of
+weights from this one.** Picking it up is a model swap, not a flag: it would need
+a new `reference_generations.json`, re-derived from a reference build that
+supports the head, and that support is not in a release. Its acceptance would
+also have to beat what prompt lookup already gets, which `docs/benchmarks.md`
+records per draft length so there is something to compare against. All of that is
+a decision and a ticket of its own; nothing here assumes it.
+
+What this runner already has is everything such a head would need on this side of
+the boundary: the logits of every row of a batch, a rollback that costs nothing,
+an accept loop that keeps the output bit-equal, and the acceptance metric. A head
+would be a different function passed to `generate_drafting`.
