@@ -45,7 +45,7 @@ the wrong thing. `cargo bench` inherits this profile.
 | `half` | `f16` decoding for the ggml block scales. `f16` in `core` is still unstable, and hand-rolling the subnormal cases is a silent-wrongness risk for twenty saved lines. |
 | `thiserror` | Error enums with a `Display` that names the file, the key or the tensor. Derive only, nothing at runtime. |
 | `tokenizers` | See the tokenizer section. |
-| `serde_json` | Reads the committed test fixtures. Already in the tree through `tokenizers`. |
+| `serde_json` | Parses and builds the HTTP surface's bodies, and reads the committed test fixtures. Already in the tree through `tokenizers`. |
 
 Deliberately not taken:
 
@@ -418,23 +418,175 @@ counting global allocator wraps `System` in
 `crates/rust-llm/tests/allocations.rs` and opens a window around the loop: 24
 forward passes make 0 allocations, and `generate` around them makes exactly 2
 whatever the token count, the output vector and the copy of the stop-token set,
-both before the loop starts. It is one test and not two because the counter is
+both before the loop starts. Greedy and with every sampling stage on, which is
+the same number: the sampler's buffers come out of `Sampler::new`, above the
+window. It is one test and not two because the counter is global and a second
+test in the harness's thread pool would be charged to the same window.
+
+## Sampling
+
+**One function with a settings argument.** `generate` takes a `&mut Sampler`;
+greedy is `Sampling::GREEDY`, not a second code path. A greedy sampler is also
+what the correctness gate passes, so the thing the gate measures is the thing
+that ships.
+
+**The pipeline, in this order**: repetition penalty, temperature, top-k, top-p,
+min-p, the draw. The order is a choice, and it is the one that makes temperature
+free: with it applied before the truncations, `exp((l - max) / t)` is the whole
+of "divide by the temperature and softmax", so there is no pass over the
+vocabulary to divide 248320 logits.
+
+**`temperature == 0` is argmax**, the same `argmax` the gate ran against before
+sampling existed, lowest token id on a tie. The penalty is the only stage that
+could still touch the logits in that case, and `repeat_penalty == 1.0` skips it
+entirely rather than multiplying by one, so a greedy run reads the forward
+pass's own logits and is byte-identical to the committed fixture.
+
+**No full sort.** The vocabulary is 248320 entries and the sampler runs once per
+generated token, on a model that does about ten tokens a second. Measured on
+this box, release build, per `sample` call over a 248320-entry vector:
+
+| | per call |
+| --- | --- |
+| greedy (argmax only) | 0.26 ms |
+| the defaults (top-k 20) | 0.65 ms |
+| temperature, top-k 40, top-p, min-p and the penalty all on | 0.62 ms |
+| `--top-k 0` with `--top-p 1`: no truncation, and no order needed | 1.58 ms |
+| `--top-k 0` with top-p on: no truncation, and the order needed | 10.56 ms |
+| for comparison: `sort_unstable_by` over the index vector on its own | 6.5 ms |
+
+They wobble by a tenth of a millisecond between runs on this shared box, and the
+shape rather than the digits is the point.
+
+So at any `--top-k` of 1 or more the candidate set is grown by partial selection
+and nothing sorts the logit vector: `select_nth_unstable_by` over a preallocated
+index buffer puts the `k` largest logits in front in O(n) expected time, and only
+those `k` are sorted, and only when top-p is on at all. The default is 20, which
+is the 0.65 ms row, under one per cent of a 100 ms token.
+
+**`--top-k 0` together with `--top-p` below 1 is the exception, and it does sort
+the whole index vector.** `top_k = 0` means no truncation, so there is nothing to
+select and the candidate set is all 248320 entries; top-p needs them in order, so
+the sort runs over the lot. The two `--top-k 0` rows above are the same work
+apart from that sort, so the sort is the 9 ms between them; the 1.58 ms the
+cheaper of them costs is the exponential per entry that a draw over the whole
+vocabulary needs whatever else happens. It is an accepted cost, not an oversight:
+
+- growing the candidate set by repeated partial selection until the mass covers
+  `top_p` has a worst case (a flat distribution, where 0.95 of the mass is
+  thousands of candidates) of several O(n) passes plus a sort of what it found,
+  and it needs a fallback threshold to stay bounded;
+- that is more branches on the path every token takes, to make faster a setting
+  nothing defaults to and which asks for a full-vocabulary draw in the first
+  place.
+
+`--top-k 0` with top-p off (`--top-p 1`) does not sort, which is what the gap
+between the two rows is: the candidates are never ordered, because only top-p
+uses the order.
+`the_candidates_are_only_ordered_where_the_order_is_used` in
+`crates/rust-llm/tests/sample.rs` holds that, since the selection leaves the
+candidates unordered and a descending candidate set is therefore a sort that
+ran.
+
+**Why the selection is exact.** Both orders used are total: logit descending,
+then token id ascending. Equal logits therefore do not leave the selected set
+ambiguous, which they would with a bare comparison on an unstable algorithm, and
+a naive full sort under the same order keeps exactly the same tokens.
+`crates/rust-llm/tests/sample.rs` holds that against a reference that sorts the
+whole vector and works in f64, per parameter and in combination. What it
+requires exactly is the surviving set, token for token, because that is what
+decides the draw; the probabilities are compared at 1e-5 relative, since the
+product path takes its exponentials in f32 and accumulates in f64, as the
+forward pass's own softmax does.
+
+**top-p normalises over the top-k candidates**, not over the whole vocabulary.
+The ticket fixes the order but not the denominator, and an exact
+full-vocabulary one would put the exponential-per-entry pass of the 1.58 ms row
+above on every token, whatever top-k left, and the sort with it: ranking the
+whole vocabulary is the only way to find the prefix that covers the mass. This
+is also what llama.cpp's default sampler chain does: its top-p
+sampler softmaxes whatever its top-k sampler handed it. With `--top-k 0` the two
+readings coincide, because the candidate set is then the whole vocabulary.
+
+**min-p needs no normalisation at all.** The maximum is subtracted before the
+exponential, so the largest unnormalised probability is exactly `exp(0)`, and
+the threshold is `min_p` itself. One pass over the candidates, exact, and the
+maximum always survives it. llama.cpp reaches the same filter from the other
+side, as a logit threshold of `max + log(min_p)`.
+
+**The repetition penalty iterates the window, never the vocabulary.** 64 recent
+tokens by default. It follows llama.cpp: a positive logit is divided by the
+penalty and a non-positive one multiplied, so a penalty above one only ever
+lowers a logit, and it is applied once per distinct token in the window however
+often that token occurs. Because it has to write, it works on a copy of the
+logit vector, which is one 993 KB memcpy per token and only when the penalty is
+on; everything downstream then has one mutable vector to read. Every token that
+goes through the model enters the window exactly once, the prompt's included: a
+penalty that only saw the generated tokens would not notice the prompt
+repeating itself.
+
+**Nothing in `sample` allocates.** Every buffer comes out of `Sampler::new`,
+sized from the vocabulary: the candidate indices, the probability scratch and
+the recent-token ring. The two that only the drawing path uses are sized to one
+slot for a greedy sampler, and the penalty's copy is not allocated at all while
+the penalty is off, which is the default.
+`crates/rust-llm/tests/sample_allocations.rs` measures it with the same counting
+global allocator as the generation-loop test, over a 248320-entry vector and for
+every settings shape that reaches a different stage. It needs no weights, so it
+runs in CI; it is its own test binary and holds one test, because the counter is
 global and a second test in the harness's thread pool would be charged to the
 same window.
 
-## Sampling and the CLI
+**The RNG is xoshiro256++ seeded through splitmix64**, thirty lines in
+`sample.rs` and no dependency. It is not cryptographic and does not need to be;
+what it has to be is reproducible from a `u64` and well spread over the
+candidate set. Without `--seed` the seed comes from the operating system's
+entropy through `RandomState`, which is the standard library's own OS-seeded
+hasher state, and the effective seed is printed to stderr: a run that cannot be
+replayed is not reproducible, whatever the generator does.
 
-Greedy argmax and nothing else; a temperature, top-k or top-p surface is a
-separate change, and putting the hooks in now would be an interface with one
-implementation. Ties go to the lowest token id, which matters only for
-reproducibility.
+**The defaults are Qwen3.5's own recommendation**, not llama.cpp's: temperature
+0.6, top-k 20, top-p 0.95, min-p 0, repetition penalty 1 (off) over a window of
+64. llama.cpp's defaults (0.8 / 40 / 0.95 / 0.05) are tuned for nothing in
+particular; these are what the model's own card asks for in thinking mode, and
+the model's guidance warns against a repetition penalty, so it is off and the
+window size only matters once someone turns it on.
+
+## The CLI
 
 `rust-llm run --prompt "..."` renders the chat template, streams tokens as they
 are produced and prints the timings and the peak RSS to stderr. `--model`,
 `--tokenizer`, `--system`, `--context`, `--threads`, `--max-tokens`,
-`--think/--no-think` and `--raw`. Arguments are parsed by hand: there are ten,
-they are all `--name value`, and a parser crate would be a dependency and a
-build-time cost for that shape.
+`--think/--no-think`, `--raw`, and the sampling flags `--temperature`,
+`--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n` and
+`--seed`, with the defaults above shown in `USAGE`. Arguments are parsed by
+hand: they are all `--name value`, there is no per-command grammar, and a
+parser crate would be a dependency and a build-time cost for that shape.
+
+**A value that cannot be a setting is an error that names the argument.** A
+negative temperature, a `--top-p` above 1, a `--repeat-penalty` of 0: refused,
+not clamped. A silently clamped `--top-p 1.5` looks like it worked, and whoever
+typed it goes on believing their setting took effect.
+
+`rust-llm chat` is the interactive surface: the conversation is a `Vec<Message>`,
+`--system` sets the system turn, `/reset` starts over, `/exit` or the end of
+stdin quits, and the sampling flags are the same. No line editing and no
+history, so no readline dependency; `USAGE` says so, because the first thing
+anyone tries is the up arrow.
+
+**Every chat turn re-renders the whole conversation and resets the runner.** That
+is not laziness. The chat template drops the reasoning of assistant turns before
+the last user turn, so turn N+1's token prefix is not a prefix of turn N's: the
+reasoning the previous turn generated is gone from the middle of the prompt and
+everything after it has shifted. Reusing the KV cache across turns would not be
+merely stale, it would be wrong. What that costs is re-reading the prompt, which
+is the same single-token path as generation; making it cheaper is the batched
+prompt evaluation the throughput work owns, and it helps every surface at once
+rather than this one.
+
+A conversation that no longer fits the context is reported and the turn is
+dropped, rather than generating into nothing: the runner would otherwise stop
+with `ContextFull` after zero tokens and look like a model with nothing to say.
 
 **The model path has no default.** `--model`, or `RUST_LLM_MODEL`, or an error
 naming both: a path compiled in would be a path on whichever machine it was
@@ -452,6 +604,130 @@ missed every real case and fired on every character in U+F000..U+FFFF.
 
 `rust-llm trace` runs the same pass with the activation tracer on and prints
 one node per line, which is the input to the reference comparison below.
+
+`rust-llm serve` is the fourth command and has a section of its own below.
+
+## The HTTP surface
+
+`rust-llm serve` answers `POST /v1/chat/completions` and `POST /v1/completions`,
+streaming and not, in OpenAI's shapes, so anything that already speaks to an
+OpenAI endpoint speaks to this.
+
+**No HTTP crate and no async runtime.** There are two routes; a request is a
+line, a few headers and a JSON body that `serde_json` already parses, and the
+answer is a status line and a JSON body. What a framework would add on top of
+that is a dependency tree, and the one rule this project has is that there is no
+C or C++ anywhere in the build, which is a rule we have to keep checking rather
+than hope for. An executor buys nothing either: the forward pass is blocking and
+uses every core, so there is nothing to interleave it with. `crates/rust-llm/src/serve.rs`
+is the whole server, and the request reading in it is about sixty lines.
+
+**One request at a time, by having one accept loop.** Generation *is* the
+`Runner` and its KV cache and there is one of each, so the loop accepts a
+connection, answers it, and then accepts the next: a second client waits in the
+listener's backlog rather than being refused, and no lock is needed anywhere to
+say so. That is also all the hardware can do, since a single token already
+saturates the cores. The cost is that a connection holds the slot while it is
+being read, which is why a socket that goes quiet for 30 seconds is dropped, and
+why the request line, the headers and the body are all capped: the other end of
+a socket is not trusted to stop sending.
+
+**The caches are reset between requests.** Requests are independent and the
+previous one left its own conversation in the cache. A chat request also
+re-renders its whole conversation, for the reason the chat section above gives:
+the template drops the reasoning of earlier assistant turns, so turn N+1's
+tokens are not a prefix of turn N's and the cache could not be reused even if
+requests were related.
+
+**The command line is the defaults.** Every option `run` takes is the default
+for a request that does not send that field, and a request overrides the fields
+it sends and keeps the rest. Honoured:
+
+| field | |
+| --- | --- |
+| `messages` | the conversation, rendered through the model's chat template |
+| `prompt` | `/v1/completions` only, and it goes to the model verbatim, as `--raw` does |
+| `temperature`, `top_p`, `top_k`, `min_p` | the sampler, checked the way the flags are |
+| `repetition_penalty` | `--repeat-penalty`; the name vLLM and Qwen clients send |
+| `max_tokens` | `--max-tokens`, which is where the default of 512 comes from, capped at the context |
+| `seed` | per request, so one answer can be replayed on its own |
+| `stream` | `text/event-stream` instead of one object |
+| `chat_template_kwargs.enable_thinking` | the thinking toggle, where Qwen clients put it |
+
+`--seed` is the one default with a twist: given, every request without a seed of
+its own replays that same seed; not given, each request draws a fresh one from
+entropy and the server logs it, so any answer can still be reproduced.
+
+**The context is the ceiling, and it is the one field that is capped rather than
+refused.** `--context` bounds the prompt plus the answer together, so a
+`max_tokens` above it cannot change what comes back: the run ends at
+`ContextFull` at exactly the same token. Clients send whatever their own
+configuration says without knowing this server's context, so refusing a request
+this server can answer perfectly well would be an interop failure for nothing,
+and the general rule about refusing rather than clamping exists for values that
+*would* silently change the answer. It also keeps the number bounded: `generate`
+reserves its output vector for the smaller of `max_tokens` and the context, and
+a reservation sized by whatever a request asked for is a panic, or an abort
+where the allocation is refused, and the accept loop is the main thread.
+
+A prompt of `--context` tokens or more is the opposite case and is refused with
+a 400 naming both numbers. Generating into it would answer 200 with an empty
+completion, a `finish_reason` of `length` and no counts at all, which a client
+cannot tell from a model that had nothing to say. `chat` already refuses the
+same thing for the same reason, and `generate` now also reports the tokens that
+did go through the model when it stops there, instead of zero.
+
+**Everything else in the body is deliberately ignored**, which is the OpenAI
+convention for unknown fields and the instruction this was built to. `n`,
+`stop`, `logprobs`, `presence_penalty`, `frequency_penalty`, `tools`,
+`stream_options` and the rest are read by nobody: a request asking for four
+choices or an extra stop string gets one answer that ignores it, and the README
+says so, because the alternative is a 400 on a field OpenAI clients send by
+default. Two more that are not oversights: `repeat_last_n` has no OpenAI field
+and stays at the command line's value, and the `model` a request names is
+ignored because the answer reports the file that is loaded, which is what
+actually answered.
+
+**Streaming flushes per event.** Every token that decodes into something whole
+is one `data:` event, flushed on its own, the last event carries the
+`finish_reason` and no content, and the stream closes with `data: [DONE]`. A
+token is held back until what is pending decodes without a replacement
+character: a character spread over two tokens cannot be decoded from either of
+them alone, and unlike the CLI, which reprints the whole answer afterwards, a
+stream cannot take a chunk back.
+
+**A client that drops mid-stream ends that request and nothing else.** The write
+fails, the generation callback returns `false`, and the run stops with
+`Stop::Cancelled`. That hook is why `generate`'s callback returns a `bool` at
+all: otherwise a client hanging up after one token would cost every core up to
+`--max-tokens` of work nobody will read, and the next request would wait in the
+backlog for all of it.
+
+**The error mapping**, every body in OpenAI's `{"error": {...}}` shape:
+
+| | |
+| --- | --- |
+| 400 | a body that is not JSON or not an object, a sampler value that cannot be a setting, `max_tokens` of 0, a prompt of `--context` tokens or more, a `messages` array that is missing or malformed, a role this runner does not implement (`tool`, `function`), a system message that is not first, message content that is not a string, a missing `prompt` |
+| 404 | any other path, with the two it does serve in the message |
+| 405 | anything but `POST` on the two paths, with `Allow: POST` |
+| 408 | the connection closed before a whole request arrived |
+| 413 | `Content-Length` over a megabyte |
+| 431 | request line and headers over 16 KB |
+| 500 | only if what was generated cannot be decoded |
+
+The 400s on the message shapes are not re-implemented here: `Role::from_str` and
+`chat::render` already refuse a `tool` message and a misplaced system message,
+because that is where a role from outside enters the program, and the server
+turns their errors into the status instead of into a 500. Content that is not a
+string is refused rather than flattened, for the reason `chat::Message` gives:
+flattening a list of content parts would drop an image and change the prompt
+without saying so.
+
+**Loopback by default.** `--host 127.0.0.1 --port 8080`, and there is no
+authentication: a server that answers whatever it is asked is not something to
+bind to a network by default. `--port 0` takes whatever is free and the address
+the listener actually got is printed, which is also how the test avoids racing
+another run for a port number.
 
 ## The reference harness
 
@@ -573,6 +849,66 @@ multi-byte character cannot be inverted this way and would fail by name; none
 of the committed prompts produces one. One extra token is always asked for and
 dropped, so every token the gate uses is bounded by a log line on both sides.
 
+## The tiny model, so the surfaces are covered without the weights
+
+The gate above proves what the model produces, and needs 2.7 GB of weights to
+do it. What it does not touch is the product around the model: argument parsing,
+streaming, the stop conditions, the sampling flags, the conversation. That was
+only ever exercised by hand.
+
+`crates/rust-llm/tests/support/mod.rs` writes a minimal but valid Qwen3.5 GGUF,
+178 KB, in milliseconds: two blocks, one linear and one full attention, `Q8_0`
+weights so the real dequant-free kernels run, and the `tokenizer.json` that goes
+with it. `crates/rust-llm/tests/tiny_model.rs` drives the real binary against
+it through `CARGO_BIN_EXE_rust-llm`, and `crates/rust-llm/tests/serve.rs` starts
+the real server against it the same way. Neither needs weights, so both run in
+CI.
+
+**It proves the surface, not the output.** The weights are noise from a fixed
+seed, so the text is meaningless, but it is produced by the real loader, the
+real kernels, the real chat template and the real sampler, and it is identical
+on every machine and every run. That is what lets the tests compare streamed
+text directly: a three-turn chat session's output has to equal the two-turn
+session's followed by the one-turn session's, which is what says `/reset` really
+cleared the conversation.
+
+Three things about the fixture are not free choices.
+
+- **`n_embd` is 256, not 32.** The embedding table is read by the embedding
+  lookup, which needs `can_dequantize`, and dotted by the tied output head,
+  which needs a `vec_dot` kernel. The only types with both are the k-quants, so
+  the table is `Q6_K` (which is what the real `Q4_K_M` conversion uses for it)
+  and its row length has to be a whole 256-value super-block. Every other
+  quantized row length is a multiple of 32, which is `Q8_0`'s block. Nothing in
+  `forward.rs` or the loader had to change for the small shapes; the only
+  constraints that bit were these block widths.
+- **The tokenizer covers printable ASCII, tab and newline, not all 256 bytes.**
+  With the full byte alphabet most tokens the fixture generates are half a
+  multi-byte character, the streaming path correctly reprints the whole answer,
+  and every comparison in the test has to work around a doubled output. With 97
+  byte tokens every token is one valid UTF-8 byte. The reprint path stays
+  covered by the real model, where it is a real case.
+- **The end-of-sequence token is a parameter of the writer.** What this model
+  produces is noise, so a test that wants to see the end-of-sequence path asks
+  the library which token a greedy run produces first and then writes a fixture
+  that stops on exactly that token. Nothing is hard-coded, and the test cannot
+  rot into asserting that generation stopped for some other reason.
+
+Every run in that file is either greedy or carries an explicit `--seed`. The
+fixture's end-of-turn tokens are inside the vocabulary it can produce, so a run
+left on the default settings with a seed from entropy stops on one now and
+then; the first version of these tests failed about one run in six that way.
+
+One property the fixture cannot show is the streaming flush. It generates
+microseconds per token, so every event is in the socket buffer before the
+client's first `read` returns, and a server that built the whole answer and
+wrote it once would produce the same bytes in the same number of reads. So the
+serve test asserts the stream's shape instead: a whole event in hand before the
+stream ends, several events rather than one, the `finish_reason` only on the
+last, the closing `data: [DONE]`, and no `Content-Length`. The flush itself is
+one call per event, and the real model, at ten tokens a second, is where it is
+visible.
+
 ## Baseline numbers
 
 Qwen3.5-4B-heretic-Q4_K_M, `avx2+vnni`, this box (8 of 32 cores by cgroup
@@ -630,7 +966,9 @@ no signal in it. Measured on this box:
 | command | time |
 | --- | --- |
 | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` | 1 s, 25 s cold |
-| `cargo test --release` (the default set, no weights needed) | 35 s cold, 2 s warm |
+| `cargo test --workspace --all-targets` (the default set, no weights needed) | 47 s cold, 25 s warm |
+| of which `tests/sample.rs`, `tests/sample_allocations.rs` and `tests/tiny_model.rs` | 2 s, 2 s, 3 s |
+| of which `tests/serve.rs`, which starts the server and drives both endpoints | 2 s |
 | gate: `every_next_token_matches_the_reference` | 2:01 |
 | gate: `greedy_output_is_unchanged` | 2:10 |
 | gate: `resetting_the_caches_is_the_same_as_a_fresh_runner` | 27 s |
