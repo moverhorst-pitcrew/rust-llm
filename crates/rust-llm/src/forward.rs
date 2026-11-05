@@ -1342,7 +1342,7 @@ mod tests {
         let (hd, t, pos) = (256, 8, TILE + 5);
         let context = pos + t;
         let scale = 1.0 / (hd as f32).sqrt();
-        let mut rand = noise(0xca05_a1);
+        let mut rand = noise(0x00ca_05a1);
         let q: Vec<f32> = (0..t * hd).map(|_| rand()).collect();
         let k: Vec<f32> = (0..context * hd).map(|_| rand()).collect();
         let mut v: Vec<f32> = (0..context * hd).map(|_| rand()).collect();

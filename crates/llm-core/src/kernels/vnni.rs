@@ -51,7 +51,7 @@ unsafe fn q4k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
             let aqs = ab.qs.as_ptr();
             let mut acc = zero;
             let mut imin = 0i32;
-            for t in 0..4 {
+            for (t, &scv) in scv.iter().enumerate() {
                 let dp0 = _mm256_dpbusd_avx_epi32(
                     zero,
                     _mm256_loadu_si256(qw.as_ptr().add(64 * t).cast()),
@@ -62,8 +62,7 @@ unsafe fn q4k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
                     _mm256_loadu_si256(qw.as_ptr().add(64 * t + 32).cast()),
                     _mm256_loadu_si256(aqs.add(64 * t + 32).cast()),
                 );
-                acc =
-                    _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_packs_epi32(dp0, dp1), scv[t]));
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_packs_epi32(dp0, dp1), scv));
                 for sb in [2 * t, 2 * t + 1] {
                     imin +=
                         mins[sb] as i32 * (ab.bsums[sb * 2] as i32 + ab.bsums[sb * 2 + 1] as i32);
@@ -101,13 +100,13 @@ unsafe fn q6k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
             let ab = &a.row(t0 + j).blocks[ib];
             let aqs = ab.qs.as_ptr();
             let mut acc = zero;
-            for g in 0..8 {
+            for (g, &scv) in scv.iter().enumerate() {
                 let dp = _mm256_dpbusd_avx_epi32(
                     zero,
                     _mm256_loadu_si256(qw.as_ptr().add(32 * g).cast()),
                     _mm256_loadu_si256(aqs.add(32 * g).cast()),
                 );
-                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(dp, scv[g]));
+                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(dp, scv));
             }
             let mut bias = 0i32;
             for (i, s) in sc.iter().enumerate() {

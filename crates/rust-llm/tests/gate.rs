@@ -598,12 +598,12 @@ fn a_batched_prompt_is_the_same_as_one_token_at_a_time() {
     // no prompt in the set is, so both cases are always covered; asserting it
     // keeps that true if the prompt set changes.
     assert!(
-        sizes.iter().any(|b| prompt.len() % b == 0),
+        sizes.iter().any(|b| prompt.len().is_multiple_of(*b)),
         "no batch size divides a prompt of {} tokens",
         prompt.len()
     );
     assert!(
-        sizes.iter().any(|b| prompt.len() % b != 0),
+        sizes.iter().any(|b| !prompt.len().is_multiple_of(*b)),
         "every batch size divides a prompt of {} tokens",
         prompt.len()
     );
