@@ -786,20 +786,15 @@ impl Exec<'_, '_> {
             |chunk, out, scores| {
                 let (i, h) = (chunk / n_head, chunk % n_head);
                 let kh = h / group;
-                let q = &qg[i * qg_dim + h * 2 * hd..][..hd];
-                let scores = &mut scores[..pos + i + 1];
-                for (p, s) in scores.iter_mut().enumerate() {
-                    let k = &k_cache[(kh * context + p) * hd..][..hd];
-                    *s = dot(q, k) * scale;
-                }
-                softmax(scores);
-                out.fill(0.0);
-                for (p, &w) in scores.iter().enumerate() {
-                    let v = &v_cache[(kh * context + p) * hd..][..hd];
-                    for (o, &vd) in out.iter_mut().zip(v) {
-                        *o += w * vd;
-                    }
-                }
+                attend(
+                    &qg[i * qg_dim + h * 2 * hd..][..hd],
+                    &k_cache[kh * context * hd..],
+                    &v_cache[kh * context * hd..],
+                    pos + i + 1,
+                    scale,
+                    scores,
+                    out,
+                );
             },
         );
         self.profile.add(Op::Attention, at);
@@ -1072,6 +1067,37 @@ fn softplus(x: f32) -> f32 {
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(&x, &y)| x * y).sum()
+}
+
+/// One query head against `n_kv` cached positions: scores, softmax, and the
+/// weighted sum of the values.
+///
+/// `k` and `v` are this KV head's whole span of the cache, position-major, so
+/// both loops walk them forwards. `scores` is scratch for one row, which is why
+/// this is two passes over the cache rather than one; the tiled alternative
+/// that needs no score row was measured and is not here, see
+/// `docs/benchmarks.md` under "Flash-style attention, measured and not kept".
+fn attend(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_kv: usize,
+    scale: f32,
+    scores: &mut [f32],
+    out: &mut [f32],
+) {
+    let hd = q.len();
+    let scores = &mut scores[..n_kv];
+    for (p, s) in scores.iter_mut().enumerate() {
+        *s = dot(q, &k[p * hd..][..hd]) * scale;
+    }
+    softmax(scores);
+    out.fill(0.0);
+    for (p, &w) in scores.iter().enumerate() {
+        for (o, &vd) in out.iter_mut().zip(&v[p * hd..][..hd]) {
+            *o += w * vd;
+        }
+    }
 }
 
 /// In-place softmax, with the normalising sum accumulated in f64 and the
