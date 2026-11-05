@@ -831,63 +831,72 @@ fn a_rejected_draft_leaves_no_trace_in_the_logits() {
     let threads = threads();
     let vocab = model.vocab();
 
-    // The sequential side: the model's own next tokens, and after each of them
-    // the whole logit vector and the five tokens that follow.
-    let mut plain = Runner::new(&model, CONTEXT, threads);
-    let mut rows = Vec::new();
-    let mut next = {
+    // The batch: its first row is the token the model actually predicts, and
+    // every draft after it is a token it did not, so every draft is rejected
+    // and every uncommitted row is a token no sequential run would have fed.
+    let batch: Vec<u32> = {
+        let mut plain = Runner::new(&model, CONTEXT, threads);
         let mut logits = Vec::new();
         for &t in &prompt {
             logits = plain.forward(t).to_vec();
         }
-        argmax(&logits)
+        let mut next = argmax(&logits);
+        let mut batch = Vec::new();
+        for i in 0..=DRAFT {
+            batch.push(if i == 0 {
+                next
+            } else {
+                (next + 1) % vocab as u32
+            });
+            next = argmax(plain.forward(next));
+        }
+        batch
     };
-    for _ in 0..=DRAFT {
-        rows.push(next);
-        next = argmax(plain.forward(next));
-    }
-    let after: Vec<(Vec<f32>, Vec<u32>)> = (1..=rows.len())
-        .map(|keep| {
-            let mut r = Runner::new(&model, CONTEXT, threads);
-            for &t in &prompt {
-                r.forward(t);
-            }
-            let mut next = 0;
-            for &row in &rows[..keep] {
-                next = argmax(r.forward(row));
-            }
-            let logits = r.forward(next).to_vec();
-            let mut tail = vec![next, argmax(&logits)];
-            for _ in 0..4 {
-                let last = *tail.last().expect("a token");
-                tail.push(argmax(r.forward(last)));
-            }
-            (logits, tail)
-        })
-        .collect();
-
-    // A batch whose first row is the committed token and whose drafts are all
-    // tokens the model did not pick, so every one of them is rejected.
-    let batch: Vec<u32> = std::iter::once(rows[0])
-        .chain(rows[1..].iter().map(|&t| (t + 1) % vocab as u32))
-        .collect();
 
     for keep in 1..=batch.len() {
+        // The side that never saw the rejected rows: the committed tokens, one
+        // pass at a time, and nothing else. Then the whole logit vector of the
+        // pass after them and the five tokens that follow.
+        let mut plain = Runner::new(&model, CONTEXT, threads);
+        for &t in &prompt {
+            plain.forward(t);
+        }
+        let mut committed = Vec::new();
+        for &t in &batch[..keep] {
+            committed = plain.forward(t).to_vec();
+        }
+        let next = argmax(&committed);
+        let want_logits = plain.forward(next).to_vec();
+        let mut want_tail = vec![next, argmax(&want_logits)];
+        for _ in 0..4 {
+            let last = *want_tail.last().expect("a token");
+            want_tail.push(argmax(plain.forward(last)));
+        }
+
+        // The rolled-back side: the whole batch ran, `keep` rows committed.
         let mut runner = Runner::with_speculation(&model, CONTEXT, threads, 16, DRAFT);
         for &t in &prompt {
             runner.forward(t);
         }
         runner.verify(&batch);
+        // Before the rollback: the last committed row's logits have to be the
+        // logits of the pass it replaces, which is what makes a draft
+        // verifiable at all.
+        if let Some(d) = difference(runner.logit_row(keep - 1), &committed) {
+            panic!(
+                "keep {keep}: row {}'s logits are not the pass's: {d}",
+                keep - 1
+            );
+        }
         runner.accept(keep);
         assert_eq!(runner.pos(), prompt.len() + keep, "keep {keep}: position");
 
-        let (want_logits, want_tail) = &after[keep - 1];
-        let next = want_tail[0];
-        if let Some(d) = difference(runner.forward(next), want_logits) {
+        if let Some(d) = difference(runner.forward(next), &want_logits) {
             panic!(
-                "keep {keep} of {}: the logits after a rollback differ from a runner \
-                 that never saw the rejected tokens: {d}",
-                batch.len()
+                "keep {keep} of {}: the logits after the rollback differ from a runner \
+                 that never saw the {} rejected rows: {d}",
+                batch.len(),
+                batch.len() - keep,
             );
         }
         let mut tail = vec![next, argmax(runner.logits())];
@@ -897,14 +906,16 @@ fn a_rejected_draft_leaves_no_trace_in_the_logits() {
         }
         assert_eq!(
             &tail,
-            want_tail,
-            "keep {keep} of {}: the tokens after a rollback differ",
+            &want_tail,
+            "keep {keep} of {}: the tokens after the rollback differ",
             batch.len()
         );
         println!(
-            "committed {keep} of {} rows: {vocab} logits and {} tokens identical",
+            "committed {keep} of {} rows: {vocab} logits and {} tokens identical to a \
+             runner that never saw the other {}",
             batch.len(),
-            tail.len()
+            tail.len(),
+            batch.len() - keep,
         );
     }
 }
