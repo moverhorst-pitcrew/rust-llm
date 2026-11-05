@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # The model weights are not in the repository, so the tests that need
+      # them carry #[ignore]. Run those locally with:
+      #   cargo test --workspace --release -- --ignored --nocapture
+      - run: cargo test --workspace --all-targets
+
+      # Pure Rust is a hard requirement: no C or C++ toolchain anywhere in the
+      # build graph. `cc` would come in with a -sys crate, `cmake` and
+      # `bindgen` with a wrapper around a native library.
+      - name: No C or C++ build dependencies
+        run: |
+          cargo tree --workspace --edges build > build-deps.txt
+          if grep -Eq '(^|[^a-zA-Z0-9_-])(cc|cmake|bindgen) v' build-deps.txt; then
+            echo "A C or C++ build dependency entered the tree:"
+            cat build-deps.txt
+            exit 1
+          fi
+          cat build-deps.txt

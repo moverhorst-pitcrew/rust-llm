@@ -1,0 +1,11 @@
+[package]
+name = "llm-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+half.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
