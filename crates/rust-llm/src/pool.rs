@@ -12,9 +12,10 @@
 //! every time.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use llm_core::quant::{Activations, GgmlType};
 use llm_core::{KernelError, Kernels};
@@ -44,6 +45,41 @@ pub struct Pool {
     threads: usize,
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
+    stats: Stats,
+}
+
+/// What the submitter spends on getting a job run, as opposed to running it.
+///
+/// Two numbers, because they say different things. `wake` is how long the
+/// submitter waits for every worker to arrive at the first barrier, which is
+/// the cost of getting threads back on a CPU under a quota. `join` is how long
+/// it waits at the second one after finishing its own share, which is the
+/// slowest worker plus the barrier itself. Off they are one relaxed load per
+/// job; on they are four `Instant::now()` calls, against a job that is tens of
+/// microseconds.
+#[derive(Default)]
+pub struct Stats {
+    on: AtomicBool,
+    wake_ns: AtomicU64,
+    join_ns: AtomicU64,
+    jobs: AtomicU64,
+}
+
+impl Stats {
+    /// `(jobs, wake nanoseconds, join nanoseconds)`.
+    pub fn read(&self) -> (u64, u64, u64) {
+        (
+            self.jobs.load(Ordering::Relaxed),
+            self.wake_ns.load(Ordering::Relaxed),
+            self.join_ns.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn clear(&self) {
+        self.wake_ns.store(0, Ordering::Relaxed);
+        self.join_ns.store(0, Ordering::Relaxed);
+        self.jobs.store(0, Ordering::Relaxed);
+    }
 }
 
 impl Pool {
@@ -71,7 +107,17 @@ impl Pool {
             threads,
             shared,
             workers,
+            stats: Stats::default(),
         }
+    }
+
+    /// The barrier accounting, for `rust-llm profile`.
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
+
+    pub fn measure(&self, on: bool) {
+        self.stats.on.store(on, Ordering::Relaxed);
     }
 
     pub fn threads(&self) -> usize {
@@ -103,9 +149,23 @@ impl Pool {
             let erased: *const Job = std::mem::transmute(borrowed);
             *self.shared.job.get() = Some(erased);
         }
+        let timed = self.stats.on.load(Ordering::Relaxed);
+        let at = timed.then(Instant::now);
         self.shared.start.wait();
+        if let Some(at) = at {
+            self.stats
+                .wake_ns
+                .fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         let mine = catch(|| f(0, self.threads));
+        let at = timed.then(Instant::now);
         self.shared.end.wait();
+        if let Some(at) = at {
+            self.stats
+                .join_ns
+                .fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.stats.jobs.fetch_add(1, Ordering::Relaxed);
+        }
         if let Err(panic) = mine {
             std::panic::resume_unwind(panic);
         }

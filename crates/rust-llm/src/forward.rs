@@ -11,6 +11,8 @@
 //! means the state generation starts from is, by construction, the state the
 //! prompt produced. Batched prompt evaluation is a separate change.
 
+use std::time::Instant;
+
 use llm_core::quant::Activations;
 use llm_core::{Kernels, TensorView};
 
@@ -77,6 +79,145 @@ impl Tracer {
     }
 }
 
+/// Where the time goes, per operator, off unless asked for.
+///
+/// `perf` is not installed in this container and `perf_event_paranoid` is 2,
+/// so a sampling profiler was not an option here and these timers are what
+/// produced the table in `docs/benchmarks.md`. Off they are one branch per
+/// operator, which is the same thing [`Tracer`] costs; on they are two
+/// `Instant::now()` calls per operator against the fifty-odd operators a token
+/// goes through, which is under a tenth of a per cent of a token.
+#[derive(Debug, Default)]
+pub struct Profile {
+    on: bool,
+    /// Nanoseconds and calls, indexed by `Op as usize`.
+    ops: [(u64, u64); Op::COUNT],
+}
+
+/// One line of the profile. Split per tensor where the tensors differ in
+/// shape or in quantization type, because that is what a tuning change moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Op {
+    Embed,
+    /// Full block: the fused query-and-gate projection.
+    Qg,
+    K,
+    V,
+    AttnOut,
+    /// Scores, softmax and the weighted sum over the KV cache.
+    Attention,
+    /// Linear block: the q/k/v projection the convolution reads.
+    Qkv,
+    /// Linear block: the output gate, `alpha` and `beta` projections.
+    Zab,
+    Conv,
+    /// The delta-rule recurrence over the per-head state.
+    DeltaNet,
+    LinearOut,
+    FfnGate,
+    FfnUp,
+    FfnDown,
+    /// The output head over the tied embedding table.
+    Head,
+    /// Every RMS and L2 norm, including the per-head ones, and RoPE.
+    Norms,
+    /// Residual adds, SwiGLU, the sigmoid and SiLU gates, argmax-free.
+    Elementwise,
+}
+
+impl Op {
+    const COUNT: usize = 17;
+    const ALL: [Op; Op::COUNT] = [
+        Op::Embed,
+        Op::Qg,
+        Op::K,
+        Op::V,
+        Op::AttnOut,
+        Op::Attention,
+        Op::Qkv,
+        Op::Zab,
+        Op::Conv,
+        Op::DeltaNet,
+        Op::LinearOut,
+        Op::FfnGate,
+        Op::FfnUp,
+        Op::FfnDown,
+        Op::Head,
+        Op::Norms,
+        Op::Elementwise,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Op::Embed => "embed",
+            Op::Qg => "full: qg matmul",
+            Op::K => "full: k matmul",
+            Op::V => "full: v matmul",
+            Op::AttnOut => "full: output matmul",
+            Op::Attention => "full: attention",
+            Op::Qkv => "linear: qkv matmul",
+            Op::Zab => "linear: gate/alpha/beta matmul",
+            Op::Conv => "linear: convolution",
+            Op::DeltaNet => "linear: delta-net recurrence",
+            Op::LinearOut => "linear: output matmul",
+            Op::FfnGate => "ffn: gate matmul",
+            Op::FfnUp => "ffn: up matmul",
+            Op::FfnDown => "ffn: down matmul",
+            Op::Head => "output head matmul",
+            Op::Norms => "norms and rope",
+            Op::Elementwise => "elementwise",
+        }
+    }
+}
+
+impl Profile {
+    pub fn enable(&mut self) {
+        self.on = true;
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.on
+    }
+
+    pub fn clear(&mut self) {
+        self.ops = [(0, 0); Op::COUNT];
+    }
+
+    /// The clock, or nothing at all when profiling is off.
+    #[inline]
+    fn start(&self) -> Option<Instant> {
+        self.on.then(Instant::now)
+    }
+
+    #[inline]
+    fn add(&mut self, op: Op, at: Option<Instant>) {
+        if let Some(at) = at {
+            let slot = &mut self.ops[op as usize];
+            slot.0 += at.elapsed().as_nanos() as u64;
+            slot.1 += 1;
+        }
+    }
+
+    /// Everything recorded, longest first, as `(label, calls, nanoseconds)`.
+    pub fn rows(&self) -> Vec<(&'static str, u64, u64)> {
+        let mut rows: Vec<(&'static str, u64, u64)> = Op::ALL
+            .iter()
+            .map(|&op| {
+                let (ns, calls) = self.ops[op as usize];
+                (op.label(), calls, ns)
+            })
+            .filter(|r| r.1 > 0)
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+        rows
+    }
+
+    pub fn total_ns(&self) -> u64 {
+        self.ops.iter().map(|s| s.0).sum()
+    }
+}
+
 /// The caches. Both are sized at load and never reallocated.
 struct Caches {
     /// `[full block][k, v][kv head][position][head_dim]`.
@@ -119,6 +260,7 @@ pub struct Runner<'a> {
     bufs: Buffers,
     acts: Activations,
     pub tracer: Tracer,
+    pub profile: Profile,
 }
 
 impl<'a> Runner<'a> {
@@ -156,6 +298,7 @@ impl<'a> Runner<'a> {
             acts: Activations::new(c.n_embd.max(c.n_ff).max(c.d_inner).max(c.attn_dim())),
             model,
             tracer: Tracer::default(),
+            profile: Profile::default(),
         }
     }
 
@@ -207,6 +350,7 @@ impl<'a> Runner<'a> {
             bufs,
             acts,
             tracer,
+            profile,
         } = self;
         // Copied out of `self` so the borrow of the model outlives the mutable
         // borrows of the caches and the scratch rather than conflicting.
@@ -221,13 +365,16 @@ impl<'a> Runner<'a> {
             context,
             acts,
             tracer,
+            profile,
         };
 
         ex.embed(token, &mut bufs.x);
         ex.tracer.node("model.input_embed", None, &bufs.x);
 
         for il in 0..c.n_blocks {
+            let t = ex.profile.start();
             rms_norm(&bufs.x, model.blocks[il].attn_norm, c.rms_eps, &mut bufs.xn);
+            ex.profile.add(Op::Norms, t);
             ex.tracer.node("attn_norm", Some(il), &bufs.xn);
 
             match &model.blocks[il].attn {
@@ -245,29 +392,37 @@ impl<'a> Runner<'a> {
                 }
             }
 
+            let t = ex.profile.start();
             for (x, y) in bufs.x.iter_mut().zip(&bufs.y) {
                 *x += y;
             }
+            ex.profile.add(Op::Elementwise, t);
             ex.tracer.node("attn_residual", Some(il), &bufs.x);
 
+            let t = ex.profile.start();
             rms_norm(
                 &bufs.x,
                 model.blocks[il].post_attn_norm,
                 c.rms_eps,
                 &mut bufs.xn,
             );
+            ex.profile.add(Op::Norms, t);
             ex.tracer.node("attn_post_norm", Some(il), &bufs.xn);
             ex.ffn(&model.blocks[il], il, bufs);
+            let t = ex.profile.start();
             for (x, y) in bufs.x.iter_mut().zip(&bufs.y) {
                 *x += y;
             }
+            ex.profile.add(Op::Elementwise, t);
             ex.tracer.node("l_out", Some(il), &bufs.x);
         }
 
+        let t = ex.profile.start();
         rms_norm(&bufs.x, model.output_norm, c.rms_eps, &mut bufs.xn);
+        ex.profile.add(Op::Norms, t);
         ex.tracer.node("result_norm", None, &bufs.xn);
         // Tied embeddings: the table that read the token in is the output head.
-        ex.matmul(&model.token_embd, &bufs.xn, &mut bufs.logits);
+        ex.matmul(Op::Head, &model.token_embd, &bufs.xn, &mut bufs.logits);
         ex.tracer.node("result_output", None, &bufs.logits);
 
         caches.pos += 1;
@@ -277,6 +432,71 @@ impl<'a> Runner<'a> {
     /// The last logits, for a caller that wants them again without a step.
     pub fn logits(&self) -> &[f32] {
         &self.bufs.logits
+    }
+
+    /// Turns on the per-operator timers and the pool's barrier accounting.
+    pub fn enable_profile(&mut self) {
+        self.profile.enable();
+        self.pool.measure(true);
+    }
+
+    /// Throws the recorded time away, which is how the prompt phase and the
+    /// generation phase are kept apart.
+    pub fn clear_profile(&mut self) {
+        self.profile.clear();
+        self.pool.stats().clear();
+    }
+
+    /// The profile table for the `tokens` tokens since the last clear.
+    ///
+    /// The two pool rows are *inside* the matmul rows above them, not extra:
+    /// a matmul is a job, and the time the submitter spends waiting for the
+    /// other threads is part of what that matmul cost. They are listed
+    /// separately because they are the part a scheduling change can remove.
+    pub fn profile_report(&self, what: &str, tokens: usize) -> String {
+        let mut out = String::new();
+        let per = |ns: u64| ns as f64 / tokens as f64 / 1e6;
+        let total = self.profile.total_ns();
+        out.push_str(&format!(
+            "profile: {what}, {tokens} tokens, {} threads, context {}, tier {}\n",
+            self.threads(),
+            self.context,
+            self.kernels().tier().as_str(),
+        ));
+        out.push_str(&format!(
+            "{:34}{:>8}{:>11}{:>8}\n",
+            "operator", "calls/t", "ms/token", "%"
+        ));
+        for (label, calls, ns) in self.profile.rows() {
+            out.push_str(&format!(
+                "{label:34}{:>8.1}{:>11.2}{:>8.1}\n",
+                calls as f64 / tokens as f64,
+                per(ns),
+                ns as f64 / total as f64 * 100.0,
+            ));
+        }
+        out.push_str(&format!(
+            "{:34}{:>8}{:>11.2}{:>8.1}\n",
+            "measured total",
+            "",
+            per(total),
+            100.0
+        ));
+        let (jobs, wake, join) = self.pool.stats().read();
+        if jobs > 0 {
+            for (label, ns) in [
+                ("of which pool wake (barrier in)", wake),
+                ("of which pool join (barrier out)", join),
+            ] {
+                out.push_str(&format!(
+                    "{label:34}{:>8.1}{:>11.2}{:>8.1}\n",
+                    jobs as f64 / tokens as f64,
+                    per(ns),
+                    ns as f64 / total as f64 * 100.0,
+                ));
+            }
+        }
+        out
     }
 }
 
@@ -291,11 +511,13 @@ struct Exec<'m, 'r> {
     context: usize,
     acts: &'r mut Activations,
     tracer: &'r mut Tracer,
+    profile: &'r mut Profile,
 }
 
 impl Exec<'_, '_> {
     /// One row of the embedding table, expanded to f32.
     fn embed(&mut self, token: u32, out: &mut [f32]) {
+        let at_ = self.profile.start();
         let t = &self.model.token_embd;
         let k = t.dims[0] as usize;
         let stride = t.ty.bytes_for(k as u64).expect("row size fits in a u64") as usize;
@@ -305,16 +527,19 @@ impl Exec<'_, '_> {
             "token {token} is outside the vocabulary"
         );
         llm_core::dequantize_row(t.ty, &t.data[at * stride..(at + 1) * stride], out);
+        self.profile.add(Op::Embed, at_);
     }
 
     /// `out = W x`, with the rows of `W` split over the pool.
-    fn matmul(&mut self, w: &TensorView<'_>, x: &[f32], out: &mut [f32]) {
+    fn matmul(&mut self, op: Op, w: &TensorView<'_>, x: &[f32], out: &mut [f32]) {
         debug_assert_eq!(w.dims[0] as usize, x.len());
         debug_assert_eq!(w.dims[1] as usize, out.len());
+        let at = self.profile.start();
         self.acts.quantize(x);
         self.pool
             .matvec(&self.model.kernels, w.ty, w.data, x.len(), self.acts, out)
             .expect("every weight type was checked when the model loaded");
+        self.profile.add(op, at);
     }
 
     /// SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`.
@@ -326,15 +551,17 @@ impl Exec<'_, '_> {
             ffn_b,
             ..
         } = bufs;
-        self.matmul(&block.ffn_gate, xn, ffn_a);
+        self.matmul(Op::FfnGate, &block.ffn_gate, xn, ffn_a);
         self.tracer.node("ffn_gate", Some(il), ffn_a);
-        self.matmul(&block.ffn_up, xn, ffn_b);
+        self.matmul(Op::FfnUp, &block.ffn_up, xn, ffn_b);
         self.tracer.node("ffn_up", Some(il), ffn_b);
+        let at = self.profile.start();
         for (a, b) in ffn_a.iter_mut().zip(&*ffn_b) {
             *a = silu(*a) * b;
         }
+        self.profile.add(Op::Elementwise, at);
         self.tracer.node("ffn_swiglu", Some(il), ffn_a);
-        self.matmul(&block.ffn_down, ffn_a, y);
+        self.matmul(Op::FfnDown, &block.ffn_down, ffn_a, y);
         self.tracer.node("ffn_out", Some(il), y);
     }
 
@@ -365,15 +592,16 @@ impl Exec<'_, '_> {
         } = bufs;
         let qg = &mut qkv[..c.qg_dim()];
 
-        self.matmul(&b.qg, xn, qg);
+        self.matmul(Op::Qg, &b.qg, xn, qg);
         self.tracer.node("Qcur_full", Some(il), qg);
-        self.matmul(&b.v, xn, vb);
+        self.matmul(Op::V, &b.v, xn, vb);
         self.tracer.node("Vcur", Some(il), vb);
-        self.matmul(&b.k, xn, kb);
+        self.matmul(Op::K, &b.k, xn, kb);
         self.tracer.node("Kcur", Some(il), kb);
 
         // The query occupies the first half of each head's slice of `attn_q`
         // and the gate the second half, so the query is strided.
+        let at = self.profile.start();
         for h in 0..n_head {
             let q = &mut qg[h * 2 * hd..h * 2 * hd + hd];
             rms_norm_in_place(q, b.q_norm, c.rms_eps);
@@ -384,9 +612,11 @@ impl Exec<'_, '_> {
             rms_norm_in_place(k, b.k_norm, c.rms_eps);
             rope(k, pos, c.n_rot, c.rope_theta);
         }
+        self.profile.add(Op::Norms, at);
         self.tracer.node("Kcur_roped", Some(il), kb);
 
         // Append this token's keys and values, then read the cache shared.
+        let at = self.profile.start();
         let (k_cache, v_cache) = kv.split_at_mut(n_kv_head * context * hd);
         for h in 0..n_kv_head {
             let at = (h * context + pos) * hd;
@@ -394,7 +624,9 @@ impl Exec<'_, '_> {
             v_cache[at..at + hd].copy_from_slice(&vb[h * hd..(h + 1) * hd]);
         }
         let (k_cache, v_cache) = (&*k_cache, &*v_cache);
+        self.profile.add(Op::Elementwise, at);
 
+        let at = self.profile.start();
         let scale = 1.0 / (hd as f32).sqrt();
         let n_kv = pos + 1;
         let qg = &*qg;
@@ -421,19 +653,22 @@ impl Exec<'_, '_> {
                 }
             },
         );
+        self.profile.add(Op::Attention, at);
         self.tracer
             .node("attn_pregate", Some(il), &heads[..c.attn_dim()]);
 
+        let at = self.profile.start();
         for h in 0..n_head {
             let gate = &qg[h * 2 * hd + hd..(h + 1) * 2 * hd];
             for (o, &g) in heads[h * hd..(h + 1) * hd].iter_mut().zip(gate) {
                 *o *= sigmoid(g);
             }
         }
+        self.profile.add(Op::Elementwise, at);
         self.tracer
             .node("attn_gated", Some(il), &heads[..c.attn_dim()]);
 
-        self.matmul(&b.o, &heads[..c.attn_dim()], y);
+        self.matmul(Op::AttnOut, &b.o, &heads[..c.attn_dim()], y);
         self.tracer.node("attn_output", Some(il), y);
     }
 
@@ -464,40 +699,51 @@ impl Exec<'_, '_> {
         } = bufs;
         let qkv = &mut qkv[..c.conv_dim()];
 
-        self.matmul(&b.qkv, xn, qkv);
+        self.matmul(Op::Qkv, &b.qkv, xn, qkv);
         self.tracer.node("linear_attn_qkv_mixed", Some(il), qkv);
-        self.matmul(&b.gate, xn, z);
+        self.matmul(Op::Zab, &b.gate, xn, z);
         self.tracer.node("z", Some(il), z);
 
-        self.matmul(&b.alpha, xn, decay);
+        self.matmul(Op::Zab, &b.alpha, xn, decay);
         self.tracer.node("alpha", Some(il), decay);
+        let at = self.profile.start();
         for (d, (&bias, &a)) in decay.iter_mut().zip(b.dt_bias.iter().zip(b.a)) {
             // `ssm_a` is already `-exp(A_log)`, so this is the log of the
             // decay and `exp` of it lands in (0, 1).
             *d = softplus(*d + bias) * a;
         }
+        self.profile.add(Op::Elementwise, at);
         self.tracer.node("gate", Some(il), decay);
 
-        self.matmul(&b.beta, xn, beta);
+        self.matmul(Op::Zab, &b.beta, xn, beta);
+        let at = self.profile.start();
         for v in beta.iter_mut() {
             *v = sigmoid(*v);
         }
+        self.profile.add(Op::Elementwise, at);
         self.tracer.node("beta_sigmoid", Some(il), beta);
 
+        let at = self.profile.start();
         depthwise_conv(qkv, b.conv1d, c.conv_kernel, conv_state, conv);
+        self.profile.add(Op::Conv, at);
         self.tracer.node("conv_output_raw", Some(il), conv);
+        let at = self.profile.start();
         for v in conv.iter_mut() {
             *v = silu(*v);
         }
+        self.profile.add(Op::Elementwise, at);
         self.tracer.node("conv_output_silu", Some(il), conv);
 
         // q and k are L2-normalised per head; v is used as it comes out.
+        let at = self.profile.start();
         let (qk, _) = conv.split_at_mut(2 * key_dim);
         for h in 0..2 * n_kh {
             l2_norm_in_place(&mut qk[h * s..(h + 1) * s], c.rms_eps);
         }
         let conv = &*conv;
+        self.profile.add(Op::Norms, at);
 
+        let at = self.profile.start();
         let scale = 1.0 / (s as f32).sqrt();
         let decay = &*decay;
         let beta = &*beta;
@@ -533,10 +779,12 @@ impl Exec<'_, '_> {
                 }
             },
         );
+        self.profile.add(Op::DeltaNet, at);
         self.tracer
             .node("attn_output", Some(il), &heads[..c.d_inner]);
 
         // The gated norm: RMSNorm per value head, then the sigmoid-linear gate.
+        let at = self.profile.start();
         for h in 0..n_vh {
             let head = &mut heads[h * s..(h + 1) * s];
             rms_norm_in_place(head, b.norm, c.rms_eps);
@@ -544,10 +792,11 @@ impl Exec<'_, '_> {
                 *o *= silu(g);
             }
         }
+        self.profile.add(Op::Norms, at);
         self.tracer
             .node("final_output", Some(il), &heads[..c.d_inner]);
 
-        self.matmul(&b.out, &heads[..c.d_inner], y);
+        self.matmul(Op::LinearOut, &b.out, &heads[..c.d_inner], y);
         self.tracer.node("linear_attn_out", Some(il), y);
     }
 }

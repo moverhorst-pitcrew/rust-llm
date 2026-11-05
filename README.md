@@ -14,6 +14,8 @@ No llama.cpp, no ggml, no C or C++ anywhere in the build.
 - `fixtures/` — committed test fixtures and the script that regenerates them.
 - `docs/models.md` — which model, where to get it, and what is inside the file.
 - `docs/decisions.md` — every crate and data-layout choice with its reason.
+- `docs/benchmarks.md` — the machine, the measured bandwidth ceiling, and every
+  performance number with the command that produced it.
 
 ## Building
 
@@ -165,3 +167,37 @@ Kernel microbenchmark:
 ```sh
 cargo run --release -p llm-core --example bench_kernels
 ```
+
+## Measuring
+
+Throughput, as a median of repeated runs with the spread reported, per thread
+count:
+
+```sh
+rust-llm bench --context 1024 --threads 1,2,3,4,5,6,8 --prompt-tokens 19 \
+  --max-tokens 16 --repeats 5
+```
+
+The prompt is a fixed text truncated to exactly `--prompt-tokens` tokens, and
+generation runs exactly `--max-tokens` tokens through the forward pass and
+ignores stop tokens, so two runs measure the same work. The first run of each
+thread count is a warm-up and is not counted. Every configuration prints its
+thread count, context, prompt length, generated tokens, kernel tier, the cgroup
+CPU quota and the load average before and after, because this box is shared and
+a number without those is not comparable with another one.
+
+Where the time goes, per operator, for the prompt phase and for generation:
+
+```sh
+rust-llm profile --context 1024 --threads 4 --prompt-tokens 19 --max-tokens 16
+```
+
+What the machine can stream from memory, which is the ceiling batch-1
+generation runs into:
+
+```sh
+cargo run --release -p llm-core --example bench_bandwidth
+```
+
+`docs/benchmarks.md` holds the numbers these produce on the development box,
+with llama.cpp on the same file at matching thread counts.
