@@ -1,39 +1,53 @@
 //! `rust-llm` — the command line around the runner.
 //!
-//! Arguments are parsed by hand. There are seven of them, they are all
-//! `--name value`, and a parser crate would be a dependency and a build-time
-//! cost for something this shape.
+//! Arguments are parsed by hand. They are all `--name value`, there is no
+//! subcommand-specific grammar, and a parser crate would be a dependency and a
+//! build-time cost for something this shape.
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rust_llm::chat::{ChatOptions, Message};
 use rust_llm::forward::Runner;
 use rust_llm::model::Model;
-use rust_llm::sample::Sampler;
-use rust_llm::{Tokenizer, generate};
+use rust_llm::sample::{Sampler, Sampling, entropy_seed};
+use rust_llm::{Stop, Tokenizer, generate};
 
 use llm_core::Gguf;
 
 const USAGE: &str = "\
 rust-llm run --prompt <text> [options]
+rust-llm chat [options]
 rust-llm trace --prompt <text> [options]
 
-  run     generate greedily from the prompt and stream the result
+  run     generate from the prompt and stream the result
+  chat    an interactive conversation, streamed. /reset starts over,
+          /exit or Ctrl-D quits. No line editing and no history: that
+          would be a readline dependency for a development surface.
   trace   print one per-layer activation sum per line, for comparison
           against a reference runner (see docs/decisions.md)
 
 options
   --model <path>        GGUF file; required, or set $RUST_LLM_MODEL
   --tokenizer <path>    tokenizer.json (default: next to the model)
-  --prompt <text>       the user message (required)
+  --prompt <text>       the user message (required by run and trace)
   --system <text>       a system message, placed first
   --context <n>         positions to allocate for the KV cache (default 4096)
   --threads <n>         worker threads (default: all cores)
   --max-tokens <n>      stop after this many generated tokens (default 512)
   --think, --no-think   thinking mode, on by default, as the template is
   --raw                 take --prompt as the prompt verbatim, no chat template
+
+sampling
+  --temperature <f>     0 is greedy argmax (default 0.6)
+  --top-k <n>           keep the n highest logits, 0 for all (default 20)
+  --top-p <f>           keep the smallest set covering this mass (default 0.95)
+  --min-p <f>           drop below this fraction of the top probability
+                        (default 0, off)
+  --repeat-penalty <f>  1 is off (default 1)
+  --repeat-last-n <n>   tokens the penalty looks back over (default 64)
+  --seed <n>            default: from entropy, printed to stderr
 ";
 
 struct Args {
@@ -47,6 +61,8 @@ struct Args {
     max_tokens: usize,
     thinking: bool,
     raw: bool,
+    sampling: Sampling,
+    seed: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -83,29 +99,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut runner = Runner::new(&model, args.context, args.threads);
     let load = load.elapsed();
 
-    let prompt = if args.raw {
-        args.prompt.clone()
-    } else {
-        let mut messages = Vec::new();
-        if let Some(system) = &args.system {
-            messages.push(Message::system(system.clone()));
-        }
-        messages.push(Message::user(args.prompt.clone()));
-        rust_llm::chat::render(
-            &messages,
-            ChatOptions {
-                add_generation_prompt: true,
-                thinking: args.thinking,
-            },
-        )?
-    };
-    let tokens = tokenizer.encode(&prompt, true)?;
-    // Only reachable with --raw: the chat template always emits its own
-    // tokens, so an empty --prompt still renders to something.
-    if tokens.is_empty() {
-        return Err("the prompt is empty, so there is nothing to run".into());
-    }
-
     eprintln!(
         "model {} ({} blocks, {} full attention, {} linear), kernels {}, {} threads, context {}",
         args.model.display(),
@@ -116,13 +109,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         runner.threads(),
         runner.context(),
     );
-    eprintln!(
-        "loaded in {:.2}s, prompt is {} tokens",
-        load.as_secs_f64(),
-        tokens.len()
-    );
 
     if args.command == "trace" {
+        let tokens = encode_prompt(&args, &tokenizer)?;
+        eprintln!(
+            "loaded in {:.2}s, prompt is {} tokens",
+            load.as_secs_f64(),
+            tokens.len()
+        );
         runner.tracer.enable();
         for &t in &tokens {
             runner.tracer.clear();
@@ -136,28 +130,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut stdout = std::io::stdout();
-    // A character spread over two tokens cannot be decoded from either of them
-    // alone, and the decoder leaves a replacement character where it was. That
-    // is a property of what was *streamed*, so it is recorded here rather than
-    // looked for in the clean text afterwards, which cannot contain one.
-    let mut streamed_a_broken_character = false;
-    let mut sampler = Sampler::greedy(model.vocab());
-    let (ids, stop, timings) =
-        generate::generate(&mut runner, &mut sampler, &tokens, args.max_tokens, |id| {
-            if let Ok(text) = tokenizer.decode(&[id], false) {
-                streamed_a_broken_character |= text.contains(char::REPLACEMENT_CHARACTER);
-                let _ = stdout.write_all(text.as_bytes());
-                let _ = stdout.flush();
-            }
-        });
-    println!();
-
-    let text = tokenizer.decode(&ids, false)?;
-    if streamed_a_broken_character {
-        eprintln!("--- decoded as a whole ---");
-        println!("{text}");
+    // The seed is resolved here and printed, because a run taken from entropy
+    // is only reproducible if the number it used is on the screen.
+    let sampling = Sampling {
+        seed: args.seed.unwrap_or_else(entropy_seed),
+        ..args.sampling
+    };
+    let mut sampler = Sampler::new(model.vocab(), sampling);
+    if sampling.temperature > 0.0 {
+        eprintln!(
+            "sampling: temperature {}, top-k {}, top-p {}, min-p {}, repeat penalty {} over {}, seed {}",
+            sampling.temperature,
+            sampling.top_k,
+            sampling.top_p,
+            sampling.min_p,
+            sampling.repeat_penalty,
+            sampling.repeat_last_n,
+            sampling.seed,
+        );
+    } else {
+        eprintln!("sampling: greedy (temperature 0)");
     }
+
+    if args.command == "chat" {
+        return chat(&args, &tokenizer, &mut runner, &mut sampler, load);
+    }
+
+    let tokens = encode_prompt(&args, &tokenizer)?;
+    eprintln!(
+        "loaded in {:.2}s, prompt is {} tokens",
+        load.as_secs_f64(),
+        tokens.len()
+    );
+
+    let (_, stop, timings) = stream(&mut runner, &mut sampler, &tokenizer, &tokens, &args)?;
 
     eprintln!(
         "stopped: {stop:?}\nprompt   {} tokens in {:.2}s = {:.2} tok/s\ngenerate {} tokens in {:.2}s = {:.2} tok/s",
@@ -177,6 +183,151 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The prompt as the model sees it: the chat template around `--system` and
+/// `--prompt`, or `--prompt` verbatim with `--raw`.
+fn encode_prompt(
+    args: &Args,
+    tokenizer: &Tokenizer,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let prompt = if args.raw {
+        args.prompt.clone()
+    } else {
+        let mut messages = Vec::new();
+        if let Some(system) = &args.system {
+            messages.push(Message::system(system.clone()));
+        }
+        messages.push(Message::user(args.prompt.clone()));
+        render(&messages, args.thinking)?
+    };
+    let tokens = tokenizer.encode(&prompt, true)?;
+    // Only reachable with --raw: the chat template always emits its own
+    // tokens, so an empty --prompt still renders to something.
+    if tokens.is_empty() {
+        return Err("the prompt is empty, so there is nothing to run".into());
+    }
+    Ok(tokens)
+}
+
+fn render(messages: &[Message], thinking: bool) -> Result<String, rust_llm::ChatError> {
+    rust_llm::chat::render(
+        messages,
+        ChatOptions {
+            add_generation_prompt: true,
+            thinking,
+        },
+    )
+}
+
+/// Generates from `tokens`, streaming each token's text to stdout as it comes
+/// out, and returns what was generated.
+///
+/// A character spread over two tokens cannot be decoded from either of them
+/// alone, and the decoder leaves a replacement character where it was. That is
+/// a property of what was *streamed*, so it is recorded here rather than looked
+/// for in the clean text afterwards, which cannot contain one.
+fn stream(
+    runner: &mut Runner<'_>,
+    sampler: &mut Sampler,
+    tokenizer: &Tokenizer,
+    tokens: &[u32],
+    args: &Args,
+) -> Result<(Vec<u32>, Stop, generate::Timings), Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout();
+    let mut streamed_a_broken_character = false;
+    let (ids, stop, timings) = generate::generate(runner, sampler, tokens, args.max_tokens, |id| {
+        if let Ok(text) = tokenizer.decode(&[id], false) {
+            streamed_a_broken_character |= text.contains(char::REPLACEMENT_CHARACTER);
+            let _ = stdout.write_all(text.as_bytes());
+            let _ = stdout.flush();
+        }
+    });
+    println!();
+
+    if streamed_a_broken_character {
+        let text = tokenizer.decode(&ids, false)?;
+        eprintln!("--- decoded as a whole ---");
+        println!("{text}");
+    }
+    Ok((ids, stop, timings))
+}
+
+/// The interactive surface.
+///
+/// Every turn re-renders the whole conversation and resets the runner. That is
+/// not laziness: the chat template drops the reasoning of assistant turns
+/// before the last user turn, so the token prefix of turn N+1 is not a prefix
+/// of turn N and reusing the KV cache across turns would be wrong rather than
+/// merely stale. See `docs/decisions.md`.
+fn chat(
+    args: &Args,
+    tokenizer: &Tokenizer,
+    runner: &mut Runner<'_>,
+    sampler: &mut Sampler,
+    load: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!(
+        "loaded in {:.2}s. /reset starts over, /exit or Ctrl-D quits.",
+        load.as_secs_f64()
+    );
+    let mut messages: Vec<Message> = Vec::new();
+    if let Some(system) = &args.system {
+        messages.push(Message::system(system.clone()));
+    }
+    let keep = messages.len();
+
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut line = String::new();
+    loop {
+        eprint!("> ");
+        let _ = std::io::stderr().flush();
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            // Ctrl-D.
+            eprintln!();
+            return Ok(());
+        }
+        let text = line.trim();
+        match text {
+            "" => continue,
+            "/exit" | "/quit" => return Ok(()),
+            "/reset" => {
+                messages.truncate(keep);
+                runner.reset();
+                sampler.reset();
+                eprintln!("(conversation cleared)");
+                continue;
+            }
+            _ => {}
+        }
+
+        messages.push(Message::user(text.to_string()));
+        let prompt = render(&messages, args.thinking)?;
+        let tokens = tokenizer.encode(&prompt, true)?;
+        if tokens.len() >= runner.context() {
+            eprintln!(
+                "the conversation is {} tokens and the context holds {}; \
+                 /reset, or restart with a larger --context",
+                tokens.len(),
+                runner.context()
+            );
+            messages.pop();
+            continue;
+        }
+
+        runner.reset();
+        let (ids, stop, _) = stream(runner, sampler, tokenizer, &tokens, args)?;
+        if stop == Stop::ContextFull {
+            eprintln!(
+                "the context of {} positions filled up part-way through this answer; \
+                 /reset, or restart with a larger --context",
+                runner.context()
+            );
+        }
+        messages.push(Message::assistant(tokenizer.decode(&ids, false)?));
+    }
+}
+
 fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let mut out = Args {
         command: String::new(),
@@ -192,6 +343,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
         max_tokens: 512,
         thinking: true,
         raw: false,
+        sampling: Sampling::default(),
+        seed: None,
     };
     let mut args = args.peekable();
     let mut seen_prompt = false;
@@ -212,6 +365,25 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
             "--context" => out.context = number(&value()?, "--context")?,
             "--threads" => out.threads = number(&value()?, "--threads")?.max(1),
             "--max-tokens" => out.max_tokens = number(&value()?, "--max-tokens")?,
+            "--temperature" => {
+                out.sampling.temperature = positive(&value()?, "--temperature", true)?
+            }
+            "--top-k" => out.sampling.top_k = number(&value()?, "--top-k")?,
+            "--top-p" => out.sampling.top_p = fraction(&value()?, "--top-p")?,
+            "--min-p" => out.sampling.min_p = fraction(&value()?, "--min-p")?,
+            // A penalty of zero would zero every repeated negative logit and
+            // divide every positive one by nothing; it is not a setting.
+            "--repeat-penalty" => {
+                out.sampling.repeat_penalty = positive(&value()?, "--repeat-penalty", false)?
+            }
+            "--repeat-last-n" => out.sampling.repeat_last_n = number(&value()?, "--repeat-last-n")?,
+            "--seed" => {
+                let v = value()?;
+                out.seed = Some(
+                    v.parse()
+                        .map_err(|_| format!("--seed needs a number, got {v:?}"))?,
+                );
+            }
             other if out.command.is_empty() && !other.starts_with('-') => {
                 out.command = other.to_string();
             }
@@ -221,11 +393,14 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     if out.command.is_empty() {
         return Ok(None);
     }
-    if out.command != "run" && out.command != "trace" {
+    if !matches!(out.command.as_str(), "run" | "chat" | "trace") {
         return Err(format!("unknown command {:?}\n\n{USAGE}", out.command));
     }
-    if !seen_prompt {
-        return Err(format!("--prompt is required\n\n{USAGE}"));
+    if out.command != "chat" && !seen_prompt {
+        return Err(format!(
+            "--prompt is required by {}\n\n{USAGE}",
+            out.command
+        ));
     }
     if out.model.as_os_str().is_empty() {
         return Err(format!(
@@ -238,6 +413,38 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
 fn number(s: &str, what: &str) -> Result<usize, String> {
     s.parse()
         .map_err(|_| format!("{what} needs a number, got {s:?}"))
+}
+
+/// A float argument. Out of range is refused by name rather than clamped: a
+/// silently clamped `--top-p 1.5` would look like it worked.
+fn float(s: &str, what: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .parse()
+        .map_err(|_| format!("{what} needs a number, got {s:?}"))?;
+    if !v.is_finite() {
+        return Err(format!("{what} needs a finite number, got {s:?}"));
+    }
+    Ok(v)
+}
+
+fn fraction(s: &str, what: &str) -> Result<f32, String> {
+    let v = float(s, what)?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("{what} must be between 0 and 1, got {s}"));
+    }
+    Ok(v)
+}
+
+fn positive(s: &str, what: &str, zero_allowed: bool) -> Result<f32, String> {
+    let v = float(s, what)?;
+    if v < 0.0 || (v == 0.0 && !zero_allowed) {
+        return Err(if zero_allowed {
+            format!("{what} cannot be negative, got {s}")
+        } else {
+            format!("{what} must be above 0, got {s}")
+        });
+    }
+    Ok(v)
 }
 
 /// `VmHWM` from `/proc/self/status`, where it exists.
