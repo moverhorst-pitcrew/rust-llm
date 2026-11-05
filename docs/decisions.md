@@ -373,45 +373,114 @@ reference's tokens.
 
 **One persistent pool, built at load time**, with the submitting thread as one
 of its workers. A job is published once, run by everyone, and `run` returns
-only after every thread has passed the second barrier; that is what lets a job
-borrow the caller's stack and write into disjoint pieces of a caller-owned
-slice without allocating. At 32 cores and a few hundred matmuls per token,
-spawning per matmul would cost more than the work.
+only after every thread has left it; that is what lets a job borrow the
+caller's stack and write into disjoint pieces of a caller-owned slice without
+allocating. At 32 cores and a few hundred matmuls per token, spawning per
+matmul would cost more than the work.
 
-Two shapes of work cover the whole pass: matmul rows split over the threads,
-and per-head chunks where one attention head or one delta-net value head owns
-one output chunk and one piece of scratch. Everything else is elementwise and
-cheaper than a barrier.
+Two shapes of work cover the whole pass: matmul rows, and per-head chunks where
+one attention head or one delta-net value head owns one output chunk and one
+piece of scratch. Everything else is elementwise and cheaper than a job.
 
-**A panic in a job is carried across the barrier, not out of it.** Both sides
+**Projections that read the same input are one job.** The feed-forward gate and
+up, the full block's q, k and v, and the linear block's qkv together with its
+output gate, alpha and beta each read the same normalised vector, so each group
+is one job over one row range and one activation quantization instead of N jobs
+over N quantizations of the same input. That took a token from 281 pool jobs to
+161. It also balances better than separate jobs could: alpha and beta are 32
+rows each next to tensors of thousands, so on their own they were a pair of
+barriers around work one thread does in microseconds. The profile pays for it
+by no longer being able to attribute time per tensor inside a group; the
+per-tensor breakdown from before the change is in `docs/benchmarks.md`.
+
+**A job is handed out through a sequence counter, not a barrier.** A
+`std::sync::Barrier` is a mutex and a condvar, so the 161 jobs in a token cost
+two of them each: a futex wake for every worker before the job and a futex wait
+after it. Instead the submitter writes the job pointer, bumps a counter and
+unparks the workers, and a worker waits for that counter to change by spinning
+for about twenty microseconds before it parks. The completion side is a
+countdown the workers release as they leave, which the submitter spins on and
+then yields on. At 8 threads that took the pool's own share of a token from 67
+per cent to 5.9 per cent (`docs/benchmarks.md`).
+
+Twenty microseconds of spinning is deliberately shorter than a job and longer
+than the serial stretch between two jobs (the activation quantization, the
+norms, the elementwise work), which is what a worker is usually waiting
+through. Past that it parks, because a spinning worker takes quota from the
+thread it is waiting for. `unpark` on a thread that is still spinning is an
+atomic store and no syscall, and it leaves a token that makes that thread's
+next `park` return at once, which closes the window where a worker parks just
+after being passed over.
+
+**The work is claimed, not split up front.** Both shapes take their work from
+an atomic counter: matvec groups in blocks of up to 64 rows, per-head jobs one
+head at a time. A static split hands equal rows to unequal lanes here: the
+cgroup quota means a thread can be descheduled in the middle of a job while the
+others wait for it, and this CPU is 8 performance cores plus 16 efficiency
+cores, so equal rows are not equal work even when nothing is descheduled. Of
+the time the submitter used to spend at the two barriers, waiting for the
+slowest worker was 23 ms per token against 6 ms for getting the workers
+started, so the imbalance was the larger half. 64 rows of the largest tensor
+here are 90 KiB of weights, which is tens of microseconds of streaming: long
+enough that the `fetch_add` is noise and the weight reads stay sequential,
+short enough that the last block does not decide the job's length.
+
+**A panic in a job is carried out of the job, not out of `run`.** Both sides
 run the job inside `catch_unwind`; the submitter resumes its panic only after
-`end.wait()`, and a worker that panicked sets a flag the submitter turns into a
-panic of its own. Letting the panic escape directly would leave every other
-thread waiting on a barrier the panicking one never reaches, and `Drop` waiting
-on the other one, so a failed assert in the forward pass would be a hang rather
-than a stack trace. The buffers are half written at that point, which is why
-this resumes the panic instead of reporting it: the caller's results are not
+every worker has left, and a worker that panicked sets a flag the submitter
+turns into a panic of its own. Letting the panic escape directly would leave
+the other threads inside a job nobody waits for and `Drop` joining threads that
+are still running, so a failed assert in the forward pass would be a hang
+rather than a stack trace. The buffers are half written at that point, which is
+why this resumes the panic instead of reporting it: the caller's results are not
 usable either way.
 
-**The split cannot change the result.** Each output row and each head is
+**The split cannot change the result.** Each output row and each head is still
 computed by exactly one worker from start to finish, so no reduction crosses a
-thread and the output does not depend on the thread count. A test asserts that
-for 1, 3 and all threads.
+thread and the output does not depend on the thread count: a block is handed out
+once, and the rows of a group are one range for one claim. That it holds is now
+a property of the claiming rather than of the arithmetic of a static split,
+which is why it needs a test of its own: `every_chunk_is_claimed_exactly_once`
+fails if a chunk is run twice or not at all at 1, 3, 4 and 8 threads, next to
+`the_thread_count_does_not_change_the_output` on the whole forward pass at 1, 3
+and all threads.
 
-**Default thread count is `available_parallelism`**, which on this box reports
-8 because the cgroup quota is 8 of the 32 cores. That default is not the
-fastest setting here. Measured, short prompt, context 1024, generation tok/s:
+**Default thread count stays `available_parallelism`**, which on this box
+reports 8 because the cgroup quota is 8 of the 32 cores. Before the three
+changes above that default was 25 to 35 per cent off the peak, which was at 3
+or 4 threads; it was left alone deliberately, pending a measurement. The
+measurement, taken at the end of the threading work, says the curve now rises
+to the quota instead of turning over inside it. Generation tok/s, context 1024,
+19-token prompt, 16 generated tokens, median of 3, in the quietest window
+measured (load average 5.0 to 6.2 on the 8-CPU quota):
 
-| threads | 1 | 2 | 3 | 4 | 5 | 6 | 8 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| tok/s | 4.83 | 8.29 | 9.56 | 9.66 | 9.17 | 8.59 | 7.09 |
+| threads | 4 | 6 | 7 | 8 |
+| --- | --- | --- | --- | --- |
+| tok/s | 11.15 | 14.02 | 14.73 | 15.23 |
+| spread | 1.0% | 8.2% | 1.7% | 0.9% |
 
-Batch-1 generation reads all 2.52 GiB of weights per token, so the ceiling is
-memory bandwidth and it is reached at three or four threads; past that the
-barriers cost more than the extra lanes earn, and on a shared box a thread that
-is descheduled at a barrier holds up all of them. Tuning this, and finding what
-the bandwidth ceiling actually is, is the throughput ticket's job; the default
-stays the honest one.
+So 8 threads is the fastest setting, 37 per cent ahead of 4, where it used to be
+the slowest. The measurement is repeated in `docs/benchmarks.md` with the other
+windows, and they qualify it rather than contradict it: when this shared box is
+oversubscribed, 6, 7 and 8 threads are indistinguishable (alternating passes of
+8 and 6 give 10.04/9.99/8.89 against 10.73/9.70/9.93, spreads up to 54 per
+cent), and in one window of four the peak was 6 threads. No window measured had
+a setting below the quota that was faster than the quota by more than its own
+spread.
+
+That is why the default is not a fraction of the quota. The streaming
+measurement shows memory saturating at 6 or 7 threads of the 8, so an argument
+for a default of 6 or 7 exists on paper, but what makes 8 lose in some windows
+is other work competing for the same bandwidth, and that is a property of this
+machine at that moment, not of the hardware. `quota - 1` or `quota * 3/4` would
+be fitting the product to our box's noise; `available_parallelism` reads the
+quota it is given on any machine, and generation reaches 79 per cent of the
+measured bandwidth ceiling there (against 29 per cent at the start of this
+branch). `--threads` is there for the case where the box is busy.
+
+AVX-512 was checked for and this machine does not have it: `/proc/cpuinfo` has
+`avx2` and `avx_vnni` and no `avx512*` flag, so there is no AVX-512 tier in the
+dispatch table. Adding one would be a kernel nobody here can run or test.
 
 **Nothing in the generation loop allocates**, measured rather than asserted. A
 counting global allocator wraps `System` in
@@ -911,6 +980,12 @@ visible.
 
 ## Baseline numbers
 
+These are M1's numbers, kept because the decisions above rest on them and
+because they are what the throughput work measures itself against.
+**`docs/benchmarks.md` holds the current ones**, the bandwidth ceiling, the
+per-operator profile and the reference at matching thread counts, and it is the
+only place new performance numbers go.
+
 Qwen3.5-4B-heretic-Q4_K_M, `avx2+vnni`, this box (8 of 32 cores by cgroup
 quota, and shared with other work, so these wobble by 10 to 20 per cent):
 
@@ -936,7 +1011,9 @@ the positions are used.
 
 Prompt processing is no faster per token than generation, because the prompt
 goes through the same single-token path. That is the first thing to fix for
-throughput, not a measurement error.
+throughput, not a measurement error. It is still true after the threading work,
+and it is the whole of the gap to the reference on the prompt side: see
+`docs/benchmarks.md`.
 
 **The reference, measured properly, is in the same range**, and an earlier
 figure saying otherwise was wrong. `llama-completion` on the same file and the
@@ -950,13 +1027,17 @@ same box, same prompt, 8 generated tokens:
 The 0.10 at 32 threads is where "llama.cpp does 0.20 tok/s on this
 architecture" came from. It is not a property of llama.cpp or of this
 architecture, it is four times oversubscription against an eight-core cgroup
-quota, the same barrier effect that costs this runner half its speed at eight
-threads. Best against best, this runner is about 23 per cent ahead; at the same
-eight threads the reference is about 15 per cent ahead of it.
+quota, the same barrier effect that cost this runner half its speed at eight
+threads. Best against best, this runner was about 23 per cent ahead; at the same
+eight threads the reference was about 15 per cent ahead of it.
 
-So the reference is not a floor to walk over. The bar is memory bandwidth,
-which batch-1 generation hits by reading every weight once per token, and
-establishing where that bar actually is belongs to the throughput ticket.
+So the reference is not a floor to walk over. The bar is memory bandwidth, which
+batch-1 generation hits by reading every weight once per token. That bar is
+measured now, at about 48.6 GiB/s and so 19 generation tok/s on this box, and
+`docs/benchmarks.md` has the comparison against the reference per thread count
+from `llama-bench` rather than from one `llama-completion` run. Generation at
+eight threads is ahead of the reference there; the prompt phase is a factor 4 to
+7 behind it, which is batched prompt evaluation and not scheduling.
 
 ## What the checks cost
 
@@ -969,6 +1050,7 @@ no signal in it. Measured on this box:
 | `cargo test --workspace --all-targets` (the default set, no weights needed) | 47 s cold, 25 s warm |
 | of which `tests/sample.rs`, `tests/sample_allocations.rs` and `tests/tiny_model.rs` | 2 s, 2 s, 3 s |
 | of which `tests/serve.rs`, which starts the server and drives both endpoints | 2 s |
+| the whole `--ignored` set, which is both gates and everything else needing weights | 3:30 |
 | gate: `every_next_token_matches_the_reference` | 2:01 |
 | gate: `greedy_output_is_unchanged` | 2:10 |
 | gate: `resetting_the_caches_is_the_same_as_a_fresh_runner` | 27 s |
@@ -977,6 +1059,15 @@ no signal in it. Measured on this box:
 | fixture re-derivation, one prompt | 20 to 35 s |
 | fixture re-derivation, all ten prompts | about 4 min |
 | per-layer trace comparison against the reference | 40 s |
+
+The per-test times are from running them one at a time. In one command the
+harness runs four of them at once, each asking for all 8 threads of the quota,
+so they finish together in about the time of the slowest rather than in the sum;
+the whole set took 3:30 on a box that was busy with other work at the time, and
+the threading changes on the throughput branch took it from 232 to 140 seconds
+on an idle one. Three of its tok/s figures are therefore a quarter of what
+`bench` reports, which is the oversubscription and not a regression: the gates
+measure agreement, `docs/benchmarks.md` measures speed.
 
 The default `cargo test` holds no weights and no reference, so it is the same
 35 seconds in CI. The gate tests are `#[ignore]`d because they need the model

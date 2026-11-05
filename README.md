@@ -162,6 +162,12 @@ model on disk (see `docs/models.md`):
 cargo test --workspace --release -- --ignored --nocapture
 ```
 
+One test in that set, `the_fixture_is_still_what_the_reference_produces`, also
+needs a built reference runner and fails without one:
+`RUST_LLM_REFERENCE_BIN` to the directory holding `llama-completion`, with
+`LD_LIBRARY_PATH` pointing at the same directory. The build recipe is in
+`docs/decisions.md` under "The reference harness".
+
 Kernel microbenchmark:
 
 ```sh
