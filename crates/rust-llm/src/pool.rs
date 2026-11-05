@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use llm_core::kernels::VecDotBatch;
 use llm_core::quant::{Activations, GgmlType};
 use llm_core::{KernelError, Kernels};
 
@@ -308,6 +309,7 @@ impl Pool {
                 w: m.w,
                 stride: m.ty.bytes_for(k as u64).expect("row size fits in a u64") as usize,
                 rows: m.out.len() / t,
+                batched: kernels.vec_dot_batch(m.ty),
                 out: Scatter::new(m.out),
             }
         });
@@ -451,6 +453,7 @@ struct Part<'a> {
     w: &'a [u8],
     stride: usize,
     rows: usize,
+    batched: Option<VecDotBatch>,
     out: Scatter,
 }
 
@@ -458,10 +461,10 @@ impl Part<'_> {
     /// Computes rows `at..at + len` of this part, for every row of the batch.
     ///
     /// One token goes straight through [`Kernels::matvec`], which is the path
-    /// generation has always taken. A batch runs one pass per token over the
-    /// same block of weight rows, which is where its win comes from: the block
-    /// is small enough to stay in cache, so its bytes cross the memory bus
-    /// once for the whole batch.
+    /// generation has always taken. A batch with a batched kernel walks one
+    /// weight row against a group of activation rows at a time, so the row is
+    /// unpacked once per group; without one it falls back to a pass per token,
+    /// which costs the unpacking again but is the same arithmetic.
     fn run(&self, kernels: &Kernels, k: usize, a: &Activations, at: usize, len: usize) {
         let t = a.t();
         if t == 1 {
@@ -474,13 +477,31 @@ impl Part<'_> {
                 .expect("the kernel was resolved before the threads started");
             return;
         }
-        for tt in 0..t {
-            // SAFETY: as above, and the `t` ranges here are one row block
-            // in `t` disjoint rows of the output.
-            let chunk = unsafe { self.out.at(tt * self.rows + at, len) };
-            kernels
-                .matvec_row(self.ty, &self.w[at * self.stride..], k, a, tt, chunk)
-                .expect("the kernel was resolved before the threads started");
+        let Some(dot) = self.batched else {
+            for tt in 0..t {
+                // SAFETY: as above, and the `t` ranges here are one row block
+                // in `t` disjoint rows of the output.
+                let chunk = unsafe { self.out.at(tt * self.rows + at, len) };
+                kernels
+                    .matvec_row(self.ty, &self.w[at * self.stride..], k, a, tt, chunk)
+                    .expect("the kernel was resolved before the threads started");
+            }
+            return;
+        };
+        for r in at..at + len {
+            let row = &self.w[r * self.stride..(r + 1) * self.stride];
+            let mut t0 = 0;
+            while t0 < t {
+                let n = (t - t0).min(Kernels::BATCH_GROUP);
+                let mut vals = [0.0f32; Kernels::BATCH_GROUP];
+                dot(row, a, t0, &mut vals[..n]);
+                for (j, &v) in vals[..n].iter().enumerate() {
+                    // SAFETY: as above; this row is in this worker's block and
+                    // the `t` rows of the output are disjoint.
+                    unsafe { self.out.at((t0 + j) * self.rows + r, 1)[0] = v };
+                }
+                t0 += n;
+            }
         }
     }
 }

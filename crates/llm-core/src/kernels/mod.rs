@@ -29,6 +29,19 @@ const GGML_TYPE_SLOTS: usize = 31;
 /// The weight row must hold `ceil(a.k / block_len)` blocks of the kernel's
 /// type.
 pub type VecDot = fn(w: &[u8], a: ActRow<'_>) -> f32;
+
+/// Dot products of one quantized weight row with a group of a batch of int8
+/// activations: `out[j] += row . a.row(t0 + j)`.
+///
+/// This is the batched kernel, and the reason it exists is not the memory
+/// traffic (the caller's loop order decides that) but the work in a dot product
+/// that does not depend on the activations: splitting a `Q4_K` block's nibbles,
+/// unpacking its 6-bit scales, building the scale vectors. Per token that is
+/// about half of what a block costs; per group it is paid once.
+///
+/// `out` is accumulated into rather than assigned, so a caller must zero it.
+pub type VecDotBatch = fn(w: &[u8], a: &Activations, t0: usize, out: &mut [f32]);
+
 /// The instruction set the kernels were resolved to.
 ///
 /// Ordered weakest to strongest; [`Kernels::detect`] picks the strongest tier
@@ -63,9 +76,22 @@ pub struct Kernels {
     /// Indexed by the ggml type discriminant. `None` means the product path has
     /// no dequant-free kernel for it.
     dots: [Option<VecDot>; GGML_TYPE_SLOTS],
+    /// The batched kernels, same indexing. `None` means this type has no
+    /// batched kernel on this tier, and a batch runs it one row at a time
+    /// through `dots`, which is correct and slower.
+    batched: [Option<VecDotBatch>; GGML_TYPE_SLOTS],
 }
 
 impl Kernels {
+    /// Activation rows a batched kernel takes in one call.
+    ///
+    /// The group is what divides the per-block unpacking, so bigger is better,
+    /// up to where the caller's outputs stop fitting a small stack array. At 16
+    /// the unpacking is a sixteenth of its per-token cost, which is within a
+    /// couple of per cent of what an unbounded group could reach, and a longer
+    /// batch is run as several groups.
+    pub const BATCH_GROUP: usize = 16;
+
     /// Resolves the kernel table from the CPU features reported at runtime.
     pub fn detect() -> Self {
         Self::build(Self::best_tier())
@@ -97,6 +123,7 @@ impl Kernels {
     /// Fills the table up to `tier`, strongest kernel last.
     fn build(tier: Tier) -> Self {
         let mut dots: [Option<VecDot>; GGML_TYPE_SLOTS] = [None; GGML_TYPE_SLOTS];
+        let mut batched: [Option<VecDotBatch>; GGML_TYPE_SLOTS] = [None; GGML_TYPE_SLOTS];
         dots[GgmlType::Q4_K as usize] = Some(q4k_dot_scalar as VecDot);
         dots[GgmlType::Q6_K as usize] = Some(q6k_dot_scalar as VecDot);
         dots[GgmlType::Q8_0 as usize] = Some(q80_dot_scalar as VecDot);
@@ -107,17 +134,28 @@ impl Kernels {
                 dots[GgmlType::Q4_K as usize] = Some(avx2::q4k_dot as VecDot);
                 dots[GgmlType::Q6_K as usize] = Some(avx2::q6k_dot as VecDot);
                 dots[GgmlType::Q8_0 as usize] = Some(avx2::q80_dot as VecDot);
+                batched[GgmlType::Q4_K as usize] = Some(avx2::q4k_dot_batch as VecDotBatch);
+                batched[GgmlType::Q6_K as usize] = Some(avx2::q6k_dot_batch as VecDotBatch);
+                // No batched Q8_0: this file has none, and a kernel nobody
+                // here can measure is a second rounding behaviour to keep
+                // green for nothing.
             }
             if tier >= Tier::Avx2Vnni {
                 dots[GgmlType::Q4_K as usize] = Some(vnni::q4k_dot as VecDot);
                 dots[GgmlType::Q6_K as usize] = Some(vnni::q6k_dot as VecDot);
+                batched[GgmlType::Q4_K as usize] = Some(vnni::q4k_dot_batch as VecDotBatch);
+                batched[GgmlType::Q6_K as usize] = Some(vnni::q6k_dot_batch as VecDotBatch);
                 // Q8_0 weights are signed and VPDPBUSD needs an unsigned left
                 // operand; correcting for that costs more than the instruction
                 // saves, so this type keeps the AVX2 kernel.
             }
         }
 
-        Self { tier, dots }
+        Self {
+            tier,
+            dots,
+            batched,
+        }
     }
 
     pub fn tier(&self) -> Tier {
@@ -131,6 +169,12 @@ impl Kernels {
             .copied()
             .flatten()
             .ok_or(KernelError::UnsupportedType(ty))
+    }
+
+    /// The batched kernel for `ty` on this tier, if there is one. Also outside
+    /// the hot loop.
+    pub fn vec_dot_batch(&self, ty: GgmlType) -> Option<VecDotBatch> {
+        self.batched.get(ty as usize).copied().flatten()
     }
 
     /// `out[r] = row_r . x` for a `[k, rows]` quantized weight tensor, with the
