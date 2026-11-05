@@ -656,6 +656,12 @@ fn the_fixture_is_still_what_the_reference_produces() {
 /// write. On a partial write against a different build that is worth saying out
 /// loud, because the cases that were not regenerated came from the old one.
 ///
+/// `model` and `model_sha256` are read off the file this ran against, not
+/// written from a literal: the hash is the only field that ties the fixture to
+/// a set of weights, and one that is typed in says nothing about its own
+/// origin. A partial write against a different model file is refused outright,
+/// because two models' cases in one fixture is exactly what that field exists
+/// to rule out.
 fn merge_into_fixture(all: &[Case], fresh: &[serde_json::Value], reference: &str) {
     let path = format!("{FIXTURES}/reference_generations.json");
     let existing: Option<serde_json::Value> = std::fs::read_to_string(&path)
@@ -673,6 +679,22 @@ fn merge_into_fixture(all: &[Case], fresh: &[serde_json::Value], reference: &str
             "note: the {} case(s) already in the fixture were produced by\n  {was}\nand this \
              write records\n  {reference}\nso regenerate the rest before trusting the file",
             old.len()
+        );
+    }
+
+    let path_of_model = model_path();
+    let model_name = std::path::Path::new(&path_of_model)
+        .file_name()
+        .map_or_else(
+            || path_of_model.clone(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+    let sha = sha256_of(&path_of_model);
+    if let Some(was) = existing.as_ref().and_then(|d| d["model_sha256"].as_str()) {
+        assert!(
+            was == sha || fresh.len() == all.len(),
+            "the fixture holds cases from a model with sha256 {was} and this run used \
+             {sha}; regenerate every case, not one, or the file would describe two files"
         );
     }
 
@@ -701,8 +723,8 @@ fn merge_into_fixture(all: &[Case], fresh: &[serde_json::Value], reference: &str
             "explains; the reference disagrees with its own repacked kernels on the same",
             "prompts for the same reason."
         ],
-        "model": "Qwen3.5-4B-heretic-Q4_K_M.gguf",
-        "model_sha256": "7141a114b722c2ee90b123c853177773f8e52092f80a296d442f5c6aec43f404",
+        "model": model_name,
+        "model_sha256": sha,
         "reference": reference,
         "cases": cases,
     });
@@ -956,6 +978,31 @@ fn next_log_line(s: &str) -> Option<usize> {
         }
         j + 2 < b.len() && b[j] == b' ' && b[j + 1].is_ascii_uppercase() && b[j + 2] == b' '
     })
+}
+
+/// The model file's sha256, from `sha256sum`.
+///
+/// A process rather than a crate: this is the only hash the workspace needs,
+/// and it is needed by one ignored test that already shells out to the
+/// reference runner. Adding a dependency for it would put it in the product's
+/// lock file.
+fn sha256_of(path: &str) -> String {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| panic!("run sha256sum: {e}"));
+    assert!(
+        out.status.success(),
+        "sha256sum {path} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let hash = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("no hash in sha256sum output: {text:?}"));
+    assert_eq!(hash.len(), 64, "not a sha256: {hash:?}");
+    hash.to_string()
 }
 
 fn reference_description(bin: &Path) -> String {
