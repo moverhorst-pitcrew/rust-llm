@@ -196,6 +196,25 @@ fn the_http_surface_answers_both_endpoints_and_refuses_bad_input() {
     );
     assert!(last["choices"][0]["delta"]["content"].is_null(), "{last}");
 
+    // The deltas are the whole answer and nothing twice. Fewer events than
+    // tokens is how the fixture decodes, so this is what says that holding a
+    // token back until it decodes into something whole neither loses text nor
+    // repeats it: the same request, not streamed, has to give the same string.
+    let streamed: String = content_chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    let (_, whole) = post(
+        addr,
+        CHAT,
+        r#"{"messages":[{"role":"user","content":"hello"}],"max_tokens":12,"temperature":0}"#,
+    );
+    assert_eq!(
+        whole["choices"][0]["message"]["content"].as_str(),
+        Some(streamed.as_str()),
+        "the streamed deltas and the whole answer differ"
+    );
+
     // ------------------- a text completion, whose prompt goes in verbatim
     let (code, answer) = post(
         addr,
