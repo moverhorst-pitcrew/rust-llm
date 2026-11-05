@@ -512,7 +512,7 @@ One note per place we are behind:
   schedule: the reference turns a batched prompt into a true matrix-matrix
   multiply over a repacked weight layout, blocked in both dimensions, where this
   runner keeps the matvec shape and walks one weight row against the batch. The
-  profile says where that would have to be won: 76 per cent of a prompt token is
+  profile says where that would have to be won: 80 per cent of a prompt token is
   matmul, and at batch 16 it is compute-bound (157 MiB of
   weights per token is 7.0 GiB/s at 45 tok/s, 14 per cent of the ceiling), so
   the next factor is register blocking over several weight rows at once. That is
@@ -602,12 +602,12 @@ in a quiet window the two are 1.64 and 3.24 ms, which is the same story.
 
 What is left to win, in order:
 
-- **The matmuls other than the output head are 73 per cent of a prompt token
-  and 75 per cent of a generation token** (76 and 91 with the head). In
+- **The matmuls other than the output head are 77 per cent of a prompt token
+  and 76 per cent of a generation token** (80 and 90 with the head). In
   generation they are streaming weights and so are the ceiling itself. In the prompt they are compute, and the next factor is in the
   kernel: register blocking over several weight rows, which is the shape the
   reference's repacked GEMM has and ours does not.
-- **The output head is 16.4 per cent of a generation token** and 3.4 of a prompt
+- **The output head is 14.6 per cent of a generation token** and 3.3 of a prompt
   token, because a batch computes it once. It is a single 2560 x 248320 matmul
   over the whole embedding table and it cannot be fused with anything.
 - **The delta-net recurrence is 4.3 per cent of a prompt token**, down from 10
@@ -615,8 +615,8 @@ What is left to win, in order:
   recurrence" above. It is still the one operator a batch does not make cheaper,
   because it is sequential over tokens by construction, and what is left of it
   on generation is the state's own memory traffic rather than the loop.
-- Attention is 1.4 per cent at this context and 20 per cent at 4096; see
-  "Attention" above.
+- Attention is 1.4 per cent of a generation token at this context (1.6 of a
+  prompt token) and 20 per cent at 4096; see "Attention" above.
 
 ### The tiers against each other
 
