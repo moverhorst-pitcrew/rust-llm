@@ -180,9 +180,9 @@ is the ratio inside the pair, which the alternation is what makes sound.
 
 | commit | change | before | after |
 | --- | --- | --- | --- |
-| `2f4ae17` | the prompt goes through as a batch of tokens | 13.6 | 31.6 |
-| `9141c99` | a weight block is unpacked once per batch, not once per token | 31.6 | 44.0 |
-| `1a0f8ae` | the walk over the KV cache is tiled, once per batch | see "Attention" |
+| `c0fd536` | the prompt goes through as a batch of tokens | 13.6 | 31.6 |
+| `408dacf` | a weight block is unpacked once per batch, not once per token | 31.6 | 44.0 |
+| `1828971` | the walk over the KV cache is tiled, once per batch | see "Attention" |
 
 Generation is untouched by all three: 13.4 before, 13.3 after, and batch 1
 measures 13.9 against the 13.6 of the commit before it, both inside the spread.
@@ -242,14 +242,14 @@ context so the positions are really used:
 | 2048 | 2.92 ms (11.9%) | 24.49 ms | 12.50 ms (14.7%) | 85.11 ms |
 | 4096 | 6.49 ms (22.8%) | 28.43 ms | 18.09 ms (20.1%) | 89.83 ms |
 
-The 2048 and 4096 rows are from the commit before `1a0f8ae`, so they are the
+The 2048 and 4096 rows are from the commit before `1828971`, so they are the
 "before" of the pair below. Generation's attention cost is the KV cache's bytes
 and nothing else: at context 4096 one token reads 16 query heads times 4096
 positions times 256 lanes times 4 bytes, for keys and for values, over the eight
 full-attention blocks, which is 1.07 GB and 22 ms at the measured ceiling
 against the 18 to 19 ms measured.
 
-**Tiling the walk over KV positions landed** (`1a0f8ae`). A batch's queries read
+**Tiling the walk over KV positions landed** (`1828971`). A batch's queries read
 the same keys and values, and the job used to be one chunk per (token, head), so
 a head's span of the cache was read `t` times over. At context 4096 that span is
 8 MiB per KV head, 32 MiB for the four of them, which does not stay in the
@@ -542,7 +542,7 @@ Both tiers have the batched kernel, so this is like for like.
 
 ### Before the threading work, for comparison
 
-From commit `7de450c`, the measurement surfaces before any change to the
+From commit `85dbbad`, the measurement surfaces before any change to the
 scheduling. Generation, 4 threads, context 1024:
 
 ```
@@ -589,9 +589,9 @@ carry the pairs and the gate margins.
 
 | commit | change | 4 threads | 8 threads |
 | --- | --- | --- | --- |
-| `e1a2309` | the projections that share an input are one job, 281 jobs/token -> 161 | 8.17 -> 9.10 (+11%) | not a measurement in that window, spreads to 74% |
-| `335f6c5` | workers claim row blocks from an atomic counter instead of a static split | 9.12 -> 9.79 (+7%) | 7.63 -> 8.86 (+16%) |
-| `1cdf21b` | a sequence counter and a bounded spin instead of the two barriers | 9.64 -> 11.14 (+16%) | 9.36 -> 15.01 (+60%) |
+| `9f95131` | the projections that share an input are one job, 281 jobs/token -> 161 | 8.17 -> 9.10 (+11%) | not a measurement in that window, spreads to 74% |
+| `cf4c9c3` | workers claim row blocks from an atomic counter instead of a static split | 9.12 -> 9.79 (+7%) | 7.63 -> 8.86 (+16%) |
+| `dba9ecb` | a sequence counter and a bounded spin instead of the two barriers | 9.64 -> 11.14 (+16%) | 9.36 -> 15.01 (+60%) |
 
 Generation tok/s, context 1024, 19-token prompt, 16 generated tokens. The
 absolute level differs between rows because each row is its own window; only the
