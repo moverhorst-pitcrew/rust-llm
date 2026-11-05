@@ -180,13 +180,16 @@ Throughput, as a median of repeated runs with the spread reported, per thread
 count:
 
 ```sh
-rust-llm bench --context 1024 --threads 1,2,3,4,5,6,8 --prompt-tokens 19 \
-  --max-tokens 16 --repeats 5
+rust-llm bench --context 1024 --threads 1,2,3,4,5,6,7,8 --prompt-tokens 192 \
+  --max-tokens 16 --repeats 3
 ```
 
-The prompt is a fixed text truncated to exactly `--prompt-tokens` tokens, and
-generation runs exactly `--max-tokens` tokens through the forward pass and
-ignores stop tokens, so two runs measure the same work. The first run of each
+The prompt is a fixed text truncated to exactly `--prompt-tokens` tokens, or
+repeated if more are asked for than its 204, and generation runs exactly
+`--max-tokens` tokens through the forward pass and ignores stop tokens, so two
+runs measure the same work. The prompt is read in batches of `--batch` tokens,
+16 by default, which is what makes it faster per token than generation; a prompt
+of fewer tokens than the batch is one batch. The first run of each
 thread count is a warm-up and is not counted. Every configuration prints its
 thread count, context, prompt length, generated tokens, kernel tier, the cgroup
 CPU quota and the load average before and after, because this box is shared and
@@ -195,7 +198,7 @@ a number without those is not comparable with another one.
 Where the time goes, per operator, for the prompt phase and for generation:
 
 ```sh
-rust-llm profile --context 1024 --threads 4 --prompt-tokens 19 --max-tokens 16
+rust-llm profile --context 1024 --threads 8 --prompt-tokens 192 --max-tokens 8
 ```
 
 What the machine can stream from memory, which is the ceiling batch-1
