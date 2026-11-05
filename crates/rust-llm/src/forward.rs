@@ -1133,7 +1133,16 @@ impl Exec<'_, '_> {
                     let out = &mut out[i * s..][..s];
                     let (from, to) = ((live + i) % slots, (live + i + 1) % slots);
                     if from == to {
-                        delta_net(&mut ring[from * s * s..][..s * s], q, k, v, g, beta, scale, out);
+                        delta_net(
+                            &mut ring[from * s * s..][..s * s],
+                            q,
+                            k,
+                            v,
+                            g,
+                            beta,
+                            scale,
+                            out,
+                        );
                     } else {
                         let (prev, next) = ring_pair(ring, s * s, from, to);
                         delta_net_into(prev, next, q, k, v, g, beta, scale, out);

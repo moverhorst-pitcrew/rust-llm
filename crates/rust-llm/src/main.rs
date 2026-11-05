@@ -255,6 +255,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         timings.generate_time.as_secs_f64(),
         timings.generate_per_second(),
     );
+    // Printed for any prompt, because what a draft source is worth depends on
+    // the text: this is how to see whether a prompt of your own is one
+    // speculation helps with.
+    if args.speculate > 0 {
+        eprintln!("speculation: {}", timings.speculation.report());
+    }
     if let Some(peak) = peak_rss_kib() {
         eprintln!(
             "peak RSS {peak} KiB ({:.2} GiB)",
@@ -362,10 +368,12 @@ fn serve(
         thinking: args.thinking,
         sampling: args.sampling,
         seed: args.seed,
+        speculate: args.speculate,
     };
     eprintln!(
         "loaded in {:.2}s. defaults: max-tokens {}, thinking {}, temperature {}, \
-         top-k {}, top-p {}, min-p {}, repeat penalty {} over {}, seed {}",
+         top-k {}, top-p {}, min-p {}, repeat penalty {} over {}, seed {}, \
+         speculate {}",
         load.as_secs_f64(),
         defaults.max_tokens,
         defaults.thinking,
@@ -379,6 +387,7 @@ fn serve(
             Some(seed) => seed.to_string(),
             None => "from entropy, per request".to_string(),
         },
+        defaults.speculate,
     );
     // Last, and with the address the listener actually got, so that `--port 0`
     // is usable and a client can treat this line as "the server is up".

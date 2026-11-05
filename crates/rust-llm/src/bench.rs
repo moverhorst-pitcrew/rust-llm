@@ -20,8 +20,9 @@
 use std::time::{Duration, Instant};
 
 use crate::forward::Runner;
+use crate::generate::{Speculated, Stop, generate};
 use crate::model::Model;
-use crate::sample::argmax;
+use crate::sample::{Sampler, argmax};
 
 /// The text every bench prompt is taken from, truncated to the requested
 /// token count. Fixed on purpose: a prompt that changes changes the numbers.
@@ -96,6 +97,7 @@ pub fn sweep(model: &Model<'_>, prompt: &[u32], threads: &[usize], opts: &Option
         if opts.speculate > 0 {
             let token = median(&generate_rate).recip() * 1e3;
             verify_rows(model, prompt, nth, opts, token);
+            speculated(model, prompt, nth, opts);
         }
     }
     // Printed once, not per configuration: `VmHWM` is a high-water mark for
@@ -167,6 +169,67 @@ fn verify_rows(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options
         first - plain,
         (first - plain) / plain * 100.0,
     );
+}
+
+/// Generation through the accept loop with the drafter on, against the same
+/// loop with it off, in one window and on one runner.
+///
+/// The pair is what a speed-up is: both rows run `generate` on the same runner,
+/// so the ring is allocated and written in both and the only difference between
+/// them is whether drafts are offered. What having the ring at all costs is the
+/// separate pair at the end of [`verify_rows`], and what the whole feature
+/// costs against a build without it is the `generation` row above, which is
+/// today's loop on a runner with a single state buffer.
+///
+/// Greedy, because the acceptance of a draft is a property of the model and the
+/// text and not of a seed, and stop tokens are honoured rather than ignored, so
+/// a run that ends early is reported with the tokens it produced. The histogram
+/// is summed over the repeats.
+fn speculated(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options) {
+    let mut runner =
+        Runner::with_speculation(model, opts.context, threads, opts.batch, opts.speculate);
+    for (label, draft) in [("sequential", 0), ("speculated", opts.speculate)] {
+        assert!(runner.set_draft(draft), "the ring was sized for this draft");
+        // Not counted, and once per draft length: the first run faults in the
+        // slots this draft length is the first to touch.
+        let _ = generated(&mut runner, model, prompt, opts.generate);
+        let mut rates = Vec::new();
+        let mut tally = Speculated::default();
+        let mut produced = 0;
+        let mut stopped = Stop::MaxTokens;
+        for _ in 0..opts.repeats {
+            let (n, secs, stop, spec) = generated(&mut runner, model, prompt, opts.generate);
+            rates.push(rate(n, Duration::from_secs_f64(secs)));
+            tally.plain += spec.plain;
+            tally.offered += spec.offered;
+            for (a, b) in tally.accepted.iter_mut().zip(spec.accepted) {
+                *a += b;
+            }
+            (produced, stopped) = (n, stop);
+        }
+        println!("  {label}  {}", summary(&rates));
+        if draft > 0 {
+            println!("    {produced} tokens, {stopped:?}, {}", tally.report());
+        }
+    }
+}
+
+/// One generation run through [`generate`], from a fresh cache and the prompt.
+fn generated(
+    runner: &mut Runner<'_>,
+    model: &Model<'_>,
+    prompt: &[u32],
+    tokens: usize,
+) -> (usize, f64, Stop, Speculated) {
+    runner.reset();
+    let mut sampler = Sampler::greedy(model.vocab());
+    let (ids, stop, timings) = generate(runner, &mut sampler, prompt, tokens, |_| true);
+    (
+        ids.len(),
+        timings.generate_time.as_secs_f64(),
+        stop,
+        timings.speculation,
+    )
 }
 
 /// The median of `repeats` verification batches of `rows` rows, from a fresh
