@@ -342,7 +342,7 @@ assumed: a batch of 1 reads a prompt at 13.9 tok/s against the 13.6 of the
 commit before the batched path, inside the spread, and
 `greedy_output_is_unchanged` holds.
 
-Prompt tok/s went from 13.6 to 44.0 at 8 threads, 3.3 times generation.
+Prompt tok/s went from 13.6 to 47.2 at 8 threads, 3.2 times generation.
 `docs/benchmarks.md` has the per-commit pairs and the batch-size curve.
 
 **What does not batch, and why that is the whole correctness story.** Two things
@@ -1209,7 +1209,7 @@ the positions are used.
 
 Prompt processing was no faster per token than generation in those rows,
 because the prompt went through the same single-token path. That is fixed: it is
-3.3 times generation at 8 threads now, and the numbers are in
+3.2 times generation at 8 threads now, and the numbers are in
 `docs/benchmarks.md`. The peak RSS numbers above still hold to within 10 MiB,
 because the batched path's extra scratch is a few megabytes against 2.5
 gibibytes of weights.
@@ -1236,8 +1236,8 @@ measured now, at about 48.6 GiB/s and so 19 generation tok/s on this box, and
 `docs/benchmarks.md` has the comparison against the reference per thread count
 from `llama-bench` rather than from one `llama-completion` run: generation is
 within 11 per cent of it at every thread count from 1 to 8 with the flags
-matched and ahead at 6, 7 and 8, and the prompt is a factor 2.1 behind, down
-from the factor 4 to 7 it was before the prompt was batched. What is left on the
+matched and ahead at 8, and the prompt is a factor 2.1 to 2.3 behind, down from
+the factor 4 to 7 it was before the prompt was batched. What is left on the
 prompt side is a kernel shape, not a schedule: the reference turns a batch into
 a true matrix-matrix multiply over a repacked weight layout.
 
@@ -1252,7 +1252,7 @@ no signal in it. Measured on this box:
 | `cargo test --workspace --all-targets` (the default set, no weights needed) | 47 s cold, 25 s warm |
 | of which `tests/sample.rs`, `tests/sample_allocations.rs` and `tests/tiny_model.rs` | 2 s, 2 s, 3 s |
 | of which `tests/serve.rs`, which starts the server and drives both endpoints | 2 s |
-| the whole `--ignored` set, which is both gates and everything else needing weights | 3:30 |
+| the whole `--ignored` set, one test at a time, which is both gates and everything else needing weights | 4:50 |
 | gate: `every_next_token_matches_the_reference` | 2:01 |
 | gate: `greedy_output_is_unchanged` | 2:10 |
 | gate: `resetting_the_caches_is_the_same_as_a_fresh_runner` | 27 s |
@@ -1269,14 +1269,18 @@ no signal in it. Measured on this box:
 | fixture re-derivation, all ten prompts | about 4 min |
 | per-layer trace comparison against the reference | 40 s |
 
-The per-test times are from running them one at a time. In one command the
-harness runs four of them at once, each asking for all 8 threads of the quota,
-so they finish together in about the time of the slowest rather than in the sum;
-the whole set took 3:30 on a box that was busy with other work at the time, 210
-seconds with the batched-prompt test added to it on a quiet one, and the
-threading changes on the throughput branch took it from 232 to 140 seconds. Three of its tok/s figures are therefore a quarter of what
-`bench` reports, which is the oversubscription and not a regression: the gates
-measure agreement, `docs/benchmarks.md` measures speed.
+The per-test times are from running them one at a time, which is also the only
+way to run the set: `--test-threads=1`. Left to itself the harness starts six of
+these at once, each loading the model and starting a worker pool on all 8
+threads of the quota, which was measured at 40 threads and 17 GiB resident
+inside a quota of 8 CPUs. That is slower than running them in sequence, not
+faster, and nothing measured next to it means anything. In sequence the set is
+about ten and a half minutes, of which the two gates and the fixture
+re-derivation are nine.
+
+A tok/s figure printed by one of those tests is not a speed measurement even
+then: the gates measure agreement with the timers incidental, and
+`docs/benchmarks.md` measures speed.
 
 The measurement rows are there because the budget rule is per step: nothing in
 that list is a wait with no signal in it, and the two longest ones are the price

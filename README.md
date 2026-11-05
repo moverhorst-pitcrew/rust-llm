@@ -159,8 +159,14 @@ weights by a tiny committed model the tests write themselves. With the real
 model on disk (see `docs/models.md`):
 
 ```sh
-cargo test --workspace --release -- --ignored --nocapture
+cargo test --workspace --release -- --ignored --nocapture --test-threads=1
 ```
+
+`--test-threads=1` is not optional for that set. Every test in it loads the
+model and starts a worker pool on all cores, so the harness's default of running
+them in parallel oversubscribes the machine several times over: it makes the run
+slower, it multiplies the resident memory by the number of tests, and any
+measurement taken at the same time is meaningless.
 
 One test in that set, `the_fixture_is_still_what_the_reference_produces`, also
 needs a built reference runner and fails without one:
