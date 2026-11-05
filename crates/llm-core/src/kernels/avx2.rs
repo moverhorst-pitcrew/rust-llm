@@ -26,8 +26,12 @@ unsafe fn q4k_block(b: &[u8], ab: &ActBlock) -> f32 {
     let dmin = read_f16(b, 2);
     let scales = &b[4..16];
 
-    let mut imin = 0i32;
-    let isum = unsafe {
+    let (mut scs, mut mins) = ([0u8; 8], [0u8; 8]);
+    for j in 0..8 {
+        (scs[j], mins[j]) = q4k_scale_min(j, scales);
+    }
+
+    let (isum, imin) = unsafe {
         let qs = b[16..].as_ptr();
         let aqs = ab.qs.as_ptr();
         let low_nibble = _mm256_set1_epi8(0x0F);
@@ -40,18 +44,16 @@ unsafe fn q4k_block(b: &[u8], ab: &ActBlock) -> f32 {
                 _mm256_and_si256(_mm256_srli_epi16::<4>(qv), low_nibble),
             ];
             for (half, qw) in halves.into_iter().enumerate() {
-                let (sc, m) = q4k_scale_min(2 * t + half, scales);
-                let j = 2 * t + half;
-                imin += m as i32 * (ab.bsums[j * 2] as i32 + ab.bsums[j * 2 + 1] as i32);
                 let av = _mm256_loadu_si256(aqs.add(64 * t + 32 * half).cast());
                 // Weights are genuinely unsigned 4-bit, so VPMADDUBSW needs no
                 // sign juggling. Folding the 6-bit scale into the i16 products
                 // keeps one i32 accumulator for the whole super-block.
                 let p16 = _mm256_maddubs_epi16(qw, av);
-                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, _mm256_set1_epi16(sc as i16)));
+                let sc = scs[2 * t + half] as i16;
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, _mm256_set1_epi16(sc)));
             }
         }
-        hsum_i32(acc)
+        (hsum_i32(acc), q4k_imin(q4k_mins_vec(&mins), &ab.bsums))
     };
     ab.d * (d * isum as f32 - dmin * imin as f32)
 }
@@ -144,22 +146,19 @@ unsafe fn q4k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
     let mut mins = [0u8; 8];
     unsafe {
         q4k_unpack(b, &mut qw, &mut scs, &mut mins);
+        let mins_vec = q4k_mins_vec(&mins);
         for (j, o) in out.iter_mut().enumerate() {
             let ab = &a.row(t0 + j).blocks[ib];
             let aqs = ab.qs.as_ptr();
             let mut acc = _mm256_setzero_si256();
-            let mut imin = 0i32;
-            for sb in 0..8 {
+            for (sb, &sc) in scs.iter().enumerate() {
                 let p16 = _mm256_maddubs_epi16(
                     _mm256_loadu_si256(qw.as_ptr().add(32 * sb).cast()),
                     _mm256_loadu_si256(aqs.add(32 * sb).cast()),
                 );
-                acc = _mm256_add_epi32(
-                    acc,
-                    _mm256_madd_epi16(p16, _mm256_set1_epi16(scs[sb] as i16)),
-                );
-                imin += mins[sb] as i32 * (ab.bsums[sb * 2] as i32 + ab.bsums[sb * 2 + 1] as i32);
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, _mm256_set1_epi16(sc as i16)));
             }
+            let imin = q4k_imin(mins_vec, &ab.bsums);
             *o += ab.d * (d * hsum_i32(acc) as f32 - dmin * imin as f32);
         }
     }
@@ -179,6 +178,7 @@ unsafe fn q6k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
     let mut qw = [0u8; QK_K];
     unsafe {
         q6k_unpack(b, &mut qw);
+        let scales_vec = q6k_scales_vec(sc);
         for (j, o) in out.iter_mut().enumerate() {
             let ab = &a.row(t0 + j).blocks[ib];
             let aqs = ab.qs.as_ptr();
@@ -197,10 +197,7 @@ unsafe fn q6k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
                 );
                 acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, scv));
             }
-            let mut bias = 0i32;
-            for (i, s) in sc.iter().enumerate() {
-                bias += *s as i8 as i32 * ab.bsums[i] as i32;
-            }
+            let bias = q6k_bias(scales_vec, &ab.bsums);
             *o += ab.d * d * (hsum_i32(acc) - 32 * bias) as f32;
         }
     }
@@ -255,10 +252,7 @@ unsafe fn q6k_block(b: &[u8], ab: &ActBlock) -> f32 {
         hsum_i32(acc)
     };
 
-    let mut bias = 0i32;
-    for (i, s) in sc.iter().enumerate() {
-        bias += *s as i8 as i32 * ab.bsums[i] as i32;
-    }
+    let bias = unsafe { q6k_bias(q6k_scales_vec(sc), &ab.bsums) };
     ab.d * d * (isum - 32 * bias) as f32
 }
 
@@ -293,6 +287,60 @@ unsafe fn q80_row(w: &[u8], a: ActRow<'_>) -> f32 {
             acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), scale, acc);
         }
         hsum_f32(acc)
+    }
+}
+
+/// The eight `Q4_K` sub-block minima as sixteen i16, each one twice.
+///
+/// Lane `2j` and `2j+1` both hold `mins[j]`, which is the layout
+/// [`q4k_imin`] needs. It depends only on the weight block, so a batch builds
+/// it once per super-block instead of once per token.
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn q4k_mins_vec(mins: &[u8; 8]) -> __m256i {
+    unsafe {
+        let v = _mm_loadl_epi64(mins.as_ptr().cast());
+        _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(v, v))
+    }
+}
+
+/// `sum_j mins[j] * (bsums[2j] + bsums[2j+1])`, the `Q4_K` minimum term.
+///
+/// One `VPMADDWD` against the activation group sums: lane `j` of its result is
+/// `mins[j] * bsums[2j] + mins[j] * bsums[2j+1]`, so the eight lanes sum to
+/// what the scalar loop accumulated one sub-block at a time. The products are at
+/// most `63 * 16 * 127` and there are two per lane, well inside i32, and integer
+/// addition is associative, so this is the same integer rather than a close one.
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn q4k_imin(mins_vec: __m256i, bsums: &[i16; QK_K / 16]) -> i32 {
+    unsafe {
+        hsum_i32(_mm256_madd_epi16(
+            _mm256_loadu_si256(bsums.as_ptr().cast()),
+            mins_vec,
+        ))
+    }
+}
+
+/// The sixteen `Q6_K` sub-block scales sign-extended to i16, for [`q6k_bias`].
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn q6k_scales_vec(sc: &[u8]) -> __m256i {
+    unsafe { _mm256_cvtepi8_epi16(_mm_loadu_si128(sc.as_ptr().cast())) }
+}
+
+/// `sum_i sc[i] * bsums[i]`, the term the constant -32 of `Q6_K` collapses into.
+///
+/// Same `VPMADDWD` as [`q4k_imin`], with each scale meeting one group sum
+/// instead of two. Exact for the same reason.
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn q6k_bias(scales_vec: __m256i, bsums: &[i16; QK_K / 16]) -> i32 {
+    unsafe {
+        hsum_i32(_mm256_madd_epi16(
+            _mm256_loadu_si256(bsums.as_ptr().cast()),
+            scales_vec,
+        ))
     }
 }
 

@@ -9,7 +9,9 @@
 
 use std::arch::x86_64::*;
 
-use super::avx2::{hsum_i32, q4k_unpack, q6k_unpack};
+use super::avx2::{
+    hsum_i32, q4k_imin, q4k_mins_vec, q4k_unpack, q6k_bias, q6k_scales_vec, q6k_unpack,
+};
 use crate::quant::{
     ActBlock, ActRow, Activations, Q4_K_BYTES, Q6_K_BYTES, QK_K, q4k_scale_min, read_f16,
 };
@@ -46,11 +48,11 @@ unsafe fn q4k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
                 s1, s1, s1, s1, s0, s0, s0, s0, s1, s1, s1, s1, s0, s0, s0, s0,
             );
         }
+        let mins_vec = q4k_mins_vec(&mins);
         for (j, o) in out.iter_mut().enumerate() {
             let ab = &a.row(t0 + j).blocks[ib];
             let aqs = ab.qs.as_ptr();
             let mut acc = zero;
-            let mut imin = 0i32;
             for (t, &scv) in scv.iter().enumerate() {
                 let dp0 = _mm256_dpbusd_avx_epi32(
                     zero,
@@ -63,11 +65,8 @@ unsafe fn q4k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
                     _mm256_loadu_si256(aqs.add(64 * t + 32).cast()),
                 );
                 acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_packs_epi32(dp0, dp1), scv));
-                for sb in [2 * t, 2 * t + 1] {
-                    imin +=
-                        mins[sb] as i32 * (ab.bsums[sb * 2] as i32 + ab.bsums[sb * 2 + 1] as i32);
-                }
             }
+            let imin = q4k_imin(mins_vec, &ab.bsums);
             *o += ab.d * (d * hsum_i32(acc) as f32 - dmin * imin as f32);
         }
     }
@@ -96,6 +95,7 @@ unsafe fn q6k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
             let s1 = sc[2 * g + 1] as i8 as i32;
             *v = _mm256_set_epi32(s1, s1, s1, s1, s0, s0, s0, s0);
         }
+        let scales_vec = q6k_scales_vec(sc);
         for (j, o) in out.iter_mut().enumerate() {
             let ab = &a.row(t0 + j).blocks[ib];
             let aqs = ab.qs.as_ptr();
@@ -108,10 +108,7 @@ unsafe fn q6k_block_batch(b: &[u8], a: &Activations, t0: usize, ib: usize, out: 
                 );
                 acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(dp, scv));
             }
-            let mut bias = 0i32;
-            for (i, s) in sc.iter().enumerate() {
-                bias += *s as i8 as i32 * ab.bsums[i] as i32;
-            }
+            let bias = q6k_bias(scales_vec, &ab.bsums);
             *o += ab.d * d * (hsum_i32(acc) - 32 * bias) as f32;
         }
     }
@@ -131,8 +128,12 @@ unsafe fn q4k_block(b: &[u8], ab: &ActBlock) -> f32 {
     let dmin = read_f16(b, 2);
     let scales = &b[4..16];
 
-    let mut imin = 0i32;
-    let isum = unsafe {
+    let (mut scs, mut mins) = ([0u8; 8], [0u8; 8]);
+    for j in 0..8 {
+        (scs[j], mins[j]) = q4k_scale_min(j, scales);
+    }
+
+    let (isum, imin) = unsafe {
         let qs = b[16..].as_ptr();
         let aqs = ab.qs.as_ptr();
         let low_nibble = _mm256_set1_epi8(0x0F);
@@ -144,11 +145,6 @@ unsafe fn q4k_block(b: &[u8], ab: &ActBlock) -> f32 {
             // 32 bytes, so they are done as a pair.
             let lo = _mm256_and_si256(qv, low_nibble);
             let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(qv), low_nibble);
-            let (sc0, m0) = q4k_scale_min(2 * t, scales);
-            let (sc1, m1) = q4k_scale_min(2 * t + 1, scales);
-            for (j, m) in [(2 * t, m0), (2 * t + 1, m1)] {
-                imin += m as i32 * (ab.bsums[j * 2] as i32 + ab.bsums[j * 2 + 1] as i32);
-            }
             let dp0 = _mm256_dpbusd_avx_epi32(zero, lo, _mm256_loadu_si256(aqs.add(64 * t).cast()));
             let dp1 =
                 _mm256_dpbusd_avx_epi32(zero, hi, _mm256_loadu_si256(aqs.add(64 * t + 32).cast()));
@@ -158,13 +154,13 @@ unsafe fn q4k_block(b: &[u8], ab: &ActBlock) -> f32 {
             // VPMULLD per sub-block. VPACKSSDW interleaves per 128-bit half:
             // [dp0[0..4], dp1[0..4] | dp0[4..8], dp1[4..8]].
             let packed = _mm256_packs_epi32(dp0, dp1);
-            let (s0, s1) = (sc0 as i16, sc1 as i16);
+            let (s0, s1) = (scs[2 * t] as i16, scs[2 * t + 1] as i16);
             let scv = _mm256_set_epi16(
                 s1, s1, s1, s1, s0, s0, s0, s0, s1, s1, s1, s1, s0, s0, s0, s0,
             );
             acc = _mm256_add_epi32(acc, _mm256_madd_epi16(packed, scv));
         }
-        hsum_i32(acc)
+        (hsum_i32(acc), q4k_imin(q4k_mins_vec(&mins), &ab.bsums))
     };
     ab.d * (d * isum as f32 - dmin * imin as f32)
 }
@@ -215,9 +211,6 @@ unsafe fn q6k_block(b: &[u8], ab: &ActBlock) -> f32 {
         hsum_i32(acc)
     };
 
-    let mut bias = 0i32;
-    for (i, s) in sc.iter().enumerate() {
-        bias += *s as i8 as i32 * ab.bsums[i] as i32;
-    }
+    let bias = unsafe { q6k_bias(q6k_scales_vec(sc), &ab.bsums) };
     ab.d * d * (isum - 32 * bias) as f32
 }
