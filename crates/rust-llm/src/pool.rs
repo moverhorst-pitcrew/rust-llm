@@ -31,6 +31,8 @@ struct Shared {
     /// The barrier is the only synchronisation this needs.
     job: UnsafeCell<Option<*const Job>>,
     stop: AtomicBool,
+    /// Set by a worker whose job panicked, read by the submitter after `end`.
+    failed: AtomicBool,
 }
 
 // SAFETY: `job` is only written between two barriers that every thread passes
@@ -54,6 +56,7 @@ impl Pool {
             end: Barrier::new(threads),
             job: UnsafeCell::new(None),
             stop: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
         });
         let workers = (1..threads)
             .map(|ith| {
@@ -76,6 +79,15 @@ impl Pool {
     }
 
     /// Runs `f` on every thread and waits for all of them.
+    ///
+    /// A panic in `f` is carried across the barrier rather than out of it. If
+    /// the panic escaped here directly, this thread would never reach `end`,
+    /// the workers would wait on it forever and `Drop` would then wait on
+    /// `start`, so an index error in the forward pass would be a hang instead
+    /// of a stack trace. The panic is therefore caught, every thread is let
+    /// through `end`, and only then is it resumed. The buffers the job was
+    /// writing are left half finished, which is why this resumes rather than
+    /// reporting: the caller's results are not usable either way.
     pub fn run(&self, f: &(dyn Fn(usize, usize) + Sync)) {
         if self.threads == 1 {
             f(0, 1);
@@ -92,8 +104,16 @@ impl Pool {
             *self.shared.job.get() = Some(erased);
         }
         self.shared.start.wait();
-        f(0, self.threads);
+        let mine = catch(|| f(0, self.threads));
         self.shared.end.wait();
+        if let Err(panic) = mine {
+            std::panic::resume_unwind(panic);
+        }
+        // A worker's panic has already printed its own message and location.
+        assert!(
+            !self.shared.failed.swap(false, Ordering::Relaxed),
+            "a worker thread panicked in this job; its panic is logged above"
+        );
     }
 
     /// `out[r] = row_r . a` for a `[k, out.len()]` quantized weight tensor,
@@ -189,6 +209,17 @@ impl Drop for Pool {
     }
 }
 
+/// Runs `f`, returning its panic instead of unwinding.
+///
+/// The job is behind a shared reference and holds raw pointers, so it is not
+/// `UnwindSafe` by the compiler's reckoning. What that lint protects against is
+/// observing half-written state after catching a panic; here the panic is
+/// resumed or turned into one as soon as the barrier is passed, and nothing
+/// reads those buffers in between.
+fn catch<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+}
+
 fn worker(shared: &Shared, ith: usize, nth: usize) {
     loop {
         shared.start.wait();
@@ -198,7 +229,12 @@ fn worker(shared: &Shared, ith: usize, nth: usize) {
         // SAFETY: see `Pool::run`. The job was published before this barrier
         // and stays alive until every thread has passed `end`.
         let job = unsafe { (*shared.job.get()).expect("a job was published") };
-        unsafe { (*job)(ith, nth) };
+        if catch(|| unsafe { (*job)(ith, nth) }).is_err() {
+            // The submitter turns this into its own panic after `end`. This
+            // thread must stay alive and reach the barrier, or everyone else
+            // waits on it forever.
+            shared.failed.store(true, Ordering::Relaxed);
+        }
         shared.end.wait();
     }
 }
@@ -251,7 +287,40 @@ fn split(n: usize, ith: usize, nth: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::split;
+    use super::{Pool, split};
+
+    /// A failing job has to come out as a panic on the submitting thread, from
+    /// either side of the pool, and leave the pool usable.
+    ///
+    /// Before this the pool deadlocked instead: the panic skipped the second
+    /// barrier, every other thread waited on it, and `Drop` then waited on the
+    /// first one. A test that hangs is the symptom, which is why this test is
+    /// worth its noise.
+    #[test]
+    fn a_panicking_job_panics_the_submitter_instead_of_hanging() {
+        let pool = Pool::new(4);
+        // The panics below are expected, so their messages are not printed.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        for culprit in [0usize, 1, 3] {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.run(&|ith, _| assert!(ith != culprit, "worker {ith} is the culprit"));
+            }));
+            assert!(out.is_err(), "a panic on thread {culprit} was swallowed");
+        }
+
+        std::panic::set_hook(hook);
+
+        // And the pool still works, which is what says the failed jobs left no
+        // thread behind a barrier.
+        let mut seen = vec![0.0f32; 4];
+        let mut scratch = vec![0.0f32; 4];
+        pool.chunks(&mut seen, 1, &mut scratch, 1, |i, o, _| {
+            o[0] = i as f32 + 1.0
+        });
+        assert_eq!(seen, vec![1.0, 2.0, 3.0, 4.0]);
+    }
 
     #[test]
     fn split_partitions_the_range() {

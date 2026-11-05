@@ -383,6 +383,16 @@ and per-head chunks where one attention head or one delta-net value head owns
 one output chunk and one piece of scratch. Everything else is elementwise and
 cheaper than a barrier.
 
+**A panic in a job is carried across the barrier, not out of it.** Both sides
+run the job inside `catch_unwind`; the submitter resumes its panic only after
+`end.wait()`, and a worker that panicked sets a flag the submitter turns into a
+panic of its own. Letting the panic escape directly would leave every other
+thread waiting on a barrier the panicking one never reaches, and `Drop` waiting
+on the other one, so a failed assert in the forward pass would be a hang rather
+than a stack trace. The buffers are half written at that point, which is why
+this resumes the panic instead of reporting it: the caller's results are not
+usable either way.
+
 **The split cannot change the result.** Each output row and each head is
 computed by exactly one worker from start to finish, so no reduction crosses a
 thread and the output does not depend on the thread count. A test asserts that
