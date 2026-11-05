@@ -515,40 +515,29 @@ fn the_system_prompt_and_the_thinking_toggle_reach_the_model() {
          closes the think block itself, which is more tokens, not fewer"
     );
 
-    // And on chat, where the same flags go through a different path.
-    let chat_plain = run(
-        &tiny.model,
-        &[
-            "chat",
-            "--max-tokens",
-            "4",
-            "--context",
-            "512",
-            "--temperature",
-            "0",
-        ],
-        "hello\n/exit\n",
-    );
-    let chat_system = run(
-        &tiny.model,
-        &[
-            "chat",
-            "--max-tokens",
-            "4",
-            "--context",
-            "512",
-            "--temperature",
-            "0",
-            "--system",
-            "you are a teapot",
-        ],
-        "hello\n/exit\n",
-    );
-    assert_ne!(
-        chat_plain.ok("chat without a system prompt"),
-        chat_system.ok("chat with a system prompt"),
-        "--system did not reach chat"
-    );
+    // And on chat, where the same two flags go through a different path.
+    let chat = [
+        "chat",
+        "--max-tokens",
+        "4",
+        "--context",
+        "512",
+        "--temperature",
+        "0",
+    ];
+    let plain_chat = run(&tiny.model, &chat, "hello\n/exit\n")
+        .ok("chat with neither flag")
+        .to_string();
+    for extra in [vec!["--system", "you are a teapot"], vec!["--no-think"]] {
+        let mut full: Vec<&str> = chat.to_vec();
+        full.extend(&extra);
+        let out = run(&tiny.model, &full, "hello\n/exit\n");
+        assert_ne!(
+            out.ok("chat with the flag"),
+            plain_chat,
+            "{extra:?} did not reach chat"
+        );
+    }
 }
 
 /// The library's own generation loop against the fixture, so the sampler is
