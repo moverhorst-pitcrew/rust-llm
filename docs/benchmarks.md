@@ -395,7 +395,7 @@ instrument.
 
 The memory is not the argument either way: an f16 cache saves 90 to 180 MiB of
 a 2.75 to 3.00 GiB peak, of which 2.52 GiB is the mapped model file. See
-"Memory" above.
+"Memory" below.
 
 What would reopen it: a requirement for generation throughput at a full long
 context, arriving as a `--kv-dtype` option with f32 the gated default rather
@@ -549,7 +549,7 @@ window's, and generation is the half that shows it: it is bandwidth-bound, so
 the workers get descheduled and the pool's join row absorbs the difference. The
 comparable thing is a pair measured in one window, and the only operator this
 branch's last change moves has its pair under "Blocking the delta-net
-recurrence" below, where `4ebb916` gave 75.82 ms against the 75.91 here.
+recurrence" above, where `4ebb916` gave 75.82 ms against the 75.91 here.
 
 ```
 profile: prompt, 192 tokens, 8 threads, context 1024, batch 16, tier avx2+vnni
@@ -612,7 +612,7 @@ What is left to win, in order:
   over the whole embedding table and it cannot be fused with anything.
 - **The delta-net recurrence is 4.3 per cent of a prompt token**, down from 10
   before it was blocked over its output components; see "Blocking the delta-net
-  recurrence" below. It is still the one operator a batch does not make cheaper,
+  recurrence" above. It is still the one operator a batch does not make cheaper,
   because it is sequential over tokens by construction, and what is left of it
   on generation is the state's own memory traffic rather than the loop.
 - Attention is 1.4 per cent at this context and 20 per cent at 4096; see
