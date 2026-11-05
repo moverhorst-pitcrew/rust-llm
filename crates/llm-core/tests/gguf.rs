@@ -212,10 +212,11 @@ fn reads_every_value_type() {
     // Integers widen, everything else refuses.
     assert_eq!(g.meta_u64("a.u8").unwrap(), 1);
     assert_eq!(g.meta_u64("a.u64").unwrap(), 8);
-    assert!(matches!(
-        g.meta_u64("a.i8"),
-        Err(GgufError::MetaTypeMismatch { .. })
-    ));
+    let err = g.meta_u64("a.i8").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        r#"metadata key "a.i8" is i8, expected non-negative integer"#
+    );
     assert!(matches!(
         g.meta_str("a.u8"),
         Err(GgufError::MetaTypeMismatch { .. })

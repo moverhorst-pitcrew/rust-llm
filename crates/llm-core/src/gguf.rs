@@ -381,7 +381,8 @@ impl Gguf {
 
     pub fn meta_u64(&self, key: &str) -> Result<u64> {
         let v = self.meta_required(key)?;
-        v.as_u64().ok_or_else(|| Self::mismatch(key, "integer", v))
+        v.as_u64()
+            .ok_or_else(|| Self::mismatch(key, "non-negative integer", v))
     }
 
     pub fn meta_u32(&self, key: &str) -> Result<u32> {

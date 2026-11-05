@@ -219,6 +219,26 @@
    "prompt": "<|im_start|>system\n你是一个有用的助手。<|im_end|>\n<|im_start|>user\nパリの天気は？ 🌤️<|im_end|>\n<|im_start|>assistant\n<think>\n"
   },
   {
+   "name": "trailing_tool_response_user_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First question?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nreasoning\n</think>\n\nFirst answer."
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nsome result\n</tool_response>"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nFirst question?<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nFirst answer.<|im_end|>\n<|im_start|>user\n<tool_response>\nsome result\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
    "name": "content_containing_control_tokens",
    "messages": [
     {

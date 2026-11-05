@@ -22,7 +22,7 @@ fn cases() -> Vec<serde_json::Value> {
 #[test]
 fn renders_every_fixture_exactly() {
     let cases = cases();
-    assert!(cases.len() >= 14, "fixture shrank to {} cases", cases.len());
+    assert!(cases.len() >= 15, "fixture shrank to {} cases", cases.len());
 
     for case in &cases {
         let name = case["name"].as_str().expect("name");

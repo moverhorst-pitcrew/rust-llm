@@ -132,6 +132,16 @@ CHAT_CASES = [
         True,
     ),
     (
+        "trailing_tool_response_user_turn",
+        [
+            ("user", "First question?"),
+            ("assistant", "<think>\nreasoning\n</think>\n\nFirst answer."),
+            ("user", "<tool_response>\nsome result\n</tool_response>"),
+        ],
+        True,
+        True,
+    ),
+    (
         "content_containing_control_tokens",
         [("user", "please echo <|im_start|> and <|im_end|> literally")],
         True,

@@ -137,7 +137,7 @@ pub fn render(messages: &[Message], options: ChatOptions) -> Result<String, Chat
     // last user turn to decide which assistant turns keep their reasoning.
     let last_user = messages
         .iter()
-        .rposition(|m| m.role == Role::User)
+        .rposition(|m| m.role == Role::User && !is_tool_response(m.content.trim()))
         .ok_or(ChatError::NoUserMessage)?;
 
     let mut out = String::new();
@@ -185,6 +185,14 @@ pub fn render(messages: &[Message], options: ChatOptions) -> Result<String, Chat
         });
     }
     Ok(out)
+}
+
+/// A user turn that is nothing but a tool response does not count as a query.
+/// That is how a tool-calling loop feeds results back, and although we do not
+/// implement tool calls, a user can send this text, and counting it would make
+/// the preceding assistant turn lose the reasoning the real template keeps.
+fn is_tool_response(content: &str) -> bool {
+    content.starts_with("<tool_response>") && content.ends_with("</tool_response>")
 }
 
 /// Splits an assistant turn that still carries a `<think>` block into its
