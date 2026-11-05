@@ -87,6 +87,17 @@ const CONTEXT: usize = 1024;
 /// on a scale of +/-20, with room to spare; typical margins are twenty times
 /// this.
 const INDETERMINATE: f32 = 0.25;
+/// How far a recorded margin may move before this test calls it a regression.
+///
+/// Zero would be the honest bound, because nothing in the implementation is
+/// allowed to change the arithmetic and every margin here is reproduced to the
+/// last bit today. `1e-4` instead of zero leaves room for a difference in the
+/// *reference* fixture's own last printed digit and nothing else: the four
+/// margins are 0.009 to 0.126, so a reordered reduction anywhere in the pass
+/// moves them by far more than this. A margin that moves inside the band is
+/// still a change in the arithmetic, which is why this fails rather than
+/// printing a warning.
+const MARGIN_DRIFT: f32 = 1e-4;
 
 /// The model file, from `RUST_LLM_MODEL`.
 ///
@@ -270,8 +281,9 @@ fn every_next_token_matches_the_reference() {
         for &(at, _) in &allowed {
             if !disagreed.iter().any(|&(p, _)| p == at) {
                 failures.push(format!(
-                    "{}: position {at} is recorded as indeterminate but now agrees; \
-                     regenerate the fixture",
+                    "{}: position {at} is recorded as indeterminate but now agrees, so \
+                     the arithmetic of this path has changed; bring that to a decision \
+                     rather than re-recording the fixture",
                     case.name
                 ));
             }
@@ -282,9 +294,30 @@ fn every_next_token_matches_the_reference() {
                 let was = allowed
                     .iter()
                     .find(|&&(p, _)| p == at)
-                    .map_or(f32::NAN, |&(_, m)| m);
-                moved.push(margin - was);
-                format!("at {at} margin {margin:.5} (fixture {was:.5})")
+                    .and_then(|&(_, m)| m);
+                let Some(was) = was else {
+                    failures.push(format!(
+                        "{}: position {at} is recorded as indeterminate without a margin, \
+                         so there is nothing to hold this run's {margin:.6} against; the \
+                         fixture has to carry the margin it was written with",
+                        case.name
+                    ));
+                    return format!("at {at} margin {margin:.5} (fixture has none)");
+                };
+                let drift = margin - was;
+                if drift.abs() > MARGIN_DRIFT {
+                    failures.push(format!(
+                        "{}: the margin at position {at} is {margin:.6}, where the fixture \
+                         records {was:.6}: a move of {drift:+.6}, outside the \
+                         {MARGIN_DRIFT} this test allows. Something in the pass changed \
+                         the arithmetic. Bring these numbers to a decision; the fixture \
+                         moves with one that is written down, not with a change made for \
+                         speed.",
+                        case.name
+                    ));
+                }
+                moved.push(drift);
+                format!("at {at} margin {margin:.5} (fixture {was:.5}, {drift:+.5})")
             })
             .collect();
         println!(
@@ -303,6 +336,8 @@ fn every_next_token_matches_the_reference() {
         failures.len(),
         failures.join("\n")
     );
+    // Every recorded margin was compared above, so this is a summary and not
+    // the check: `failures` already holds anything that moved too far.
     let widest = moved.iter().copied().fold(0.0f32, |m, d| m.max(d.abs()));
     println!(
         "{agreed} of {positions} next-token predictions identical to the reference, \
@@ -928,7 +963,7 @@ fn ids_of(v: &serde_json::Value) -> Vec<u32> {
 /// inside the rounding band it is. A margin that has widened is a change in
 /// the arithmetic even when the test still passes, and the only way to see
 /// that is to put the two numbers next to each other.
-fn indeterminate_positions(case: &serde_json::Value) -> Vec<(usize, f32)> {
+fn indeterminate_positions(case: &serde_json::Value) -> Vec<(usize, Option<f32>)> {
     case["indeterminate"]
         .as_array()
         .map(|a| {
@@ -936,7 +971,10 @@ fn indeterminate_positions(case: &serde_json::Value) -> Vec<(usize, f32)> {
                 .map(|e| {
                     (
                         e["at"].as_u64().expect("at") as usize,
-                        e["margin"].as_f64().unwrap_or(f64::NAN) as f32,
+                        // `Option`, not a sentinel: a fixture entry that lost
+                        // its margin has to fail the comparison below rather
+                        // than disappear into a NaN that `f32::max` drops.
+                        e["margin"].as_f64().map(|m| m as f32),
                     )
                 })
                 .collect()
