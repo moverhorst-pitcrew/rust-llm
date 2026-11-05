@@ -226,6 +226,32 @@ pub fn generate(
     sampler: &mut Sampler,
     prompt: &[u32],
     max_tokens: usize,
+    on_token: impl FnMut(u32) -> bool,
+) -> (Vec<u32>, Stop, Timings) {
+    generate_drafting(runner, sampler, prompt, max_tokens, prompt_lookup, on_token)
+}
+
+/// [`generate`] with the drafts coming from somewhere other than
+/// [`prompt_lookup`].
+///
+/// `draft_with` is handed the prompt plus everything generated so far and a
+/// buffer of `runner.draft()` tokens to fill, and returns how many it wrote,
+/// which is the same contract as [`prompt_lookup`]. It is called once per pass
+/// and must not allocate, because it sits in the generation loop.
+///
+/// This exists for two reasons and is not a strategy type: a different draft
+/// source, an MTP head being the obvious one, is a different function passed
+/// here and nothing else, and the tests need a draft source whose acceptance
+/// they choose. On the tiny fixture's random weights a natural match is never
+/// accepted, so the burst boundaries, a stop token, `max_tokens`, a cancelling
+/// `on_token` and the end of the context inside one batch, would otherwise only
+/// be reachable with the 2.7 GB model.
+pub fn generate_drafting(
+    runner: &mut Runner<'_>,
+    sampler: &mut Sampler,
+    prompt: &[u32],
+    max_tokens: usize,
+    mut draft_with: impl FnMut(&[u32], &mut [u32]) -> usize,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Stop, Timings) {
     assert!(!prompt.is_empty(), "the prompt is empty");
@@ -336,7 +362,7 @@ pub fn generate(
         let n = if draft == 0 || room < 2 {
             0
         } else {
-            prompt_lookup(&history, &mut drafts[..draft.min(room - 1)])
+            draft_with(&history, &mut drafts[..draft.min(room - 1)])
         };
         if n == 0 {
             timings.speculation.plain += usize::from(draft > 0);

@@ -23,7 +23,7 @@ use llm_core::Gguf;
 use rust_llm::Tokenizer;
 use rust_llm::chat::{ChatOptions, Message, render};
 use rust_llm::forward::Runner;
-use rust_llm::generate::generate;
+use rust_llm::generate::{generate, generate_drafting};
 use rust_llm::model::Model;
 use rust_llm::sample::{Sampler, Sampling, argmax};
 
@@ -117,6 +117,8 @@ fn the_generation_loop_allocates_nothing_per_token() {
     // all of them and the batched windows below are measured against buffers
     // that already exist.
     const BATCH: usize = 8;
+    /// Drafts per pass in the speculated window at the end.
+    const DRAFT: usize = 4;
     let mut runner = Runner::with_batch(&model, 256, 4, BATCH);
 
     // The prompt is the warm-up: it runs every block of both kinds, fills the
@@ -225,4 +227,74 @@ fn the_generation_loop_allocates_nothing_per_token() {
              vector and the stop-token set"
         );
     }
+
+    // And the speculated path, which adds three buffers of its own and a
+    // drafter that scans the whole history every pass. Every one of those is
+    // something the loop could have been written to allocate per token, so this
+    // is the window that says it does not.
+    //
+    // The drafts are injected and every one of them is accepted, because what
+    // has to be covered is a pass that runs a verification batch and then reads
+    // several rows out of it. A prompt-lookup draft on this prompt would mostly
+    // be no draft at all, and that path is the plain one already measured above.
+    let mut runner = Runner::with_speculation(&model, 256, 4, BATCH, DRAFT);
+    let mut sampler = Sampler::greedy(model.vocab());
+    // The tokens a sequential run produces, which the drafter then offers back.
+    let (truth, _, _) = generate(&mut runner, &mut sampler, &prompt, 32, |_| true);
+    let mut known: Vec<u32> = prompt.clone();
+    known.extend_from_slice(&truth);
+    known.extend(std::iter::repeat_n(0, DRAFT + 1));
+
+    let mut speculated = Vec::new();
+    for max_tokens in [4usize, 32] {
+        let mut sampler = Sampler::greedy(model.vocab());
+        // The throwaway call, for the same reason as above.
+        runner.reset();
+        generate(&mut runner, &mut sampler, &prompt, 2, |_| true);
+        runner.reset();
+        let mut produced = 0;
+        let mut rows = 0;
+        let n = allocations(|| {
+            let (ids, _, timings) = generate_drafting(
+                &mut runner,
+                &mut sampler,
+                &prompt,
+                max_tokens,
+                |seen, out| {
+                    let take = out.len().min(known.len() - seen.len());
+                    out[..take].copy_from_slice(&known[seen.len()..][..take]);
+                    take
+                },
+                |_| true,
+            );
+            produced = ids.len();
+            rows = timings.speculation.passes() + timings.speculation.saved();
+        });
+        speculated.push((max_tokens, produced, rows, n));
+    }
+    for (max_tokens, produced, rows, n) in &speculated {
+        println!(
+            "speculated by {DRAFT}, max_tokens {max_tokens}: {produced} tokens over \
+             {rows} verification rows, {n} allocations"
+        );
+    }
+    assert!(
+        speculated.iter().all(|&(_, _, rows, _)| rows > 0),
+        "no verification batch ran, so the speculated loop was not measured: \
+         {speculated:?}"
+    );
+    let (_, _, _, few) = speculated[0];
+    let (_, _, _, many) = speculated[1];
+    assert_eq!(
+        few, many,
+        "the speculated loop allocated {few} times for a short run and {many} for a \
+         long one, so something in it scales with the token count: {speculated:?}"
+    );
+    // The output vector, the stop-token set, the token history, the draft
+    // buffer and the row buffer: five, each made once before the loop starts.
+    assert!(
+        many <= 5,
+        "the speculated loop allocated {many} times, expected at most the output \
+         vector, the stop-token set and the three buffers speculation adds"
+    );
 }
