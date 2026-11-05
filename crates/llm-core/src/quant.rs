@@ -1,4 +1,12 @@
-//! ggml tensor types and their on-disk block layouts.
+//! ggml tensor types, their on-disk block layouts, and the int8 activation
+//! blocks the quantized kernels consume.
+//!
+//! Weights are never dequantized to f32 on the product path. The kernels read
+//! the quantized bytes straight out of the memory map and meet them with
+//! activations that have been quantized to int8, so every dot product runs in
+//! integer arithmetic and only the per-block scales are floating point.
+
+use half::f16;
 
 /// Super-block length of the k-quants (`Q4_K`, `Q6_K`, `Q8_K`).
 pub const QK_K: usize = 256;
@@ -98,5 +106,106 @@ impl GgmlType {
     pub fn bytes_for(self, n: u64) -> u64 {
         let bl = self.block_len() as u64;
         n.div_ceil(bl) * self.block_bytes() as u64
+    }
+}
+
+/// Reads a little-endian `f16` at `off`.
+#[inline]
+pub(crate) fn read_f16(b: &[u8], off: usize) -> f32 {
+    f16::from_bits(u16::from_le_bytes([b[off], b[off + 1]])).to_f32()
+}
+
+/// Unpacks the `j`-th 6-bit scale and min out of a `Q4_K` 12-byte scale block.
+///
+/// This is the `get_scale_min_k4` packing from ggml: the first four pairs are
+/// stored plainly in the low 6 bits of bytes 0..8, the last four steal their
+/// high two bits from the top of bytes 0..8.
+#[inline]
+pub(crate) fn q4k_scale_min(j: usize, s: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (s[j] & 63, s[j + 4] & 63)
+    } else {
+        (
+            (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4),
+            (s[j + 4] >> 4) | ((s[j] >> 6) << 4),
+        )
+    }
+}
+
+/// One super-block of activations quantized to int8.
+///
+/// `bsums` holds the sum of every group of 16 quants. The k-quant kernels need
+/// them for the offset terms: `Q4_K` subtracts a per-sub-block minimum and
+/// `Q6_K` carries a constant -32 bias, and both collapse into a dot product
+/// with these sums instead of a second pass over the activations.
+#[derive(Clone)]
+pub struct ActBlock {
+    pub d: f32,
+    pub qs: [i8; QK_K],
+    pub bsums: [i16; QK_K / 16],
+}
+
+impl Default for ActBlock {
+    fn default() -> Self {
+        Self {
+            d: 0.0,
+            qs: [0; QK_K],
+            bsums: [0; QK_K / 16],
+        }
+    }
+}
+
+/// Reusable int8 activation scratch.
+///
+/// Allocated once from the largest `K` in the model and refilled per matmul, so
+/// the forward pass never allocates. The tail of the last super-block is zeroed
+/// rather than special-cased: a zero activation kills whatever the weight row
+/// holds past `K`, which is what makes a `K` that is not a multiple of the
+/// block length fall out for free in every kernel.
+pub struct Activations {
+    blocks: Vec<ActBlock>,
+    k: usize,
+}
+
+impl Activations {
+    /// Allocates scratch for up to `max_k` activations.
+    pub fn new(max_k: usize) -> Self {
+        Self {
+            blocks: vec![ActBlock::default(); max_k.div_ceil(QK_K)],
+            k: 0,
+        }
+    }
+
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    pub fn blocks(&self) -> &[ActBlock] {
+        &self.blocks[..self.k.div_ceil(QK_K)]
+    }
+
+    /// Quantizes `x` into the scratch. Panics if `x` is longer than the scratch
+    /// was sized for, because growing it would allocate in the hot loop.
+    pub fn quantize(&mut self, x: &[f32]) {
+        let nb = x.len().div_ceil(QK_K);
+        assert!(
+            nb <= self.blocks.len(),
+            "activation scratch holds {} values, got {}",
+            self.blocks.len() * QK_K,
+            x.len()
+        );
+        self.k = x.len();
+        for (b, chunk) in self.blocks[..nb].iter_mut().zip(x.chunks(QK_K)) {
+            let amax = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            b.d = amax / 127.0;
+            let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            b.qs.fill(0);
+            for (q, v) in b.qs.iter_mut().zip(chunk) {
+                *q = (v * id).round().clamp(-127.0, 127.0) as i8;
+            }
+            for (i, s) in b.bsums.iter_mut().enumerate() {
+                *s = b.qs[i * 16..i * 16 + 16].iter().map(|&q| q as i16).sum();
+            }
+        }
     }
 }

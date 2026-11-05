@@ -5,8 +5,10 @@
 //! kernels read those same bytes in place.
 
 pub mod gguf;
+pub mod kernels;
 pub mod quant;
 pub mod qwen35;
 
 pub use gguf::{Gguf, GgufError, TensorView, Value};
-pub use quant::GgmlType;
+pub use kernels::{KernelError, Kernels, Tier};
+pub use quant::{Activations, GgmlType};
