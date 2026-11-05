@@ -55,12 +55,21 @@ pub enum Tier {
 }
 
 impl Tier {
+    pub const ALL: [Tier; 3] = [Tier::Scalar, Tier::Avx2Fma, Tier::Avx2Vnni];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Tier::Scalar => "scalar",
             Tier::Avx2Fma => "avx2+fma",
             Tier::Avx2Vnni => "avx2+vnni",
         }
+    }
+
+    /// The tier that prints as `s`, which is what `--tier` takes. Comparing two
+    /// tiers on the real model at the real thread count needs the binary to be
+    /// able to run either, not a rebuild.
+    pub fn parse(s: &str) -> Option<Tier> {
+        Tier::ALL.into_iter().find(|t| t.as_str() == s)
     }
 }
 

@@ -14,7 +14,7 @@ use rust_llm::model::Model;
 use rust_llm::sample::{self, Sampler, Sampling, entropy_seed};
 use rust_llm::{Stop, Tokenizer, bench, default_threads, generate, peak_rss_kib};
 
-use llm_core::Gguf;
+use llm_core::{Gguf, Kernels, Tier};
 
 const USAGE: &str = "\
 rust-llm run --prompt <text> [options]
@@ -50,6 +50,8 @@ options
                         bench 16, and bench generates exactly this many)
   --batch <n>           tokens per batch while reading the prompt (default:
                         see docs/decisions.md; 1 reads it token by token)
+  --tier <name>         pin the kernel tier (scalar, avx2+fma, avx2+vnni)
+                        instead of taking the strongest the CPU reports
   --think, --no-think   thinking mode, on by default, as the template is
   --raw                 take --prompt as the prompt verbatim, no chat template
   --host <addr>         serve: address to listen on (default 127.0.0.1)
@@ -86,6 +88,7 @@ struct Args {
     /// `None` is the command's own default: 512 for `run`, 16 for `bench`.
     max_tokens: Option<usize>,
     batch: usize,
+    tier: Option<String>,
     prompt_tokens: usize,
     repeats: usize,
     thinking: bool,
@@ -126,7 +129,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let gguf = Gguf::open(&args.model)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
     tokenizer.verify_against_weights(&gguf)?;
-    let model = Model::load(&gguf)?;
+    let model = match &args.tier {
+        None => Model::load(&gguf)?,
+        Some(name) => {
+            let tier = Tier::parse(name).ok_or_else(|| {
+                format!(
+                    "unknown --tier {name:?}; one of {}",
+                    Tier::ALL.map(|t| t.as_str()).join(", ")
+                )
+            })?;
+            let kernels = Kernels::for_tier(tier)
+                .ok_or_else(|| format!("this CPU cannot run the {name} kernels"))?;
+            Model::with_kernels(&gguf, kernels)?
+        }
+    };
     let load = load.elapsed();
 
     // Before the runner: each of these builds its own, one per thread count.
@@ -444,6 +460,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
         threads: vec![default_threads()],
         max_tokens: None,
         batch: rust_llm::forward::DEFAULT_BATCH,
+        tier: None,
         prompt_tokens: 19,
         repeats: 5,
         thinking: true,
@@ -483,6 +500,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
             "--threads" => out.threads = thread_list(&value()?)?,
             "--max-tokens" => out.max_tokens = Some(number(&value()?, "--max-tokens")?),
             "--batch" => out.batch = number(&value()?, "--batch")?.max(1),
+            "--tier" => out.tier = Some(value()?),
             "--prompt-tokens" => out.prompt_tokens = number(&value()?, "--prompt-tokens")?.max(1),
             "--repeats" => out.repeats = number(&value()?, "--repeats")?.max(1),
             "--temperature" => {
