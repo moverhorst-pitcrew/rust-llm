@@ -169,10 +169,13 @@ slower, it multiplies the resident memory by the number of tests, and any
 measurement taken at the same time is meaningless.
 
 One test in that set, `the_fixture_is_still_what_the_reference_produces`, also
-needs a built reference runner and fails without one:
-`RUST_LLM_REFERENCE_BIN` to the directory holding `llama-completion`, with
-`LD_LIBRARY_PATH` pointing at the same directory. The build recipe is in
-`docs/decisions.md` under "The reference harness".
+needs a built reference runner and fails without one: point
+`RUST_LLM_REFERENCE_BIN` at the directory holding `llama-completion`, which is
+the only variable the test needs because it passes `LD_LIBRARY_PATH` to the
+reference itself. Forgetting it does not cost only that test: the failing test
+binary ends the whole run, so the binaries after `tests/gate.rs` never run and
+the red is the missing variable rather than a broken gate. The build recipe is
+in `docs/decisions.md` under "The reference harness".
 
 Kernel microbenchmark:
 

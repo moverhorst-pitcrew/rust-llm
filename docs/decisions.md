@@ -1107,6 +1107,14 @@ Omitting `RUST_LLM_GATE_ONLY` does the whole set in one command, which is about
 four minutes. Per prompt it is 20 to 35 seconds, which is the size to keep a
 check at.
 
+**Forgetting `RUST_LLM_REFERENCE_BIN` in the whole `--ignored` run costs more
+than this one test.** It panics on the missing variable, a failing test binary
+ends the `cargo test` run, and the binaries after `tests/gate.rs` then never
+run at all, `tests/weights.rs` among them: a missing variable reads as a broken
+gate and hides the rest of the set. It is the only variable the run needs,
+because the test passes `LD_LIBRARY_PATH` to the reference process itself; by
+hand the reference needs it in the environment, as above.
+
 It reads the reference's ids out of its verbose log, because `llama-completion`
 prints a generated token's text and never its id: a token's bytes are exactly
 the text between one log line and the `n_past` line after it. Inverting text
