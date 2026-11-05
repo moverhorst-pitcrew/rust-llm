@@ -713,14 +713,11 @@ fn bench_prompt(tokenizer: &Tokenizer, n: usize) -> Result<Vec<u32>, Box<dyn std
 }
 
 /// `4` or `1,2,3,4`: one thread count for `run`, a sweep for `bench`.
+///
+/// Always at least one count: `split` yields one empty part for an empty
+/// argument, and that fails in [`number`].
 fn thread_list(s: &str) -> Result<Vec<usize>, String> {
-    let list: Result<Vec<usize>, String> = s
-        .split(',')
+    s.split(',')
         .map(|part| number(part.trim(), "--threads").map(|n| n.max(1)))
-        .collect();
-    let list = list?;
-    if list.is_empty() {
-        return Err("--threads needs at least one number".to_string());
-    }
-    Ok(list)
+        .collect()
 }
