@@ -448,18 +448,45 @@ this box, release build, per `sample` call over a 248320-entry vector:
 
 | | per call |
 | --- | --- |
-| greedy (argmax only) | 0.256 ms |
-| the defaults (top-k 20) | 0.606 ms |
-| temperature, top-k 40, top-p, min-p and the penalty all on | 0.597 ms |
-| `--top-k 0`, so the candidate set is the whole vocabulary | 9.49 ms |
-| for comparison: `sort_unstable_by` over the whole index vector | 6.5 ms |
+| greedy (argmax only) | 0.26 ms |
+| the defaults (top-k 20) | 0.65 ms |
+| temperature, top-k 40, top-p, min-p and the penalty all on | 0.62 ms |
+| `--top-k 0` with `--top-p 1`: no truncation, and no order needed | 1.58 ms |
+| `--top-k 0` with top-p on: no truncation, and the order needed | 10.56 ms |
+| for comparison: `sort_unstable_by` over the index vector on its own | 6.5 ms |
 
-So the candidate set is grown by partial selection, not sorting:
-`select_nth_unstable_by` over a preallocated index buffer puts the `k` largest
-logits in front in O(n) expected time, and only those `k` are sorted, and only
-when top-p is on at all. `--top-k 0` is the one setting that has no truncation
-to lean on: it asks for a draw over the whole vocabulary, which needs an
-exponential per entry. The default is 20.
+They wobble by a tenth of a millisecond between runs on this shared box, and the
+shape rather than the digits is the point.
+
+So at any `--top-k` of 1 or more the candidate set is grown by partial selection
+and nothing sorts the logit vector: `select_nth_unstable_by` over a preallocated
+index buffer puts the `k` largest logits in front in O(n) expected time, and only
+those `k` are sorted, and only when top-p is on at all. The default is 20, which
+is the 0.65 ms row, under one per cent of a 100 ms token.
+
+**`--top-k 0` together with `--top-p` below 1 is the exception, and it does sort
+the whole index vector.** `top_k = 0` means no truncation, so there is nothing to
+select and the candidate set is all 248320 entries; top-p needs them in order, so
+the sort runs over the lot. The two `--top-k 0` rows above are the same work
+apart from that sort, so the sort is the 9 ms between them; the 1.58 ms the
+cheaper of them costs is the exponential per entry that a draw over the whole
+vocabulary needs whatever else happens. It is an accepted cost, not an oversight:
+
+- growing the candidate set by repeated partial selection until the mass covers
+  `top_p` has a worst case (a flat distribution, where 0.95 of the mass is
+  thousands of candidates) of several O(n) passes plus a sort of what it found,
+  and it needs a fallback threshold to stay bounded;
+- that is more branches on the path every token takes, to make faster a setting
+  nothing defaults to and which asks for a full-vocabulary draw in the first
+  place.
+
+`--top-k 0` with top-p off (`--top-p 1`) does not sort, which is what the gap
+between the two rows is: the candidates are never ordered, because only top-p
+uses the order.
+`the_candidates_are_only_ordered_where_the_order_is_used` in
+`crates/rust-llm/tests/sample.rs` holds that, since the selection leaves the
+candidates unordered and a descending candidate set is therefore a sort that
+ran.
 
 **Why the selection is exact.** Both orders used are total: logit descending,
 then token id ascending. Equal logits therefore do not leave the selected set
@@ -474,8 +501,10 @@ forward pass's own softmax does.
 
 **top-p normalises over the top-k candidates**, not over the whole vocabulary.
 The ticket fixes the order but not the denominator, and an exact
-full-vocabulary one is the 9.49 ms row above on every token, whatever top-k
-left. This is also what llama.cpp's default sampler chain does: its top-p
+full-vocabulary one would put the exponential-per-entry pass of the 1.58 ms row
+above on every token, whatever top-k left, and the sort with it: ranking the
+whole vocabulary is the only way to find the prefix that covers the mass. This
+is also what llama.cpp's default sampler chain does: its top-p
 sampler softmaxes whatever its top-k sampler handed it. With `--top-k 0` the two
 readings coincide, because the candidate set is then the whole vocabulary.
 

@@ -19,11 +19,20 @@
 //!    a pass of its own: `exp((l - max) / t)` is the same function as
 //!    `softmax(l / t)` and costs one pass over the vocabulary less.
 //! 3. **top-k**: the `k` largest logits, by partial selection over a
-//!    preallocated index buffer. No full sort.
+//!    preallocated index buffer. At any `top_k >= 1` nothing sorts the logit
+//!    vector. `top_k == 0` means no truncation at all, so the candidate set is
+//!    the whole vocabulary and there is nothing to select; see the note under
+//!    top-p.
 //! 4. **top-p**: the shortest prefix of the candidates, in descending order,
 //!    whose mass covers `top_p`. The mass is normalised over the top-k
 //!    candidates, which is what llama.cpp's default chain does too: its top-p
-//!    sampler softmaxes whatever its top-k sampler left it.
+//!    sampler softmaxes whatever its top-k sampler left it. Only the candidates
+//!    are sorted and only when top-p is on, so `top_k == 0` together with
+//!    `top_p < 1` is the one configuration that does sort the whole index
+//!    vector: 10.5 ms a token against 0.65 ms for the defaults, 9 ms of which
+//!    is the sort. It is accepted rather than worked around: the default
+//!    truncates at 20, and the alternatives all cost more branches on the path
+//!    that matters. The measurements are in `docs/decisions.md`.
 //! 5. **min-p**: a threshold against the largest probability. Exact in one
 //!    pass over the candidates and needing no normalisation at all, because the
 //!    maximum is subtracted before the exponential, so the largest
@@ -287,7 +296,10 @@ impl Sampler {
         let cand = &mut idx[..k];
         // The candidates only have to be ordered for top-p; min-p is a
         // threshold and the draw does not care, so with top-p off this is
-        // where the full sort would otherwise have been.
+        // where the full sort would otherwise have been. With `top_k == 0`
+        // there was no truncation above and `cand` is the whole vocabulary, so
+        // this line is a full sort, which is the cost named in the module
+        // documentation and accepted there.
         if set.top_p < 1.0 {
             cand.sort_unstable_by(&order);
         }
