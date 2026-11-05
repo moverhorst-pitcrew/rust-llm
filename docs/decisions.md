@@ -551,8 +551,9 @@ and 1.5 at 1024, so the upper bound on the win is 10 per cent of a token at
 4096 and nothing measurable at the default configurations. It is also a
 rounding change in the attention scores, which is exactly what the correctness
 gate measures, so taking it would move the fixture that records the four
-permitted disagreements. That trade needs the board's acceptance rather than a
-tuning commit, and `docs/benchmarks.md` carries the number for it. Note that the
+permitted disagreements. That trade needs a decision of its own, written down
+with the number, rather than arriving inside a change made for speed, and
+`docs/benchmarks.md` carries the number for it. Note that the
 reference's own default *is* an f16 cache, which is part of why its shipping
 numbers are ahead of its matched-flags ones.
 

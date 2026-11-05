@@ -295,8 +295,9 @@ score loop.
 
 It is also a rounding change in the attention scores, which is what the gate
 measures, and it would move the fixture that records the four permitted
-disagreements. The fixture moves only with a reason the board has accepted, so
-this is not taken in M2; the number above is what the decision needs. The
+disagreements. That fixture moves with a decision that is written down, not as
+a side effect of a change made for speed, so this is not taken here; the number
+above is what such a decision needs. The
 reference's own default is an f16 cache, which is part of why its `tg16` column
 below is ahead of its matched-flags column.
 
@@ -406,7 +407,8 @@ One note per place we are behind:
   matmul, and at batch 16 it is compute-bound (157 MiB of
   weights per token is 7.0 GiB/s at 45 tok/s, 14 per cent of the ceiling), so
   the next factor is register blocking over several weight rows at once. That is
-  a kernel rewrite and it is M3's, not this issue's.
+  a kernel rewrite with a correctness story of its own, so it belongs to a
+  separate change rather than to the batching work this table measures.
 - The reference's defaults beat its matched flags by 4 to 20 per cent on
   generation and 1 to 5 per cent on the prompt, which is the price of the
   comparison being fair rather than flattering.
