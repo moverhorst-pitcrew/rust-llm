@@ -62,7 +62,8 @@ cargo run --release -p llm-core --example bench_bandwidth
 ones: a `--ignored` set left to the test harness's own parallelism was measured
 at 40 threads and 17 GiB resident inside a quota of 8 CPUs. Every number in this
 file is taken with nothing else loading the model, and the `--ignored` tests are
-run with `--test-threads=1`, which is also faster (4:50 against 6:50). The load
+run with `--test-threads=1`, which is also the faster way to run them: the six
+tests of `tests/gate.rs` take 4:33 in sequence against 6:38 all at once. The load
 average printed before and after each configuration is what says whether
 anything else was on the box at all.
 

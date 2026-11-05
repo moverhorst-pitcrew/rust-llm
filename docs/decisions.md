@@ -1253,30 +1253,29 @@ no signal in it. Measured on this box:
 | of which `tests/sample.rs`, `tests/sample_allocations.rs` and `tests/tiny_model.rs` | 2 s, 2 s, 3 s |
 | of which `tests/serve.rs`, which starts the server and drives both endpoints | 2 s |
 | the whole `--ignored` set, one test at a time, which is both gates and everything else needing weights | 4:50 |
-| gate: `every_next_token_matches_the_reference` | 2:01 |
-| gate: `greedy_output_is_unchanged` | 2:10 |
-| gate: `resetting_the_caches_is_the_same_as_a_fresh_runner` | 27 s |
-| gate: `the_thread_count_does_not_change_the_output` | 21 s |
-| gate: `a_batched_prompt_is_the_same_as_one_token_at_a_time` | 17 s |
-| `the_generation_loop_allocates_nothing_per_token` | 12 s |
+| of which `tests/gate.rs`, its six tests in sequence: the two gates, the reset and thread-count checks, the batched-prompt check and the fixture re-derivation against the reference | 4:33 |
+| the same six left to the harness, which runs them all at once | 6:38 |
+| of which `tests/allocations.rs`, whose ignored test is `the_generation_loop_allocates_nothing_per_token` | 16 s |
 | `rust-llm bench` at one thread count, 192-token prompt, 3 repeats | 25 s to 1:30 |
 | `rust-llm bench --threads 1,2,3,4,5,6,7,8`, the whole sweep | 5:07 |
 | `rust-llm profile`, 192-token prompt | 30 s |
 | `rust-llm profile`, 2048-token prompt (long-context attention) | 1:41 |
 | `rust-llm profile`, 4096-token prompt | 3:52 |
 | `llama-bench -p 192 -n 16 -t 1,2,3,4,5,6,7,8 -r 3`, one flag set | 2:44 |
-| fixture re-derivation, one prompt | 20 to 35 s |
-| fixture re-derivation, all ten prompts | about 4 min |
+| writing the fixture (`RUST_LLM_WRITE_FIXTURE`), one command per prompt | 20 to 35 s a prompt, about 4 min for all ten |
 | per-layer trace comparison against the reference | 40 s |
 
-The per-test times are from running them one at a time, which is also the only
-way to run the set: `--test-threads=1`. Left to itself the harness starts six of
-these at once, each loading the model and starting a worker pool on all 8
-threads of the quota, which was measured at 40 threads and 17 GiB resident
-inside a quota of 8 CPUs. That is slower than running them in sequence, not
-faster, and nothing measured next to it means anything. In sequence the set is
-about ten and a half minutes, of which the two gates and the fixture
-re-derivation are nine.
+One test at a time, `--test-threads=1`, is the only way to run that set. Left to
+itself the harness starts all six of `tests/gate.rs` at once, each loading the
+model and starting a worker pool on all 8 threads of the quota, which was
+measured at 40 threads and 17 GiB resident inside a quota of 8 CPUs: nothing
+measured next to a run like that means anything. It is also slower, and the two
+numbers above are the same six tests on the same build, as the harness itself
+reported them: 4:33 in sequence against 6:38 at once.
+
+The rows are per test binary, because that is what the harness reports. A single
+test run on its own costs its own model load on top, so the set in sequence is
+cheaper than the tests that make it up added together.
 
 A tok/s figure printed by one of those tests is not a speed measurement even
 then: the gates measure agreement with the timers incidental, and
