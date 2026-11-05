@@ -1,12 +1,13 @@
-//! Greedy generation over [`Runner`], and the timings that go with it.
+//! Generation over [`Runner`], and the timings that go with it.
 //!
-//! Sampling is argmax and nothing else. A temperature, top-k or top-p surface
-//! is a separate change; putting the hooks in now would be an interface with
-//! one implementation.
+//! One function with a [`Sampler`] argument rather than a greedy function next
+//! to a sampling one: a greedy run is [`crate::sample::Sampling::GREEDY`], not
+//! a separate code path.
 
 use std::time::{Duration, Instant};
 
 use crate::forward::Runner;
+use crate::sample::Sampler;
 
 /// What a run cost, split the way the two phases differ: the prompt is read
 /// with the caches growing from nothing, generation reads all the weights per
@@ -46,8 +47,8 @@ pub enum Stop {
     ContextFull,
 }
 
-/// Reads the prompt, then generates greedily until a stop token, `max_tokens`
-/// or the end of the context.
+/// Reads the prompt, then generates until a stop token, `max_tokens` or the
+/// end of the context.
 ///
 /// `on_token` sees every generated token as it is produced, before the next
 /// forward pass, so a caller can stream. Stop tokens are not passed to it.
@@ -56,8 +57,14 @@ pub enum Stop {
 /// the first prediction, which is also why nothing re-reads the prompt and the
 /// delta-net state generation continues from is exactly the state the prompt
 /// left behind.
+///
+/// Every token that goes through the model enters the sampler's recent-token
+/// window exactly once, the prompt's included: the window is what the
+/// repetition penalty reads, and a penalty that only saw the generated tokens
+/// would not notice the prompt repeating itself.
 pub fn generate(
     runner: &mut Runner<'_>,
+    sampler: &mut Sampler,
     prompt: &[u32],
     max_tokens: usize,
     mut on_token: impl FnMut(u32),
@@ -74,8 +81,9 @@ pub fn generate(
             return (out, Stop::ContextFull, timings);
         }
         let logits = runner.forward(t);
+        sampler.remember(t);
         if i + 1 == prompt.len() {
-            next = argmax(logits);
+            next = sampler.sample(logits);
         }
     }
     timings.prompt_tokens = prompt.len();
@@ -94,38 +102,10 @@ pub fn generate(
         if runner.pos() == runner.context() {
             break Stop::ContextFull;
         }
-        next = argmax(runner.forward(next));
+        next = sampler.sample(runner.forward(next));
     };
     timings.generated_tokens = out.len();
     timings.generate_time = start.elapsed();
 
     (out, stop, timings)
-}
-
-/// The highest logit, lowest token id winning a tie.
-///
-/// The tie rule only matters for reproducibility; on this model exact ties
-/// between two logits do not happen in practice.
-pub fn argmax(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as u32
-}
-
-#[cfg(test)]
-mod tests {
-    use super::argmax;
-
-    #[test]
-    fn argmax_takes_the_first_of_a_tie() {
-        assert_eq!(argmax(&[1.0, 3.0, 3.0, 2.0]), 1);
-        assert_eq!(argmax(&[-5.0]), 0);
-        assert_eq!(argmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY]), 0);
-    }
 }

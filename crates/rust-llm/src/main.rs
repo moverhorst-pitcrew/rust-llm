@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use rust_llm::chat::{ChatOptions, Message};
 use rust_llm::forward::Runner;
 use rust_llm::model::Model;
+use rust_llm::sample::Sampler;
 use rust_llm::{Tokenizer, generate};
 
 use llm_core::Gguf;
@@ -141,13 +142,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // is a property of what was *streamed*, so it is recorded here rather than
     // looked for in the clean text afterwards, which cannot contain one.
     let mut streamed_a_broken_character = false;
-    let (ids, stop, timings) = generate::generate(&mut runner, &tokens, args.max_tokens, |id| {
-        if let Ok(text) = tokenizer.decode(&[id], false) {
-            streamed_a_broken_character |= text.contains(char::REPLACEMENT_CHARACTER);
-            let _ = stdout.write_all(text.as_bytes());
-            let _ = stdout.flush();
-        }
-    });
+    let mut sampler = Sampler::greedy(model.vocab());
+    let (ids, stop, timings) =
+        generate::generate(&mut runner, &mut sampler, &tokens, args.max_tokens, |id| {
+            if let Ok(text) = tokenizer.decode(&[id], false) {
+                streamed_a_broken_character |= text.contains(char::REPLACEMENT_CHARACTER);
+                let _ = stdout.write_all(text.as_bytes());
+                let _ = stdout.flush();
+            }
+        });
     println!();
 
     let text = tokenizer.decode(&ids, false)?;

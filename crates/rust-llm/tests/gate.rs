@@ -73,8 +73,9 @@ use llm_core::Gguf;
 use rust_llm::Tokenizer;
 use rust_llm::chat::{self, ChatOptions, Message, Role};
 use rust_llm::forward::Runner;
-use rust_llm::generate::{argmax, generate};
+use rust_llm::generate::generate;
 use rust_llm::model::Model;
+use rust_llm::sample::{Sampler, argmax};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
 /// Enough for every prompt in the set plus its answer, and small enough that
@@ -320,7 +321,13 @@ fn greedy_output_is_unchanged() {
         // Every case starts from a clean cache, which is what makes the result
         // independent of the order the cases run in.
         runner.reset();
-        let (ids, stop, timings) = generate(&mut runner, &prompt, case.max_tokens, |_| {});
+        let (ids, stop, timings) = generate(
+            &mut runner,
+            &mut Sampler::greedy(model.vocab()),
+            &prompt,
+            case.max_tokens,
+            |_| {},
+        );
         let committed = ids_of(&want["tokens"]);
         let reference = ids_of(&want["reference_tokens"]);
         total += ids.len();
@@ -390,7 +397,13 @@ fn the_thread_count_does_not_change_the_output() {
     let mut outputs = Vec::new();
     for threads in [1usize, 3, threads()] {
         let mut runner = Runner::new(&model, CONTEXT, threads);
-        let (ids, _, _) = generate(&mut runner, &prompt, 24, |_| {});
+        let (ids, _, _) = generate(
+            &mut runner,
+            &mut Sampler::greedy(model.vocab()),
+            &prompt,
+            24,
+            |_| {},
+        );
         println!("{threads} threads: {ids:?}");
         outputs.push((threads, ids));
     }
@@ -453,7 +466,13 @@ fn resetting_the_caches_is_the_same_as_a_fresh_runner() {
         logits
     };
     runner.reset();
-    let (first, _, _) = generate(&mut runner, &prompt, 24, |_| {});
+    let (first, _, _) = generate(
+        &mut runner,
+        &mut Sampler::greedy(model.vocab()),
+        &prompt,
+        24,
+        |_| {},
+    );
 
     runner.reset();
     if let Some(d) = difference(runner.forward(prompt[0]), &fresh_first) {
@@ -468,7 +487,13 @@ fn resetting_the_caches_is_the_same_as_a_fresh_runner() {
         panic!("after a reset, the prompt's last logits differ from a fresh runner's: {d}");
     }
     runner.reset();
-    let (second, _, _) = generate(&mut runner, &prompt, 24, |_| {});
+    let (second, _, _) = generate(
+        &mut runner,
+        &mut Sampler::greedy(model.vocab()),
+        &prompt,
+        24,
+        |_| {},
+    );
     assert_eq!(
         first, second,
         "a reset runner generated different tokens than a fresh one:\n  \
@@ -554,7 +579,13 @@ fn the_fixture_is_still_what_the_reference_produces() {
         // band, both recorded so the two gates above need neither the
         // reference nor a second run.
         runner.reset();
-        let (ours, _, _) = generate(&mut runner, &prompt_ids, case.max_tokens, |_| {});
+        let (ours, _, _) = generate(
+            &mut runner,
+            &mut Sampler::greedy(model.vocab()),
+            &prompt_ids,
+            case.max_tokens,
+            |_| {},
+        );
 
         runner.reset();
         let mut feed = prompt_ids.clone();

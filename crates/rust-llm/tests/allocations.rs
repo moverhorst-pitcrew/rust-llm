@@ -23,8 +23,9 @@ use llm_core::Gguf;
 use rust_llm::Tokenizer;
 use rust_llm::chat::{ChatOptions, Message, render};
 use rust_llm::forward::Runner;
-use rust_llm::generate::{argmax, generate};
+use rust_llm::generate::generate;
 use rust_llm::model::Model;
+use rust_llm::sample::{Sampler, Sampling, argmax};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
 
@@ -136,36 +137,61 @@ fn the_generation_loop_allocates_nothing_per_token() {
     );
     println!("{tokens} forward passes, {n} allocations");
 
-    // One throwaway call first, so a lazily initialised anything inside the
-    // standard library is not charged to the measurements below.
-    generate(&mut runner, &prompt, 2, |_| {});
+    // Greedy and the full pipeline, because what the sampler costs is a
+    // per-call budget too: every one of its buffers comes out of
+    // `Sampler::new` and `sample` is supposed to touch nothing else.
+    let settings = [
+        ("greedy", Sampling::GREEDY),
+        (
+            "temperature 0.8, top-k 40, top-p 0.9, min-p 0.05, penalty 1.1",
+            Sampling {
+                temperature: 0.8,
+                top_k: 40,
+                top_p: 0.9,
+                min_p: 0.05,
+                repeat_penalty: 1.1,
+                repeat_last_n: 64,
+                seed: 7,
+            },
+        ),
+    ];
 
-    let mut counts = Vec::new();
-    for max_tokens in [4usize, 32] {
+    for (name, set) in settings {
+        let mut sampler = Sampler::new(model.vocab(), set);
+        // One throwaway call first, so a lazily initialised anything inside
+        // the standard library is not charged to the measurements below.
         runner.reset();
-        let mut produced = 0;
-        let n = allocations(|| {
-            let (ids, _, _) = generate(&mut runner, &prompt, max_tokens, |_| {});
-            produced = ids.len();
-        });
-        counts.push((max_tokens, produced, n));
-    }
+        generate(&mut runner, &mut sampler, &prompt, 2, |_| {});
 
-    for (max_tokens, produced, n) in &counts {
-        println!("max_tokens {max_tokens}: {produced} tokens, {n} allocations");
+        let mut counts = Vec::new();
+        for max_tokens in [4usize, 32] {
+            runner.reset();
+            let mut produced = 0;
+            let n = allocations(|| {
+                let (ids, _, _) = generate(&mut runner, &mut sampler, &prompt, max_tokens, |_| {});
+                produced = ids.len();
+            });
+            counts.push((max_tokens, produced, n));
+        }
+
+        for (max_tokens, produced, n) in &counts {
+            println!("{name}, max_tokens {max_tokens}: {produced} tokens, {n} allocations");
+        }
+        let (_, _, few) = counts[0];
+        let (_, _, many) = counts[1];
+        assert_eq!(
+            few, many,
+            "{name}: generate allocated {few} times for a short run and {many} for a \
+             long one, so something in the loop scales with the token count: {counts:?}"
+        );
+        // The output vector and the copy of the stop-token set, both made once
+        // before the loop starts. A third would mean a new allocation in the
+        // loop, whatever the settings: the sampler's buffers are allocated by
+        // `Sampler::new`, above the window.
+        assert!(
+            many <= 2,
+            "{name}: generate allocated {many} times, expected at most the output \
+             vector and the stop-token set"
+        );
     }
-    let (_, _, few) = counts[0];
-    let (_, _, many) = counts[1];
-    assert_eq!(
-        few, many,
-        "generate allocated {few} times for a short run and {many} for a long one, \
-         so something in the loop scales with the token count: {counts:?}"
-    );
-    // The output vector and the copy of the stop-token set, both made once
-    // before the loop starts. A third would mean a new allocation in the loop.
-    assert!(
-        many <= 2,
-        "generate allocated {many} times, expected at most the output vector and \
-         the stop-token set"
-    );
 }
