@@ -57,6 +57,15 @@ rust-llm bench --context 1024 --threads 8 --prompt-tokens 192 --max-tokens 8 \
 cargo run --release -p llm-core --example bench_bandwidth
 ```
 
+**One model run at a time.** A second runner on this box streams the same
+2.52 GiB of weights, so two at once are not two measurements but two wrong
+ones: a `--ignored` set left to the test harness's own parallelism was measured
+at 40 threads and 17 GiB resident inside a quota of 8 CPUs. Every number in this
+file is taken with nothing else loading the model, and the `--ignored` tests are
+run with `--test-threads=1`, which is also faster (4:50 against 6:50). The load
+average printed before and after each configuration is what says whether
+anything else was on the box at all.
+
 The first run of each configuration is a warm-up and is not counted. The prompt
 is a fixed text in the binary truncated to exactly `--prompt-tokens` tokens,
 repeated with a space between copies when more tokens are asked for than its
@@ -101,27 +110,27 @@ left as it is, because the correction is smaller than the window-to-window
 spread of everything it would be applied to.
 
 **The ceiling is for generation only.** A prompt read in batches of 16 reads the
-weights once per batch, so 157 MiB per token, and at the 45.34 prompt tok/s
-below that is 7.0 GiB/s: 14 per cent of the same ceiling. The prompt is not
+weights once per batch, so 157 MiB per token, and at the 47.16 prompt tok/s
+below that is 7.4 GiB/s: 15 per cent of the same ceiling. The prompt is not
 bounded by memory any more, which is the whole point of batching it, and a
 "fraction of the ceiling" column for the prompt would say nothing.
 
 ## The runner against that ceiling
 
 Context 1024, 192-token prompt, batch 16, 16 generated tokens, tier
-`avx2+vnni`, quota 8 CPUs, 3 repeats, the quietest window measured
-(load 1.72 -> 5.22, which is this bench's own threads for the most part):
+`avx2+vnni`, quota 8 CPUs, 3 repeats, with no other run touching the model
+(load 3.00 -> 6.17, most of it this bench's own threads):
 
 | threads | prompt tok/s | spread | generation tok/s | spread | ceiling | fraction | prompt / generation |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 10.40 | 3.2% | 3.58 | 2.0% | 6.26 | 57% | 2.9 |
-| 2 | 18.92 | 1.9% | 6.61 | 1.5% | 11.33 | 58% | 2.9 |
-| 3 | 25.40 | 1.6% | 8.73 | 3.5% | 14.56 | 60% | 2.9 |
-| 4 | 30.34 | 0.5% | 10.60 | 0.7% | 16.63 | 64% | 2.9 |
-| 5 | 35.41 | 0.9% | 11.93 | 0.8% | 17.79 | 67% | 3.0 |
-| 6 | 40.17 | 1.1% | 12.95 | 1.0% | 18.77 | 69% | 3.1 |
-| 7 | 43.44 | 2.1% | 13.50 | 1.4% | 19.30 | 70% | 3.2 |
-| 8 | 45.34 | 1.5% | 13.72 | 2.7% | 19.19 | **71%** | **3.3** |
+| 1 | 10.55 | 1.6% | 3.66 | 1.4% | 6.26 | 58% | 2.9 |
+| 2 | 18.85 | 0.3% | 6.66 | 1.4% | 11.33 | 59% | 2.8 |
+| 3 | 25.36 | 0.8% | 8.80 | 0.9% | 14.56 | 60% | 2.9 |
+| 4 | 31.43 | 0.7% | 10.57 | 1.4% | 16.63 | 64% | 3.0 |
+| 5 | 36.12 | 0.5% | 12.14 | 3.5% | 17.79 | 68% | 3.0 |
+| 6 | 40.36 | 3.9% | 13.22 | 3.3% | 18.77 | 70% | 3.1 |
+| 7 | 43.88 | 1.7% | 13.46 | 4.7% | 19.30 | 70% | 3.3 |
+| 8 | 47.16 | 7.1% | 14.87 | 3.0% | 19.19 | **77%** | **3.2** |
 
 Peak RSS 2.82 GiB for the whole bench process, which loads the model once and
 runs every configuration in it. Per configuration, from a single `rust-llm run`
@@ -131,7 +140,8 @@ context was allocated for. See "Memory" below.
 
 Honest notes on that table:
 
-- **The prompt is 2.9 times generation at 1 to 4 threads and 3.3 times at 8**,
+- **The prompt is 2.8 to 2.9 times generation at 1 to 3 threads and 3.0 to 3.3
+  from 4 threads up**,
   and the reason it is not a flat factor is that the two phases are bounded by
   different things. Generation is bandwidth-bound only once there are enough
   threads to saturate memory: at 1 thread it reaches 57 per cent of the implied
@@ -142,16 +152,16 @@ Honest notes on that table:
   profile below, of a 20.06 ms prompt token the delta-net recurrence is 10.0 per
   cent, the elementwise work 5.9, the convolution 4.1 and the norms 2.5: 22.5
   per cent that costs the same per token whether 1 token or 16 go through
-  together. With that fixed and the matmuls divided by the batch, 3.3 at 8
+  together. With that fixed and the matmuls divided by the batch, 3.2 at 8
   threads is close to what is available; the next factor would have to come out
   of the matmul kernel, not out of the batch.
-- Generation reaches 71 per cent of the measured ceiling at 8 threads. The
+- Generation reaches 77 per cent of the measured ceiling at 8 threads. The
   remaining fifth is the output head and everything per token that is not
   streaming weights; it is not barrier time, which is 3.8 per cent (see the
   profile).
-- The spreads in this window are under 3.5 per cent everywhere, which is the
-  tightest sweep in this file. Earlier windows on this box gave 12 per cent at
-  8 threads. Compare rows within a window, never across.
+- The spreads are under 5 per cent except the 8-thread prompt row at 7.1,
+  which is the setting most exposed to whatever else runs on the box. Earlier
+  windows gave 12 per cent there. Compare rows within a window, never across.
 
 Where this started. On the first commit of this branch, same configuration
 before any threading or batching change: 7.75 generation tok/s at 4 threads and
@@ -162,7 +172,10 @@ went through the same single-token path.
 
 Three changes, each measured against the previous commit's binary, alternated in
 one window. Prompt tok/s, context 1024, 192-token prompt, 8 threads, batch 32
-for the first two rows.
+for the first two rows. These pairs predate the one-run-at-a-time rule above, so
+the absolute level in them is lower than the table at the top of this file by
+the few per cent that another agent's work on the box costs; what each row says
+is the ratio inside the pair, which the alternation is what makes sound.
 
 | commit | change | before | after |
 | --- | --- | --- | --- |
@@ -178,7 +191,9 @@ that is what it should do.
 ### The batch-size curve, and why the default is 16
 
 Context 1024, 192-token prompt, 8 threads, 2 repeats, one invocation per batch
-size, load 3.60 -> 8.27 across the series. Prompt tok/s:
+size, load 3.60 -> 8.27 across the series, and from before the
+one-run-at-a-time rule: the shape of the curve is what this is for, and the
+knee does not move with the absolute level. Prompt tok/s:
 
 | batch | 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32 | 48 | 64 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -355,51 +370,57 @@ prompt and 16 generated tokens the KV cache is under a megabyte against 2.52 GiB
 of weights per token, so it is not what these rows differ by; the per-layer
 comparison, which does need f32, uses `llama-eval-callback` and gets it there.
 
-All three columns were measured within the same half hour on a box whose load
-average stayed between 1.7 and 6.4: ours at 1.72 -> 5.22, the matched reference
-at 3.64 -> 6.38, the reference's defaults at 6.38 -> 5.43.
+The matched-flags column and our column are both measured with nothing else
+loading the model, ours at load 3.00 -> 6.17 and the reference at 4.29 -> 5.47.
+The defaults column is from an earlier pass over the same commands at load
+6.38 -> 5.43 with the serialisation above not yet in place, so read it as the
+reference against itself and not against our column: at a 192-token prompt the
+two reference columns differ by its weight repacking, which is what that
+comparison is for.
 
 Generation, `tg16` against our generation tok/s:
 
 | threads | reference, matched flags | reference, its defaults | this runner | against matched |
 | --- | --- | --- | --- | --- |
-| 1 | 4.01 | 4.83 | 3.58 | -11% |
-| 2 | 7.21 | 8.35 | 6.61 | -8% |
-| 3 | 9.49 | 10.40 | 8.73 | -8% |
-| 4 | 11.02 | 12.11 | 10.60 | -4% |
-| 5 | 12.06 | 13.06 | 11.93 | -1% |
-| 6 | 12.75 | 13.61 | 12.95 | +2% |
-| 7 | 12.81 | 14.07 | 13.50 | +5% |
-| 8 | 12.51 | 13.85 | 13.72 | +10% |
+| 1 | 4.05 | 4.83 | 3.66 | -10% |
+| 2 | 7.42 | 8.35 | 6.66 | -10% |
+| 3 | 9.91 | 10.40 | 8.80 | -11% |
+| 4 | 11.74 | 12.11 | 10.57 | -10% |
+| 5 | 12.86 | 13.06 | 12.14 | -6% |
+| 6 | 13.71 | 13.61 | 13.22 | -4% |
+| 7 | 14.29 | 14.07 | 13.46 | -6% |
+| 8 | 14.25 | 13.85 | 14.87 | **+4%** |
 
 Prompt, `pp192` against our prompt tok/s:
 
 | threads | reference, matched flags | reference, its defaults | this runner | against matched |
 | --- | --- | --- | --- | --- |
-| 1 | 21.08 | 21.37 | 10.40 | -51% |
-| 2 | 38.43 | 39.60 | 18.92 | -51% |
-| 3 | 51.91 | 53.02 | 25.40 | -51% |
-| 4 | 65.79 | 67.03 | 30.34 | -54% |
-| 5 | 76.11 | 78.75 | 35.41 | -53% |
-| 6 | 85.31 | 90.08 | 40.17 | -53% |
-| 7 | 91.04 | 95.30 | 43.44 | -52% |
-| 8 | 93.97 | 98.21 | 45.34 | -52% |
+| 1 | 21.72 | 21.37 | 10.55 | -51% |
+| 2 | 40.90 | 39.60 | 18.85 | -54% |
+| 3 | 54.79 | 53.02 | 25.36 | -54% |
+| 4 | 69.85 | 67.03 | 31.43 | -55% |
+| 5 | 80.21 | 78.75 | 36.12 | -55% |
+| 6 | 92.63 | 90.08 | 40.36 | -56% |
+| 7 | 97.98 | 95.30 | 43.88 | -55% |
+| 8 | 102.47 | 98.21 | 47.16 | -54% |
 
 One note per place we are behind:
 
 - **Generation is within 11 per cent of the reference at every thread count from
-  1 to 8 with the flags matched**, and ahead of it at 6, 7 and 8 because its own
-  curve turns down there and ours does not. Against the reference's shipping
-  defaults we are 26 per cent behind at 1 thread, 21 at 2 and 1 per cent at 8:
-  the difference between its two columns is weight repacking, which reorders the
-  quantization blocks into a layout its kernel prefers and is a different
-  rounding of the same arithmetic. We deliberately read the blocks as the file
-  stores them.
-- **One thread is the widest generation gap** (3.58 against 4.01 matched).
-  With one thread there is no scheduling left to win, so this is kernel work:
-  our Q4_K dot is about 11 per cent behind theirs on the same block layout.
-- **The prompt is a factor 2.1 behind, down from a factor 4 to 7 before this
-  branch.** The remaining factor is a different algorithm, not a different
+  1 to 8 with the flags matched**, and ahead of it only at 8 threads, where its
+  own curve turns down and ours does not. An earlier unserialised pass had us
+  ahead at 6 and 7 as well; under the serialisation both sides gained and the
+  reference gained more there, which is the honest picture and the one in the
+  table.
+- **The gap is 4 to 11 per cent and it is kernel work, not scheduling.** It is
+  widest at 1 to 4 threads (10 to 11 per cent), where there is no scheduling
+  left to win at all: our Q4_K dot is about a tenth behind theirs on the same
+  block layout. The reference's own two columns differ by its weight repacking,
+  which reorders the quantization blocks into a layout its kernel prefers and is
+  a different rounding of the same arithmetic; we deliberately read the blocks
+  as the file stores them.
+- **The prompt is a factor 2.1 to 2.3 behind, down from a factor 4 to 7 before
+  this branch.** The remaining factor is a different algorithm, not a different
   schedule: the reference turns a batched prompt into a true matrix-matrix
   multiply over a repacked weight layout, blocked in both dimensions, where this
   runner keeps the matvec shape and walks one weight row against the batch. The
@@ -413,8 +434,8 @@ One note per place we are behind:
   generation and 1 to 5 per cent on the prompt, which is the price of the
   comparison being fair rather than flattering.
 
-At matching thread counts the reference is a peer on generation and ahead on the
-prompt. The bar for this runner is the bandwidth ceiling in the table above, not
+At matching thread counts the reference is a peer on generation, within a tenth
+either way, and ahead on the prompt by a factor two. The bar for this runner is the bandwidth ceiling in the table above, not
 llama.cpp.
 
 ## Where a token's time goes
@@ -502,7 +523,8 @@ What is left to win, in order:
 
 The VNNI tier was kept on this measurement rather than deleted. Prompt tok/s,
 context 1024, 192-token prompt, batch 16, two passes each alternated from one
-binary through `--tier`:
+binary through `--tier`, from before the one-run-at-a-time rule, so again the
+pair is what holds:
 
 | | pass 1 | pass 2 | generation |
 | --- | --- | --- | --- |
