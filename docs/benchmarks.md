@@ -35,25 +35,38 @@ dynamically rather than splitting it equally up front.
 export RUST_LLM_MODEL=<path>/Qwen3.5-4B-heretic-Q4_K_M.gguf
 
 # throughput, median of repeats with the spread, per thread count
-rust-llm bench --context 1024 --threads 1,2,3,4,5,6,7,8 --prompt-tokens 19 \
+rust-llm bench --context 1024 --threads 1,2,3,4,5,6,7,8 --prompt-tokens 192 \
   --max-tokens 16 --repeats 3
+
+# the batch-size curve, one invocation per batch size
+rust-llm bench --context 1024 --threads 8 --prompt-tokens 192 \
+  --max-tokens 4 --repeats 2 --batch <n>
 
 # the long-context configuration
-rust-llm bench --context 4096 --threads 4,8 --prompt-tokens 204 \
-  --max-tokens 16 --repeats 3
+rust-llm bench --context 4096 --threads 8,4 --prompt-tokens 1024 \
+  --max-tokens 16 --repeats 2
 
-# where a token's time goes
-rust-llm profile --context 1024 --threads 8 --prompt-tokens 19 --max-tokens 8
+# where a token's time goes, one table per phase
+rust-llm profile --context 1024 --threads 8 --prompt-tokens 192 --max-tokens 8
+
+# the two kernel tiers against each other, from one binary
+rust-llm bench --context 1024 --threads 8 --prompt-tokens 192 --max-tokens 8 \
+  --repeats 2 --batch 16 --tier avx2+vnni     # and --tier avx2+fma
 
 # what the machine can stream, which is the ceiling batch-1 generation hits
 cargo run --release -p llm-core --example bench_bandwidth
 ```
 
 The first run of each configuration is a warm-up and is not counted. The prompt
-is a fixed text in the binary truncated to exactly `--prompt-tokens` tokens (204
-tokens is the whole text), and generation runs exactly `--max-tokens` tokens
-through the forward pass and ignores stop tokens, so two runs measure the same
-work whatever the model decides to say.
+is a fixed text in the binary truncated to exactly `--prompt-tokens` tokens,
+repeated with a space between copies when more tokens are asked for than its
+204, and generation runs exactly `--max-tokens` tokens through the forward pass
+and ignores stop tokens, so two runs measure the same work whatever the model
+decides to say.
+
+`--prompt-tokens 192` rather than M1's 19: a prompt has to be several batches
+long for the batched path's numbers to mean anything, and 192 is twelve batches
+of the default 16.
 
 ## The ceiling: what this box can stream
 
@@ -82,84 +95,238 @@ checks the deadline between whole passes over its region, so it stops up to one
 pass early and then idles while the others finish theirs, while the elapsed time
 counted is the whole scope's. A pass is 68 ms of the 2-second window at 1 thread
 and 23 ms at 8. A low ceiling makes the "fraction of the ceiling" rows below
-read high, so they are flattering by about that much and not conservative: the
-79 per cent at the end of this branch is nearer 77. Taking the elapsed time per
-thread instead of per scope would remove it, and belongs with the kernel work on
-this branch rather than in a docs change.
+read high, so they are flattering by about that much and not conservative.
+Taking the elapsed time per thread instead of per scope would remove it; it was
+left as it is, because the correction is smaller than the window-to-window
+spread of everything it would be applied to.
+
+**The ceiling is for generation only.** A prompt read in batches of 16 reads the
+weights once per batch, so 157 MiB per token, and at the 45.34 prompt tok/s
+below that is 7.0 GiB/s: 14 per cent of the same ceiling. The prompt is not
+bounded by memory any more, which is the whole point of batching it, and a
+"fraction of the ceiling" column for the prompt would say nothing.
 
 ## The runner against that ceiling
 
-Context 1024, 19-token prompt, 16 generated tokens, tier `avx2+vnni`, quota 8
-CPUs. Generation tok/s with its spread, and what fraction of the implied ceiling
-above it reaches.
+Context 1024, 192-token prompt, batch 16, 16 generated tokens, tier
+`avx2+vnni`, quota 8 CPUs, 3 repeats, the quietest window measured
+(load 1.72 -> 5.22, which is this bench's own threads for the most part):
 
-The quietest full sweep (1 to 8, 3 repeats, load 3.99 -> 4.55):
-
-| threads | prompt tok/s | generation tok/s | spread | ceiling | fraction |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 3.55 | 3.47 | 2.2% | 6.26 | 55% |
-| 2 | 6.37 | 6.40 | 1.7% | 11.33 | 56% |
-| 3 | 8.79 | 8.52 | 2.5% | 14.56 | 59% |
-| 4 | 10.80 | 10.60 | 1.9% | 16.63 | 64% |
-| 5 | 12.12 | 11.80 | 4.0% | 17.79 | 66% |
-| 6 | 12.95 | 12.79 | 0.8% | 18.77 | 68% |
-| 7 | 12.78 | 12.69 | 1.1% | 19.30 | 66% |
-| 8 | 11.75 | 11.57 | 12.7% | 19.19 | 60% |
-
-The best window measured (8, 7, 6, 4 in that order, 3 repeats, load 4.96 -> 6.20):
-
-| threads | prompt tok/s | generation tok/s | spread | ceiling | fraction |
-| --- | --- | --- | --- | --- | --- |
-| 4 | 11.30 | 11.15 | 1.0% | 16.63 | 67% |
-| 6 | 14.07 | 14.02 | 8.2% | 18.77 | 75% |
-| 7 | 14.65 | 14.73 | 1.7% | 19.30 | 76% |
-| 8 | 15.03 | 15.23 | 0.9% | 19.19 | **79%** |
+| threads | prompt tok/s | spread | generation tok/s | spread | ceiling | fraction | prompt / generation |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 10.40 | 3.2% | 3.58 | 2.0% | 6.26 | 57% | 2.9 |
+| 2 | 18.92 | 1.9% | 6.61 | 1.5% | 11.33 | 58% | 2.9 |
+| 3 | 25.40 | 1.6% | 8.73 | 3.5% | 14.56 | 60% | 2.9 |
+| 4 | 30.34 | 0.5% | 10.60 | 0.7% | 16.63 | 64% | 2.9 |
+| 5 | 35.41 | 0.9% | 11.93 | 0.8% | 17.79 | 67% | 3.0 |
+| 6 | 40.17 | 1.1% | 12.95 | 1.0% | 18.77 | 69% | 3.1 |
+| 7 | 43.44 | 2.1% | 13.50 | 1.4% | 19.30 | 70% | 3.2 |
+| 8 | 45.34 | 1.5% | 13.72 | 2.7% | 19.19 | **71%** | **3.3** |
 
 Peak RSS 2.82 GiB for the whole bench process, which loads the model once and
-runs every configuration in it; a single `rust-llm run` at context 4096 with 8
-threads peaks at 2.76 GiB, of which 2.52 GiB is the mapped model.
+runs every configuration in it. Per configuration, from a single `rust-llm run`
+with a 16-token prompt: 2.76 GiB at context 1024 and 2.75 GiB at context 4096,
+the same number, because a 16-token prompt touches 32 KV positions whatever the
+context was allocated for. See "Memory" below.
 
-Honest notes on those two tables:
+Honest notes on that table:
 
-- The two disagree about the top of the curve: the first makes 6 threads the
-  peak and the second makes 8 the peak and 30 per cent faster than itself at 6.
-  Both ran under a load average between 4 and 6. The load average does not
-  predict it on its own, because what matters is whether the other work on the
-  box is competing for memory bandwidth or only for CPU.
-- What every window agrees on: the curve rises steeply to 4 threads, 6, 7 and 8
-  are within 10 per cent of each other, and 4 threads is 5 to 35 per cent behind
-  the best setting. Nothing measured here is faster than the quota allows.
-- 1 and 2 threads sit at 55 per cent of the ceiling, 8 threads at 79 per cent in
-  the best window. The remaining fifth is not barrier time any more (see the
-  profile below); it is the output head and everything per token that is not
-  streaming weights.
-- The 8-thread row of the first table has a 12.7 per cent spread, the widest in
-  either table. Asking for the whole quota is the setting most exposed to
-  whatever else runs on the box.
+- **The prompt is 2.9 times generation at 1 to 4 threads and 3.3 times at 8**,
+  and the reason it is not a flat factor is that the two phases are bounded by
+  different things. Generation is bandwidth-bound only once there are enough
+  threads to saturate memory: at 1 thread it reaches 57 per cent of the implied
+  ceiling, so it is compute-bound as well, and batching has less waste to
+  remove. The prompt keeps scaling with cores because it is compute-bound at
+  every thread count.
+- **What caps the ratio is the part of a token that does not batch.** From the
+  profile below, of a 20.06 ms prompt token the delta-net recurrence is 10.0 per
+  cent, the elementwise work 5.9, the convolution 4.1 and the norms 2.5: 22.5
+  per cent that costs the same per token whether 1 token or 16 go through
+  together. With that fixed and the matmuls divided by the batch, 3.3 at 8
+  threads is close to what is available; the next factor would have to come out
+  of the matmul kernel, not out of the batch.
+- Generation reaches 71 per cent of the measured ceiling at 8 threads. The
+  remaining fifth is the output head and everything per token that is not
+  streaming weights; it is not barrier time, which is 3.8 per cent (see the
+  profile).
+- The spreads in this window are under 3.5 per cent everywhere, which is the
+  tightest sweep in this file. Earlier windows on this box gave 12 per cent at
+  8 threads. Compare rows within a window, never across.
 
-Where this started. On the first commit of this branch, same command and
-configuration, before any threading change: 7.75 generation tok/s at 4 threads
-(47 per cent of the ceiling) and 5.52 at 8 threads (29 per cent). Eight threads
-was then the slowest useful setting and is now the fastest.
+Where this started. On the first commit of this branch, same configuration
+before any threading or batching change: 7.75 generation tok/s at 4 threads and
+5.52 at 8, with the prompt equal to generation to within the spread because it
+went through the same single-token path.
 
-### The long-context configuration
+## What batched prompt evaluation moved
 
-Context 4096, 204-token prompt, 16 generated tokens, 3 repeats, load 4.63 -> 8.77:
+Three changes, each measured against the previous commit's binary, alternated in
+one window. Prompt tok/s, context 1024, 192-token prompt, 8 threads, batch 32
+for the first two rows.
 
-| threads | prompt tok/s | generation tok/s | spread (gen) | peak RSS |
+| commit | change | before | after |
+| --- | --- | --- | --- |
+| `2f4ae17` | the prompt goes through as a batch of tokens | 13.6 | 31.6 |
+| `9141c99` | a weight block is unpacked once per batch, not once per token | 31.6 | 44.0 |
+| `1a0f8ae` | the walk over the KV cache is tiled, once per batch | see "Attention" |
+
+Generation is untouched by all three: 13.4 before, 13.3 after, and batch 1
+measures 13.9 against the 13.6 of the commit before it, both inside the spread.
+A batch of one goes down the same code path with every loop running once, so
+that is what it should do.
+
+### The batch-size curve, and why the default is 16
+
+Context 1024, 192-token prompt, 8 threads, 2 repeats, one invocation per batch
+size, load 3.60 -> 8.27 across the series. Prompt tok/s:
+
+| batch | 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32 | 48 | 64 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| tok/s | 13.75 | 21.29 | 30.68 | 38.28 | 41.76 | 44.26 | 44.58 | 46.50 | 46.67 | 47.92 |
+| gain over the previous | | +55% | +44% | +25% | +9% | +6% | +1% | +4% | +0% | +3% |
+
+The knee is at 16, and the curve is monotone from 1, so there is no prompt
+length below which batching should be turned off: a two-token prompt is already
+55 per cent faster read as one batch. The 8 per cent still available between 16
+and 64 is the per-batch fixed costs amortising further (the output head, which
+runs once per batch, and the 161 pool jobs), and it costs four times the batch
+scratch, of which the score buffer alone is batch times context times 16 floats.
+
+16 is also exactly one group of the batched kernel, which is not a coincidence:
+past one group the weight block's unpacking is already divided by 16 and only
+the fixed costs are left to amortise.
+
+## The long-context configuration
+
+Context 4096, 1024-token prompt, batch 16, 16 generated tokens, 2 repeats,
+load 6.37 -> 7.42:
+
+| threads | prompt tok/s | spread | generation tok/s | spread |
 | --- | --- | --- | --- | --- |
-| 4 | 11.18 | 11.17 | 3.6% | |
-| 8 | 13.50 | 12.72 | 10.9% | 3.00 GiB for the process, both configurations |
+| 8 | 45.32 | 0.2% | 13.78 | 9.2% |
+| 4 | 30.53 | 0.1% | 10.34 | 0.5% |
 
-Generation at context 4096 is within the spread of generation at context 1024,
-which the profile predicts: attention is under 1 per cent of a token at these
-lengths, so a four times larger KV cache costs almost nothing. The KV cache is
-what the extra 240 MiB of RSS over the context-1024 run is.
+Peak RSS 3.00 GiB for the process, both configurations.
 
-M1's baseline for the same shape (a 384-token prompt, which does not fit the
-bench text, so not the same row) was 6.68 prompt and 3.90 generation tok/s at 8
-threads. The generation side of that is a factor 3.3 below what this branch
-measures now.
+The prompt is the same 45.3 tok/s as at context 1024, to two decimal places,
+because the work is the same: a 1024-token prompt touches 1024 positions
+whatever the context was allocated for. Generation is the same too at these
+lengths. What *does* move with the context is attention once the positions are
+actually used, which is the next section.
+
+## Attention, and what tiling the KV walk bought
+
+Attention is invisible at short context and the largest single operator at long
+context. Per-operator, 8 threads, batch 16, the prompt length equal to the
+context so the positions are really used:
+
+| context | prompt: attention | prompt: token | generation: attention | generation: token |
+| --- | --- | --- | --- | --- |
+| 1024 | 0.27 ms (1.4%) | 20.06 ms | 0.97 ms (1.5%) | 64.50 ms |
+| 2048 | 2.92 ms (11.9%) | 24.49 ms | 12.50 ms (14.7%) | 85.11 ms |
+| 4096 | 6.49 ms (22.8%) | 28.43 ms | 18.09 ms (20.1%) | 89.83 ms |
+
+The 2048 and 4096 rows are from the commit before `1a0f8ae`, so they are the
+"before" of the pair below. Generation's attention cost is the KV cache's bytes
+and nothing else: at context 4096 one token reads 16 query heads times 4096
+positions times 256 lanes times 4 bytes, for keys and for values, over the eight
+full-attention blocks, which is 1.07 GB and 22 ms at the measured ceiling
+against the 18 to 19 ms measured.
+
+**Tiling the walk over KV positions landed** (`1a0f8ae`). A batch's queries read
+the same keys and values, and the job used to be one chunk per (token, head), so
+a head's span of the cache was read `t` times over. At context 4096 that span is
+8 MiB per KV head, 32 MiB for the four of them, which does not stay in the
+36 MiB L3 next to everything else a token touches. The chunk is now one head
+holding its whole batch, tiled over 128 positions with the queries inside the
+tile. Against the previous commit's binary, alternated in one window
+(load 5.41 -> 8.61):
+
+| | attention | prompt token | prompt tok/s |
+| --- | --- | --- | --- |
+| context 4096, 4096-token prompt, before | 6.49 ms | 28.43 ms | |
+| context 4096, 4096-token prompt, after | 5.20 ms | 26.00 ms | +9% |
+| context 2048, 2048-token prompt, before | 2.92 ms | 24.49 ms | |
+| context 2048, 2048-token prompt, after | 2.80 ms | 24.79 ms | inside the noise |
+
+So it pays from about context 4096 upwards and not below: up to 2048 a head's
+span still fits the L3 and there is nothing to win. Generation has one query per
+head, so no byte is read twice and tiling has nothing to save at any context;
+its numbers across the pair move only with the box (89.83 against 84.35 ms per
+token, in a window whose load went from 5.4 to 8.6).
+
+### Flash-style attention, measured and not kept
+
+The other half of a flash-style attention is the running maximum and running
+sum that let the score row go unmaterialised. That is **not** here, and the
+measurement is why.
+
+The score row is the only thing it saves. At context 4096 a row is 4096 floats,
+16 KiB per query, and the loop that reads it back also reads 4 MiB of values
+from memory in the same pass: the second pass over the scores is a read from L2
+against a read from DRAM three hundred times its size. The upper bound on what
+removing it could win is therefore well under one per cent of an operator that
+is 20 per cent of a token, so under 0.2 per cent of a token, at the context
+where attention matters most of all the ones that fit the measurement budget.
+
+Against that, an incremental softmax rescales its accumulator at every tile, so
+it is a different rounding of the one operator the correctness gate is most
+sensitive to: the gate's four disagreements with the reference sit at margins of
+0.009 to 0.126 on a logit scale, and the softmax is where a score difference
+turns into a logit difference. The tiling as it landed is bit-identical to one
+query at a time instead, which the unit tests assert with `==` on this model's
+GQA shapes, at a cache length and a causal bound either side of the tile
+boundary, for a batch and for a single token.
+
+Projection for the long context we cannot run: the ratio above only gets worse
+for the running softmax as the context grows, because the score row grows
+linearly while the values it is weighed against grow linearly too, and the row
+stays in L2 until about context 32768 (128 KiB per query). There is no context
+at which the saved pass over the scores becomes the larger term.
+
+## KV-cache dtype: measured, not taken
+
+An f16 KV cache halves the bytes generation's attention reads, and that operator
+is measured above: 20.1 per cent of a generation token at context 4096, 14.7 at
+2048, 1.5 at 1024. So the **upper bound** on the win is half of each, which is
+10 per cent of a token at context 4096, 7 per cent at 2048 and nothing
+measurable at 1024, before anything is paid for converting f16 to f32 in the
+score loop.
+
+It is also a rounding change in the attention scores, which is what the gate
+measures, and it would move the fixture that records the four permitted
+disagreements. The fixture moves only with a reason the board has accepted, so
+this is not taken in M2; the number above is what the decision needs. The
+reference's own default is an f16 cache, which is part of why its `tg16` column
+below is ahead of its matched-flags column.
+
+## Memory
+
+Peak RSS, from `VmHWM`, per configuration:
+
+| configuration | peak RSS |
+| --- | --- |
+| `run`, 16-token prompt, context 1024 | 2.76 GiB |
+| `run`, 16-token prompt, context 4096 | 2.75 GiB |
+| `bench` sweep, context 1024, 192-token prompt, 8 thread counts | 2.82 GiB |
+| `bench`, context 4096, 1024-token prompt, 2 thread counts | 3.00 GiB |
+
+Of that, 2.52 GiB is the mapped model file, resident because the output head
+reads the whole embedding table every token; about 190 MiB is the tokenizer's
+in-memory vocabulary; 50 MiB is the recurrent state, written every token.
+
+**Raising `--context` costs nothing until the positions are used**, which the
+first two rows measure: the same 2.75 GiB at context 1024 and at 4096 for a
+16-token prompt. `vec![0.0; n]` of the cache's size comes from `mmap`, so its
+pages become resident as they are first written. The difference between the last
+two rows, 180 MiB, is exactly the KV positions the 1024-token prompt at context
+4096 touches that the 192-token prompt at context 1024 does not: 3072 extra
+positions times 8 blocks times 2 times 4 KV heads times 256 lanes times 4 bytes
+is 192 MiB.
+
+The batched path adds scratch for a batch of 16: every intermediate is 16 rows
+instead of 1, and the score buffer is batch times head count times context
+floats, 4 MiB at context 4096. That is inside the noise of the table above.
 
 ## llama.cpp on the same file, at matching thread counts
 
@@ -175,79 +342,78 @@ export LD_LIBRARY_PATH=$REF_BIN
 M=<path>/Qwen3.5-4B-heretic-Q4_K_M.gguf
 
 # flags matched to what this runner does: no weight repacking, no flash attention
-$REF_BIN/llama-bench -m $M -p 19 -n 16 -t 1,3,4,6,7,8 -r 3 --repack 0 -fa off
+$REF_BIN/llama-bench -m $M -p 192 -n 16 -t 1,2,3,4,5,6,7,8 -r 3 --repack 0 -fa off
 
 # the reference as it ships: repacking on, flash attention auto, f16 KV cache
-$REF_BIN/llama-bench -m $M -p 19 -n 16 -t 1,3,4,6,7,8 -r 3
+$REF_BIN/llama-bench -m $M -p 192 -n 16 -t 1,2,3,4,5,6,7,8 -r 3
 ```
 
 `-ctk f32 -ctv f32` is refused by `llama-bench` at this commit, so both
-reference rows run an f16 KV cache where this runner keeps f32. At a 19-token
-prompt and 16 generated tokens the KV cache is a few hundred KiB against
-2.52 GiB of weights per token, so it is not what these rows differ by; the
-per-layer comparison, which does need f32, uses `llama-eval-callback` and gets
-it there.
+reference rows run an f16 KV cache where this runner keeps f32. At a 192-token
+prompt and 16 generated tokens the KV cache is under a megabyte against 2.52 GiB
+of weights per token, so it is not what these rows differ by; the per-layer
+comparison, which does need f32, uses `llama-eval-callback` and gets it there.
 
-Generation (`tg16`), three runs each, all at matching thread counts. Our column
-is a `bench` sweep run in the same window as the reference's own defaults
-(load 8.56 -> 9.68 against 7.41 -> 8.35), which is a busy window for all three.
+All three columns were measured within the same half hour on a box whose load
+average stayed between 1.7 and 6.4: ours at 1.72 -> 5.22, the matched reference
+at 3.64 -> 6.38, the reference's defaults at 6.38 -> 5.43.
 
-| threads | reference, matched flags | reference, its defaults | this runner |
-| --- | --- | --- | --- |
-| 1 | 3.35 | 3.79 | 3.12 |
-| 3 | 8.86 | 8.54 | 7.92 |
-| 4 | 8.96 | 9.58 | 9.60 |
-| 6 | 8.56 | 8.99 | 10.43 |
-| 7 | 7.93 | 8.22 | 10.25 |
-| 8 | 7.28 | 7.54 | 9.54 |
+Generation, `tg16` against our generation tok/s:
 
-Prompt (`pp19` against our prompt tok/s), same runs:
-
-| threads | reference, matched flags | reference, its defaults | this runner |
-| --- | --- | --- | --- |
-| 1 | 9.38 | 11.87 | 3.12 |
-| 3 | 23.76 | 33.80 | 7.96 |
-| 4 | 30.70 | 39.76 | 9.67 |
-| 6 | 35.35 | 44.11 | 10.36 |
-| 7 | 28.98 | 42.17 | 10.10 |
-| 8 | 27.39 | 39.13 | 9.47 |
-
-And at the long-context configuration (`-p 204 -n 16 -r 3`, reference defaults,
-load 7.74 -> 7.80, against our context-4096 table above):
-
-| threads | reference prompt | this runner prompt | reference generation | this runner generation |
+| threads | reference, matched flags | reference, its defaults | this runner | against matched |
 | --- | --- | --- | --- | --- |
-| 4 | 65.09 | 11.18 | 11.87 | 11.17 |
-| 8 | 93.79 | 13.50 | 13.61 | 12.72 |
+| 1 | 4.01 | 4.83 | 3.58 | -11% |
+| 2 | 7.21 | 8.35 | 6.61 | -8% |
+| 3 | 9.49 | 10.40 | 8.73 | -8% |
+| 4 | 11.02 | 12.11 | 10.60 | -4% |
+| 5 | 12.06 | 13.06 | 11.93 | -1% |
+| 6 | 12.75 | 13.61 | 12.95 | +2% |
+| 7 | 12.81 | 14.07 | 13.50 | +5% |
+| 8 | 12.51 | 13.85 | 13.72 | +10% |
+
+Prompt, `pp192` against our prompt tok/s:
+
+| threads | reference, matched flags | reference, its defaults | this runner | against matched |
+| --- | --- | --- | --- | --- |
+| 1 | 21.08 | 21.37 | 10.40 | -51% |
+| 2 | 38.43 | 39.60 | 18.92 | -51% |
+| 3 | 51.91 | 53.02 | 25.40 | -51% |
+| 4 | 65.79 | 67.03 | 30.34 | -54% |
+| 5 | 76.11 | 78.75 | 35.41 | -53% |
+| 6 | 85.31 | 90.08 | 40.17 | -53% |
+| 7 | 91.04 | 95.30 | 43.44 | -52% |
+| 8 | 93.97 | 98.21 | 45.34 | -52% |
 
 One note per place we are behind:
 
-- **The prompt phase is a factor 4 to 7 behind, and that is the largest gap in
-  this file.** The reference evaluates a prompt as a batch, so one pass over the
-  weights produces many positions at once; this runner still pushes the prompt
-  through the single-token path, so it pays the full 2.52 GiB per token. It is
-  bounded by exactly the thing the generation path is bounded by, which is why
-  our prompt and generation tok/s are equal to within the spread and the
-  reference's are not. Batched prompt evaluation is the next child issue on this
-  branch.
-- **One thread is 10 to 20 per cent behind** (3.12 against 3.35 and 3.79). With
-  one thread there is no scheduling left to win, so this is kernel work: the
-  reference repacks weights into a layout its kernel likes even with `--repack 0`
-  for some tensors, and its Q4_K kernel is better tuned than ours. Kernel tuning
-  is the next child issue as well.
-- **Generation past 4 threads we are ahead**, by 16 to 27 per cent at 6, 7 and 8,
-  because the reference's own curve turns down there and ours does not. That is
-  not a kernel win, it is the scheduling work on this branch. Best setting
-  against best setting in one window, ours 10.43 at 6 threads against its 9.58 at
-  4, we are 9 per cent ahead; in the quieter window where we reach 15.23 the gap
-  is larger, but the reference was not re-measured in that window and this file
-  does not pair numbers across windows.
-- The reference's defaults beat its matched flags by 4 to 13 per cent on
-  generation and 15 to 45 per cent on the prompt, which is the price of the
+- **Generation is within 11 per cent of the reference at every thread count from
+  1 to 8 with the flags matched**, and ahead of it at 6, 7 and 8 because its own
+  curve turns down there and ours does not. Against the reference's shipping
+  defaults we are 26 per cent behind at 1 thread, 21 at 2 and 1 per cent at 8:
+  the difference between its two columns is weight repacking, which reorders the
+  quantization blocks into a layout its kernel prefers and is a different
+  rounding of the same arithmetic. We deliberately read the blocks as the file
+  stores them.
+- **One thread is the widest generation gap** (3.58 against 4.01 matched).
+  With one thread there is no scheduling left to win, so this is kernel work:
+  our Q4_K dot is about 11 per cent behind theirs on the same block layout.
+- **The prompt is a factor 2.1 behind, down from a factor 4 to 7 before this
+  branch.** The remaining factor is a different algorithm, not a different
+  schedule: the reference turns a batched prompt into a true matrix-matrix
+  multiply over a repacked weight layout, blocked in both dimensions, where this
+  runner keeps the matvec shape and walks one weight row against the batch. The
+  profile says where that would have to be won: 76 per cent of a prompt token is
+  matmul, and at batch 16 it is compute-bound (157 MiB of
+  weights per token is 7.0 GiB/s at 45 tok/s, 14 per cent of the ceiling), so
+  the next factor is register blocking over several weight rows at once. That is
+  a kernel rewrite and it is M3's, not this issue's.
+- The reference's defaults beat its matched flags by 4 to 20 per cent on
+  generation and 1 to 5 per cent on the prompt, which is the price of the
   comparison being fair rather than flattering.
 
-At matching thread counts the reference is a peer and not a floor. The bar for
-this runner is the bandwidth ceiling in the table above, not llama.cpp.
+At matching thread counts the reference is a peer on generation and ahead on the
+prompt. The bar for this runner is the bandwidth ceiling in the table above, not
+llama.cpp.
 
 ## Where a token's time goes
 
@@ -262,60 +428,92 @@ waiting for the last worker is part of what that matmul costs.
 `bench` by what is not inside a timed operator, which at these sizes is the
 argmax over 248320 logits.
 
-### Now, at the end of the threading work
+### Now, at the end of M2
+
+```
+profile: prompt, 192 tokens, 8 threads, context 1024, batch 16, tier avx2+vnni
+operator                           calls/t   ms/token       %
+ffn: gate and up matmul                2.0       5.35    26.7
+ffn: down matmul                       2.0       3.78    18.8
+linear: qkv, gate, alpha, beta matmul    1.5       2.88    14.4
+linear: delta-net recurrence           1.5       2.00    10.0
+linear: output matmul                  1.5       1.36     6.8
+elementwise                           11.5       1.18     5.9
+linear: convolution                    1.5       0.83     4.1
+full: qg, k and v matmul               0.5       0.79     3.9
+output head matmul                     0.1       0.68     3.4
+norms and rope                         7.6       0.51     2.5
+full: output matmul                    0.5       0.43     2.1
+full: attention                        0.5       0.27     1.4
+embed                                  1.0       0.00     0.0
+measured total                                  20.06   100.0
+of which pool hand-out                10.1       0.84     4.2
+of which pool join (last worker)      10.1       0.80     4.0
+```
 
 ```
 profile: generation, 8 tokens, 8 threads, context 1024, tier avx2+vnni
 operator                           calls/t   ms/token       %
-ffn: gate and up matmul               32.0      18.52    27.9
-ffn: down matmul                      32.0      12.78    19.3
-linear: qkv, gate, alpha, beta matmul    24.0      11.15    16.8
-output head matmul                     1.0      10.95    16.5
-linear: output matmul                 24.0       3.49     5.3
-full: qg, k and v matmul               8.0       2.65     4.0
-linear: delta-net recurrence          24.0       2.45     3.7
-elementwise                          184.0       1.23     1.9
-full: output matmul                    8.0       1.17     1.8
-linear: convolution                   24.0       0.94     1.4
-norms and rope                       121.0       0.58     0.9
-full: attention                        8.0       0.48     0.7
+ffn: gate and up matmul               32.0      17.90    27.7
+ffn: down matmul                      32.0      12.34    19.1
+linear: qkv, gate, alpha, beta matmul   24.0      10.88    16.9
+output head matmul                     1.0      10.58    16.4
+linear: output matmul                 24.0       3.35     5.2
+full: qg, k and v matmul               8.0       2.59     4.0
+linear: delta-net recurrence          24.0       2.22     3.4
+elementwise                          184.0       1.17     1.8
+full: output matmul                    8.0       1.12     1.7
+full: attention                        8.0       0.97     1.5
+linear: convolution                   24.0       0.82     1.3
+norms and rope                       121.0       0.56     0.9
 embed                                  1.0       0.00     0.0
-measured total                                  66.40   100.0
-of which pool hand-out               161.0       1.21     1.8
-of which pool join (last worker)     161.0       2.74     4.1
+measured total                                  64.50   100.0
+of which pool hand-out               161.0       0.78     1.2
+of which pool join (last worker)     161.0       2.46     3.8
 ```
 
-```
-profile: generation, 8 tokens, 4 threads, context 1024, tier avx2+vnni
-operator                           calls/t   ms/token       %
-ffn: gate and up matmul               32.0      26.61    29.8
-ffn: down matmul                      32.0      16.52    18.5
-linear: qkv, gate, alpha, beta matmul    24.0      15.22    17.1
-output head matmul                     1.0      14.18    15.9
-linear: output matmul                 24.0       4.71     5.3
-linear: delta-net recurrence          24.0       3.87     4.3
-full: qg, k and v matmul               8.0       3.77     4.2
-full: output matmul                    8.0       1.51     1.7
-elementwise                          184.0       1.11     1.2
-linear: convolution                   24.0       0.89     1.0
-norms and rope                       121.0       0.54     0.6
-full: attention                        8.0       0.23     0.3
-embed                                  1.0       0.00     0.0
-measured total                                  89.16   100.0
-of which pool hand-out               161.0       0.16     0.2
-of which pool join (last worker)     161.0       1.73     1.9
-```
+The `calls/t` column in the prompt table is per token, so a batch of 16 shows
+the 32 feed-forward jobs of a token as 2 and the one output head as 0.1: ten
+jobs per token instead of 161, which is where the pool's share went from 5.9 to
+8.2 per cent of a much smaller token without growing in absolute terms.
 
-The prompt-phase table is the same table to within a per cent, because the
-prompt runs through the same single-token path; `rust-llm profile` prints both.
+What is left to win, in order:
 
-What is left to win, in order: the four matmul groups are 84 per cent of a token
-and they are streaming weights, so they are the ceiling itself. The output head
-is 16 per cent on its own, a single 2560 x 248320 matmul over the whole embedding
-table, the one matmul that cannot be fused with anything and the one place where
-a batched prompt pass would pay most. Attention, the convolution, the delta-net
-recurrence and the norms together are under 7 per cent at this context length,
-so flash-style attention has to be judged at long contexts, not at 1024.
+- **The matmuls other than the output head are 73 per cent of a prompt token
+  and 75 per cent of a generation token** (76 and 91 with the head). In
+  generation they are streaming weights and so are the ceiling itself. In the prompt they are compute, and the next factor is in the
+  kernel: register blocking over several weight rows, which is the shape the
+  reference's repacked GEMM has and ours does not.
+- **The output head is 16.4 per cent of a generation token** and 3.4 of a prompt
+  token, because a batch computes it once. It is a single 2560 x 248320 matmul
+  over the whole embedding table and it cannot be fused with anything.
+- **The delta-net recurrence is 10 per cent of a prompt token**, up from 3.4 per
+  cent of a generation token, because it is the one operator a batch does not
+  make cheaper: it is sequential over tokens by construction. Its inner loops
+  carry an f32 reduction, so they do not vectorize without reassociating the
+  sum, which would change the result. That is why it is not on this branch; see
+  "What was measured and not kept".
+- Attention is 1.4 per cent at this context and 20 per cent at 4096; see
+  "Attention" above.
+
+### The tiers against each other
+
+The VNNI tier was kept on this measurement rather than deleted. Prompt tok/s,
+context 1024, 192-token prompt, batch 16, two passes each alternated from one
+binary through `--tier`:
+
+| | pass 1 | pass 2 | generation |
+| --- | --- | --- | --- |
+| 8 threads, `avx2+vnni` | 46.19 | 44.53 | 12.38, 13.46 |
+| 8 threads, `avx2+fma` | 43.63 | 43.27 | 12.47, 14.08 |
+| 1 thread, `avx2+vnni` | 10.48 | | 3.60 |
+| 1 thread, `avx2+fma` | 9.96 | | 3.75 |
+
+VNNI is 4.4 per cent ahead at 8 threads and 5.2 at 1 on the prompt, which is the
+compute-bound path and so the one where a kernel can show at all, and a tie
+inside the spread on generation, which is bandwidth-bound. Before the batched
+kernel landed the same pair was 32.65/32.72 against 31.53/31.47, 3.8 per cent.
+Both tiers have the batched kernel, so this is like for like.
 
 ### Before the threading work, for comparison
 
@@ -340,7 +538,6 @@ elementwise                          184.0       1.04     0.8
 full: attention                        8.0       0.98     0.8
 linear: convolution                   24.0       0.81     0.7
 norms and rope                       121.0       0.53     0.4
-embed                                  1.0       0.00     0.0
 measured total                                 122.86   100.0
 of which pool wake (barrier in)      281.0      12.36    10.1
 of which pool join (barrier out)     281.0      28.51    23.2
@@ -356,13 +553,8 @@ of which pool join (barrier out)     281.0      69.40    40.9
 
 That is 281 pool jobs per token meeting at two `std::sync::Barrier`s, costing 33
 per cent of a token at 4 threads and 67 per cent at 8, which is the whole reason
-8 threads used to be slower than 4. It is 2.1 per cent at 4 threads and 5.9 per
-cent at 8 now, and the per-tensor breakdown inside a group is gone because the
-group is one job.
-
-This is also why the table above has fewer rows: the projections that read the
-same normalised input are one job, so the profile can no longer attribute time
-to `ffn: gate` and `ffn: up` separately. The per-tensor split is this table.
+8 threads used to be slower than 4. It is 5.0 per cent at 8 threads now, and the
+per-tensor breakdown inside a group is gone because the group is one job.
 
 ## What the threading work moved
 
@@ -380,18 +572,36 @@ Generation tok/s, context 1024, 19-token prompt, 16 generated tokens. The
 absolute level differs between rows because each row is its own window; only the
 pair within a row is comparable.
 
-None of the three changes the arithmetic. The per-layer trace of a two-token
-prompt is byte-identical across all three at 4 and at 7 threads, and both
-correctness gates keep the four disagreements the fixture records at 0.0094,
-0.0104, 0.0475 and 0.1262.
+None of the three changes the arithmetic, and neither does anything on the
+batched path: the per-layer trace of a two-token prompt is byte-identical across
+all of them, and both correctness gates keep the four disagreements the fixture
+records at 0.00937, 0.01035, 0.04748 and 0.12625, to the last digit.
 
 ## What was measured and not kept
 
+- **The running maximum and running sum of a flash-style attention**: see
+  "Flash-style attention, measured and not kept" above. Under 0.2 per cent of a
+  token at the context where attention matters most, against a rounding change
+  in the softmax.
+- **An f16 KV cache**: see "KV-cache dtype" above. Upper bound 10 per cent of a
+  generation token at context 4096, nothing measurable at 1024, and a rounding
+  change in the scores.
+- **Vectorizing the delta-net recurrence**: not implemented. Its inner loops
+  accumulate `sk` and the readout in f32, which is a serial dependency the
+  compiler cannot vectorize without reassociating the sum, and reassociating it
+  changes the result of the operator the reference's own arithmetic was copied
+  for. It is 10 per cent of a prompt token, so there is something there, but it
+  is a change to the arithmetic and belongs with a decision about the gate
+  rather than inside a tuning commit.
+- **A batch larger than 16 as the default**: measured, 8 per cent more prompt
+  tok/s at batch 64 for four times the scratch. See the batch-size curve.
+- **A batched Q8_0 kernel**: not written. This file holds no `Q8_0` tensor, so
+  there is nothing here to measure it on, and a kernel nobody can measure is a
+  second rounding behaviour to keep green for nothing.
 - **Thread affinity**, pinning workers to CPUs: not implemented. The profile
   stopped pointing at the scheduler once the hand-out was a sequence counter and
-  the split was dynamic (the wait for the last worker is 1.7 ms of an 89 ms
-  token at 4 threads), and the quota does not say which CPUs it will be given, so
-  pinning here would be guessing at the host's placement on a box that is shared
-  with other work.
+  the split was dynamic, and the quota does not say which CPUs it will be given,
+  so pinning here would be guessing at the host's placement on a box that is
+  shared with other work.
 - **A thread count below the quota as the default**: measured, does not hold.
   See `docs/decisions.md` under "Threading".
