@@ -11,4 +11,7 @@ thiserror.workspace = true
 tokenizers.workspace = true
 
 [dev-dependencies]
+# Only the test fixture writer needs it, to put f16 block scales in a GGUF
+# it builds byte by byte. It is already in the tree through llm-core.
+half.workspace = true
 serde_json.workspace = true
