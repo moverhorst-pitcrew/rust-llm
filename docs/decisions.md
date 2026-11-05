@@ -421,6 +421,11 @@ two tokens comes out as a replacement character. When that happens the whole
 output is decoded again and printed after the stream, rather than buffering
 every token and streaming nothing.
 
+**The model path has no default.** `--model`, or `RUST_LLM_MODEL`, or an error
+naming both: a path compiled in would be a path on whichever machine it was
+written on. The tests that need the weights read the same variable and say so
+when it is missing.
+
 `rust-llm trace` runs the same pass with the activation tracer on and prints
 one node per line, which is the input to the reference comparison below.
 
@@ -428,17 +433,19 @@ one node per line, which is the input to the reference comparison below.
 
 llama.cpp on the **same GGUF file**, so quantization is out of the comparison.
 It is a reference only: it is never linked into the product and does not appear
-in the workspace's dependency tree. There is no system `cmake` and no root on
-this box, so `cmake` comes from a venv:
+in the workspace's dependency tree. It is built in any directory outside this
+repository, `$REF_DIR` below, and nothing in the repository holds that path:
+the tests take it from `RUST_LLM_REFERENCE_BIN`. If the machine has no system
+`cmake` and no root, as ours does not, a venv provides it:
 
 ```sh
-python3 -m venv /paperclip/models/ref/venv
-/paperclip/models/ref/venv/bin/pip install cmake
-git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /paperclip/models/ref/llama.cpp
-cd /paperclip/models/ref/llama.cpp
-PATH=/paperclip/models/ref/venv/bin:$PATH cmake -B build -DCMAKE_BUILD_TYPE=Release \
+python3 -m venv "$REF_DIR/venv"
+"$REF_DIR/venv/bin/pip" install cmake
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$REF_DIR/llama.cpp"
+cd "$REF_DIR/llama.cpp"
+PATH="$REF_DIR/venv/bin:$PATH" cmake -B build -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_NATIVE=ON
-PATH=/paperclip/models/ref/venv/bin:$PATH cmake --build build -j 32 \
+PATH="$REF_DIR/venv/bin:$PATH" cmake --build build -j 32 \
   --target llama-completion llama-tokenize llama-bench llama-eval-callback
 ```
 
@@ -518,7 +525,7 @@ build and compares, or writes it with `RUST_LLM_WRITE_FIXTURE=1`. One prompt
 per command, selected by a substring of its name:
 
 ```sh
-RUST_LLM_REFERENCE_BIN=/paperclip/models/ref/llama.cpp/build/bin \
+RUST_LLM_REFERENCE_BIN=$REF_DIR/llama.cpp/build/bin \
   RUST_LLM_GATE_ONLY=capital_no_think \
   cargo test -p rust-llm --release --test gate -- --ignored the_fixture_is_still
 ```

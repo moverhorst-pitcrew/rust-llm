@@ -41,13 +41,14 @@ done
 sha256sum Qwen3.5-4B-heretic-Q4_K_M.gguf tokenizer.json config.json chat_template.jinja
 ```
 
-The tests that read the model look for it at
-`/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf`, or
-wherever `RUST_LLM_MODEL` points. They are `#[ignore]`d, so CI passes without
-the weights; run them with:
+The tests that read the model take its path from `RUST_LLM_MODEL` and have no
+default, so they say what to set rather than looking in a directory that only
+exists on one machine. They are `#[ignore]`d, so CI passes without the weights;
+run them with:
 
 ```sh
-cargo test --workspace --release -- --ignored --nocapture
+RUST_LLM_MODEL=<path>/Qwen3.5-4B-heretic-Q4_K_M.gguf \
+  cargo test --workspace --release -- --ignored --nocapture
 ```
 
 ## What is in the Q4_K_M file

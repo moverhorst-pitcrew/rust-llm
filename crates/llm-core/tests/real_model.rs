@@ -7,7 +7,7 @@
 //! cargo test -p llm-core --release --test real_model -- --ignored --nocapture
 //! ```
 //!
-//! Override the path with `RUST_LLM_MODEL` if the model lives elsewhere.
+//! `RUST_LLM_MODEL` holds the path to the GGUF file; there is no default.
 //!
 //! **This binary holds exactly one test on purpose.** It measures resident set
 //! size, which is a property of the process, not of the test, so a second test
@@ -21,7 +21,14 @@ use std::collections::BTreeMap;
 use llm_core::quant::GgmlType;
 use llm_core::{Gguf, qwen35};
 
-const DEFAULT_MODEL: &str = "/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf";
+/// The model file, from `RUST_LLM_MODEL`.
+///
+/// No default: a path baked into the repository is a path on one machine. The
+/// message is what someone who has just cloned this needs to read.
+fn model_path() -> String {
+    std::env::var("RUST_LLM_MODEL")
+        .unwrap_or_else(|_| panic!("set RUST_LLM_MODEL to the GGUF file (see docs/models.md)"))
+}
 
 /// A `/proc/self/status` size field in KiB (`VmRSS`, `VmHWM`, ...).
 fn status_kib(field: &str) -> u64 {
@@ -37,7 +44,7 @@ fn status_kib(field: &str) -> u64 {
 #[test]
 #[ignore = "needs the model file"]
 fn opens_the_real_model() {
-    let path = std::env::var("RUST_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let path = model_path();
     let file_bytes = std::fs::metadata(&path).expect("model file").len();
     let before = status_kib("VmRSS");
 

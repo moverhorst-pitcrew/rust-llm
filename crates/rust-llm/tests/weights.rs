@@ -9,10 +9,18 @@ use llm_core::Gguf;
 use rust_llm::Tokenizer;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
-const DEFAULT_MODEL: &str = "/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf";
+
+/// The model file, from `RUST_LLM_MODEL`.
+///
+/// No default: a path baked into the repository is a path on one machine. The
+/// message is what someone who has just cloned this needs to read.
+fn model_path() -> String {
+    std::env::var("RUST_LLM_MODEL")
+        .unwrap_or_else(|_| panic!("set RUST_LLM_MODEL to the GGUF file (see docs/models.md)"))
+}
 
 fn model() -> Gguf {
-    let path = std::env::var("RUST_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let path = model_path();
     Gguf::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"))
 }
 
@@ -89,10 +97,8 @@ fn the_committed_tokenizer_is_byte_identical_to_the_models() {
     // Otherwise the committed copy could drift from the file the weights were
     // converted with, and every id check above would be checking the drift
     // against itself.
-    let model_dir = std::path::Path::new(DEFAULT_MODEL)
-        .parent()
-        .expect("model dir")
-        .to_path_buf();
+    let path = model_path();
+    let model_dir = std::path::Path::new(&path).parent().expect("model dir");
     let theirs = std::fs::read(model_dir.join("tokenizer.json")).expect("model tokenizer.json");
     let ours = std::fs::read(format!("{FIXTURES}/tokenizer.json")).expect("committed copy");
     assert_eq!(ours.len(), theirs.len());

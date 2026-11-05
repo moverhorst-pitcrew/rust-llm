@@ -1,7 +1,8 @@
 //! What the generation loop allocates, measured rather than asserted.
 //!
 //! ```text
-//! cargo test -p rust-llm --release --test allocations -- --ignored --nocapture
+//! RUST_LLM_MODEL=<path>/model.gguf \
+//!   cargo test -p rust-llm --release --test allocations -- --ignored --nocapture
 //! ```
 //!
 //! It needs the weights, because what is interesting is the real pass over the
@@ -26,7 +27,6 @@ use rust_llm::generate::{argmax, generate};
 use rust_llm::model::Model;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
-const DEFAULT_MODEL: &str = "/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf";
 
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static COUNTING: AtomicBool = AtomicBool::new(false);
@@ -80,8 +80,13 @@ fn allocations(f: impl FnOnce()) -> usize {
     COUNT.load(Ordering::Relaxed)
 }
 
+/// The model file, from `RUST_LLM_MODEL`.
+///
+/// No default: a path baked into the repository is a path on one machine. The
+/// message is what someone who has just cloned this needs to read.
 fn model_path() -> String {
-    std::env::var("RUST_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+    std::env::var("RUST_LLM_MODEL")
+        .unwrap_or_else(|_| panic!("set RUST_LLM_MODEL to the GGUF file (see docs/models.md)"))
 }
 
 fn prompt_tokens(tokenizer: &Tokenizer) -> Vec<u32> {

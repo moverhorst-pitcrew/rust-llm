@@ -1,7 +1,9 @@
 //! The correctness gate: greedy generation against llama.cpp on the same GGUF
 //! file, over the committed prompt set in `fixtures/gate_prompts.json`.
 //!
-//! Four tests, all ignored by default because they need the weights:
+//! Four tests, all ignored by default because they need the weights.
+//! `RUST_LLM_MODEL` is the path to the GGUF file and has no default, so it goes
+//! in front of every command below:
 //!
 //! ```text
 //! # correctness: every next-token prediction against the reference  (~2 min)
@@ -14,7 +16,7 @@
 //! cargo test -p rust-llm --release --test gate -- --ignored --nocapture resetting
 //!
 //! # re-derive one prompt of the fixture from a local llama.cpp build (~30 s)
-//! RUST_LLM_REFERENCE_BIN=/paperclip/models/ref/llama.cpp/build/bin \
+//! RUST_LLM_REFERENCE_BIN=$REF_DIR/llama.cpp/build/bin \
 //!   RUST_LLM_GATE_ONLY=capital_no_think \
 //!   cargo test -p rust-llm --release --test gate -- --ignored --nocapture the_fixture_is_still
 //! ```
@@ -75,7 +77,6 @@ use rust_llm::generate::{argmax, generate};
 use rust_llm::model::Model;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
-const DEFAULT_MODEL: &str = "/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf";
 /// Enough for every prompt in the set plus its answer, and small enough that
 /// the KV cache stays a rounding error next to the weights.
 const CONTEXT: usize = 1024;
@@ -86,8 +87,13 @@ const CONTEXT: usize = 1024;
 /// this.
 const INDETERMINATE: f32 = 0.25;
 
+/// The model file, from `RUST_LLM_MODEL`.
+///
+/// No default: a path baked into the repository is a path on one machine. The
+/// message is what someone who has just cloned this needs to read.
 fn model_path() -> String {
-    std::env::var("RUST_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+    std::env::var("RUST_LLM_MODEL")
+        .unwrap_or_else(|_| panic!("set RUST_LLM_MODEL to the GGUF file (see docs/models.md)"))
 }
 
 /// One prompt as the gate drives it.
@@ -649,6 +655,7 @@ fn the_fixture_is_still_what_the_reference_produces() {
 /// The top-level `reference` always describes the build of the most recent
 /// write. On a partial write against a different build that is worth saying out
 /// loud, because the cases that were not regenerated came from the old one.
+///
 fn merge_into_fixture(all: &[Case], fresh: &[serde_json::Value], reference: &str) {
     let path = format!("{FIXTURES}/reference_generations.json");
     let existing: Option<serde_json::Value> = std::fs::read_to_string(&path)

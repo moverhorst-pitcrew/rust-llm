@@ -24,8 +24,7 @@ rust-llm trace --prompt <text> [options]
           against a reference runner (see docs/decisions.md)
 
 options
-  --model <path>        GGUF file (default $RUST_LLM_MODEL, else the path in
-                        docs/models.md)
+  --model <path>        GGUF file; required, or set $RUST_LLM_MODEL
   --tokenizer <path>    tokenizer.json (default: next to the model)
   --prompt <text>       the user message (required)
   --system <text>       a system message, placed first
@@ -35,8 +34,6 @@ options
   --think, --no-think   thinking mode, on by default, as the template is
   --raw                 take --prompt as the prompt verbatim, no chat template
 ";
-
-const DEFAULT_MODEL: &str = "/paperclip/models/qwen3.5-4b-heretic/Qwen3.5-4B-heretic-Q4_K_M.gguf";
 
 struct Args {
     command: String,
@@ -173,9 +170,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let mut out = Args {
         command: String::new(),
+        // No default: a path baked in here would be a path on one machine.
         model: std::env::var("RUST_LLM_MODEL")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_MODEL)),
+            .unwrap_or_default(),
         tokenizer: None,
         prompt: String::new(),
         system: None,
@@ -218,6 +216,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     }
     if !seen_prompt {
         return Err(format!("--prompt is required\n\n{USAGE}"));
+    }
+    if out.model.as_os_str().is_empty() {
+        return Err(format!(
+            "no model: pass --model <path> or set RUST_LLM_MODEL (see docs/models.md)\n\n{USAGE}"
+        ));
     }
     Ok(Some(out))
 }
