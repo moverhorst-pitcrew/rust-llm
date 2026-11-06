@@ -12,7 +12,7 @@ pub mod tokenizer;
 
 pub use chat::{ChatError, ChatOptions, Message, Role, STOP_TOKENS};
 pub use forward::Runner;
-pub use generate::{Stop, Timings};
+pub use generate::{DraftSource, Stop, Timings};
 pub use model::{Config, Model, ModelError};
 pub use sample::{Sampler, Sampling};
 pub use tokenizer::Tokenizer;

@@ -20,7 +20,7 @@
 use std::time::{Duration, Instant};
 
 use crate::forward::Runner;
-use crate::generate::{Speculated, Stop, generate};
+use crate::generate::{DraftSource, Speculated, Stop, generate};
 use crate::model::Model;
 use crate::sample::{Sampler, argmax};
 
@@ -51,6 +51,8 @@ pub struct Options {
     /// Drafted tokens per pass. Above 0, every block also reports what a
     /// verification row costs; see [`verify_rows`].
     pub speculate: usize,
+    /// Where those drafts come from.
+    pub draft_source: DraftSource,
 }
 
 /// One timed pass: the prompt, then a fixed number of generated tokens.
@@ -190,6 +192,14 @@ fn speculated(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options)
         Runner::with_speculation(model, opts.context, threads, opts.batch, opts.speculate);
     for (label, draft) in [("sequential", 0), ("speculated", opts.speculate)] {
         assert!(runner.set_draft(draft), "the ring was sized for this draft");
+        // The MTP block is enabled for the drafting arm only, so `sequential`
+        // stays the loop without the feature rather than the loop still paying
+        // to keep the block caught up. That catch-up is therefore inside the
+        // speculated row, which is where a speed-up has to carry it.
+        if draft > 0 && opts.draft_source == DraftSource::Mtp {
+            runner.reset();
+            assert!(runner.enable_mtp(), "the file has an MTP block");
+        }
         // Not counted, and once per draft length: the first run faults in the
         // slots this draft length is the first to touch.
         let _ = generated(&mut runner, model, prompt, opts.generate);
@@ -209,7 +219,11 @@ fn speculated(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options)
         }
         println!("  {label}  {}", summary(&rates));
         if draft > 0 {
-            println!("    {produced} tokens, {stopped:?}, {}", tally.report());
+            println!(
+                "    {produced} tokens from {}, {stopped:?}, {}",
+                opts.draft_source.as_str(),
+                tally.report()
+            );
         }
     }
 }

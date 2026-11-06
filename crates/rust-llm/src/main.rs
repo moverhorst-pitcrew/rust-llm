@@ -12,7 +12,7 @@ use rust_llm::chat::{ChatOptions, Message};
 use rust_llm::forward::Runner;
 use rust_llm::model::Model;
 use rust_llm::sample::{self, Sampler, Sampling, entropy_seed};
-use rust_llm::{Stop, Tokenizer, bench, default_threads, generate, peak_rss_kib};
+use rust_llm::{DraftSource, Stop, Tokenizer, bench, default_threads, generate, peak_rss_kib};
 
 use llm_core::{Gguf, Kernels, Tier};
 
@@ -50,10 +50,14 @@ options
                         bench 16, and bench generates exactly this many)
   --batch <n>           tokens per batch while reading the prompt (default:
                         see docs/decisions.md; 1 reads it token by token)
-  --speculate <n>       draft n tokens per step from the text so far and verify
-                        them in one batch; 0 is off (default and why: see
-                        docs/benchmarks.md). Costs about 50 MiB per drafted
-                        token and never changes what comes out.
+  --speculate <n>       draft n tokens per step and verify them in one batch;
+                        0 is off (default and why: see docs/benchmarks.md).
+                        Costs about 50 MiB per drafted token and never changes
+                        what comes out.
+  --draft-source <name> where those drafts come from: prompt-lookup (default,
+                        the text so far, works on any file) or mtp (the model's
+                        own prediction head, needs a file that kept it; see
+                        docs/models.md). Only read when --speculate is above 0.
   --tier <name>         pin the kernel tier (scalar, avx2+fma, avx2+vnni)
                         instead of taking the strongest the CPU reports
   --think, --no-think   thinking mode, on by default, as the template is
@@ -93,6 +97,7 @@ struct Args {
     max_tokens: Option<usize>,
     batch: usize,
     speculate: usize,
+    draft_source: DraftSource,
     tier: Option<String>,
     prompt_tokens: usize,
     repeats: usize,
@@ -165,13 +170,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.batch,
         args.speculate,
     );
+    draft_source(&model, &mut runner, args.draft_source, args.speculate)?;
 
     eprintln!(
-        "model {} ({} blocks, {} full attention, {} linear), kernels {}, {} threads, context {}, prompt batch {}",
+        "model {} ({} blocks, {} full attention, {} linear{}), kernels {}, {} threads, context {}, prompt batch {}",
         args.model.display(),
         model.config.n_blocks,
         model.config.n_full_blocks(),
         model.config.n_linear_blocks(),
+        match model.mtp.is_some() {
+            true => ", plus an MTP block",
+            false => ", no MTP block",
+        },
         runner.kernels().tier().as_str(),
         runner.threads(),
         runner.context(),
@@ -179,8 +189,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     if runner.draft() > 0 {
         eprintln!(
-            "speculation: {} drafted tokens per step, verified in one batch of {}",
+            "speculation: {} drafted tokens per step from {}, verified in one batch of {}",
             runner.draft(),
+            args.draft_source.as_str(),
             runner.draft() + 1,
         );
     }
@@ -266,6 +277,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "peak RSS {peak} KiB ({:.2} GiB)",
             peak as f64 / (1 << 20) as f64
         );
+    }
+    Ok(())
+}
+
+/// Points the runner at the draft source `--draft-source` asked for.
+///
+/// Refusing `mtp` on a file without the block is the point of doing this on the
+/// model rather than on the runner: a file that cannot draft from a head should
+/// say so instead of quietly running prompt lookup, and it should say so
+/// whatever `--speculate` is. What is only done above zero is the enabling
+/// itself, which costs the block's cache and an extra norm per prompt row, so
+/// `--speculate 0` is the path it always was whatever this flag says.
+fn draft_source(
+    model: &Model<'_>,
+    runner: &mut Runner<'_>,
+    source: DraftSource,
+    speculate: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if source != DraftSource::Mtp {
+        return Ok(());
+    }
+    if model.mtp.is_none() {
+        return Err("--draft-source mtp needs a file that kept the multi-token-prediction \
+                    block, and this one has no blk.N.nextn.eh_proj; see docs/models.md"
+            .into());
+    }
+    if speculate > 0 {
+        assert!(runner.enable_mtp(), "the file has an MTP block");
     }
     Ok(())
 }
@@ -369,11 +408,12 @@ fn serve(
         sampling: args.sampling,
         seed: args.seed,
         speculate: args.speculate,
+        draft_source: args.draft_source,
     };
     eprintln!(
         "loaded in {:.2}s. defaults: max-tokens {}, thinking {}, temperature {}, \
          top-k {}, top-p {}, min-p {}, repeat penalty {} over {}, seed {}, \
-         speculate {}",
+         speculate {} from {}",
         load.as_secs_f64(),
         defaults.max_tokens,
         defaults.thinking,
@@ -388,6 +428,7 @@ fn serve(
             None => "from entropy, per request".to_string(),
         },
         defaults.speculate,
+        defaults.draft_source.as_str(),
     );
     // Last, and with the address the listener actually got, so that `--port 0`
     // is usable and a client can treat this line as "the server is up".
@@ -490,6 +531,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
         // Off unless asked for: see docs/benchmarks.md for the measurement the
         // default comes out of.
         speculate: 0,
+        draft_source: DraftSource::default(),
         tier: None,
         prompt_tokens: 19,
         repeats: 5,
@@ -542,6 +584,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
                 }
                 out.speculate = v;
             }
+            "--draft-source" => out.draft_source = value()?.parse()?,
             "--tier" => out.tier = Some(value()?),
             "--prompt-tokens" => out.prompt_tokens = number(&value()?, "--prompt-tokens")?.max(1),
             "--repeats" => out.repeats = number(&value()?, "--repeats")?.max(1),
@@ -670,6 +713,7 @@ fn bench(
             repeats: args.repeats,
             batch: args.batch,
             speculate: args.speculate,
+            draft_source: args.draft_source,
         },
     );
     Ok(())

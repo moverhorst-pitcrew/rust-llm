@@ -286,7 +286,7 @@ fn a_burst_stops_exactly_where_a_sequential_run_stops() {
                         &mut sampler,
                         &prompt,
                         max_tokens,
-                        |history, out| {
+                        |_, history, out| {
                             offered += 1;
                             let take = out.len().min(truth.len() - history.len());
                             for (i, slot) in out[..take].iter_mut().enumerate() {
@@ -375,7 +375,7 @@ fn every_draft_length_generates_what_no_speculation_generates() {
             &mut sampler,
             &prompt,
             48,
-            |history, out| {
+            |_, history, out| {
                 let take = out.len().min(truth.len() - history.len());
                 out[..take].copy_from_slice(&truth[history.len()..][..take]);
                 take
@@ -441,7 +441,7 @@ fn the_acceptance_histogram_adds_up() {
         &mut sampler,
         &prompt,
         40,
-        |history, out| {
+        |_, history, out| {
             pass += 1;
             let take = out.len().min(truth.len() - history.len());
             for (i, slot) in out[..take].iter_mut().enumerate() {
