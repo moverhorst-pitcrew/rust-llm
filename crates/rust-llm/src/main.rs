@@ -50,6 +50,10 @@ options
                         bench 16, and bench generates exactly this many)
   --batch <n>           tokens per batch while reading the prompt (default:
                         see docs/decisions.md; 1 reads it token by token)
+  --speculate <n>       draft n tokens per step from the text so far and verify
+                        them in one batch; 0 is off (default and why: see
+                        docs/benchmarks.md). Costs about 50 MiB per drafted
+                        token and never changes what comes out.
   --tier <name>         pin the kernel tier (scalar, avx2+fma, avx2+vnni)
                         instead of taking the strongest the CPU reports
   --think, --no-think   thinking mode, on by default, as the template is
@@ -88,6 +92,7 @@ struct Args {
     /// `None` is the command's own default: 512 for `run`, 16 for `bench`.
     max_tokens: Option<usize>,
     batch: usize,
+    speculate: usize,
     tier: Option<String>,
     prompt_tokens: usize,
     repeats: usize,
@@ -153,7 +158,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return profile(&model, &tokenizer, &args);
     }
 
-    let mut runner = Runner::with_batch(&model, args.context, args.threads[0], args.batch);
+    let mut runner = Runner::with_speculation(
+        &model,
+        args.context,
+        args.threads[0],
+        args.batch,
+        args.speculate,
+    );
 
     eprintln!(
         "model {} ({} blocks, {} full attention, {} linear), kernels {}, {} threads, context {}, prompt batch {}",
@@ -166,6 +177,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         runner.context(),
         runner.max_batch(),
     );
+    if runner.draft() > 0 {
+        eprintln!(
+            "speculation: {} drafted tokens per step, verified in one batch of {}",
+            runner.draft(),
+            runner.draft() + 1,
+        );
+    }
 
     if args.command == "trace" {
         let tokens = encode_prompt(&args, &tokenizer)?;
@@ -237,6 +255,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         timings.generate_time.as_secs_f64(),
         timings.generate_per_second(),
     );
+    // Printed for any prompt, because what a draft source is worth depends on
+    // the text: this is how to see whether a prompt of your own is one
+    // speculation helps with.
+    if args.speculate > 0 {
+        eprintln!("speculation: {}", timings.speculation.report());
+    }
     if let Some(peak) = peak_rss_kib() {
         eprintln!(
             "peak RSS {peak} KiB ({:.2} GiB)",
@@ -344,10 +368,12 @@ fn serve(
         thinking: args.thinking,
         sampling: args.sampling,
         seed: args.seed,
+        speculate: args.speculate,
     };
     eprintln!(
         "loaded in {:.2}s. defaults: max-tokens {}, thinking {}, temperature {}, \
-         top-k {}, top-p {}, min-p {}, repeat penalty {} over {}, seed {}",
+         top-k {}, top-p {}, min-p {}, repeat penalty {} over {}, seed {}, \
+         speculate {}",
         load.as_secs_f64(),
         defaults.max_tokens,
         defaults.thinking,
@@ -361,6 +387,7 @@ fn serve(
             Some(seed) => seed.to_string(),
             None => "from entropy, per request".to_string(),
         },
+        defaults.speculate,
     );
     // Last, and with the address the listener actually got, so that `--port 0`
     // is usable and a client can treat this line as "the server is up".
@@ -460,6 +487,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
         threads: vec![default_threads()],
         max_tokens: None,
         batch: rust_llm::forward::DEFAULT_BATCH,
+        // Off unless asked for: see docs/benchmarks.md for the measurement the
+        // default comes out of.
+        speculate: 0,
         tier: None,
         prompt_tokens: 19,
         repeats: 5,
@@ -500,6 +530,18 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
             "--threads" => out.threads = thread_list(&value()?)?,
             "--max-tokens" => out.max_tokens = Some(number(&value()?, "--max-tokens")?),
             "--batch" => out.batch = number(&value()?, "--batch")?.max(1),
+            "--speculate" => {
+                let v = number(&value()?, "--speculate")?;
+                if v > rust_llm::forward::MAX_DRAFT {
+                    return Err(format!(
+                        "--speculate is at most {}, got {v}; a longer draft is {} MiB of \
+                         recurrent state that no measured acceptance rate pays for",
+                        rust_llm::forward::MAX_DRAFT,
+                        (v + 1) * 50,
+                    ));
+                }
+                out.speculate = v;
+            }
             "--tier" => out.tier = Some(value()?),
             "--prompt-tokens" => out.prompt_tokens = number(&value()?, "--prompt-tokens")?.max(1),
             "--repeats" => out.repeats = number(&value()?, "--repeats")?.max(1),
@@ -627,6 +669,7 @@ fn bench(
             generate,
             repeats: args.repeats,
             batch: args.batch,
+            speculate: args.speculate,
         },
     );
     Ok(())

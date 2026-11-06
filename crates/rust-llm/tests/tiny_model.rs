@@ -372,6 +372,9 @@ fn the_sampling_flags_are_honoured_and_checked() {
         (vec!["--top-k", "-3"], "--top-k"),
         (vec!["--seed", "banana"], "--seed"),
         (vec!["--temperature", "nonsense"], "--temperature"),
+        (vec!["--speculate", "17"], "--speculate"),
+        (vec!["--speculate", "-1"], "--speculate"),
+        (vec!["--speculate", "some"], "--speculate"),
     ] {
         let mut full = vec!["run", "--prompt", "hello"];
         full.extend(&args);
@@ -385,6 +388,58 @@ fn the_sampling_flags_are_honoured_and_checked() {
             out.stderr.contains(wanted),
             "{args:?} failed without naming {wanted}:\n{}",
             out.stderr
+        );
+    }
+}
+
+/// `--speculate` changes the speed and nothing else, which on the command line
+/// means the streamed text has to be the same at every draft length.
+///
+/// Greedy, so the answer is a function of the prompt alone and the three runs
+/// can be compared directly. The fixture's weights are noise, so almost no
+/// draft is accepted and what this really covers is the surface: the flag
+/// parses, the runner allocates its ring, the drafter runs over a real history
+/// and the accept loop produces the same stream. Where a draft *is* accepted is
+/// `tests/speculate.rs`, and on real weights the gate.
+#[test]
+fn the_speculate_flag_changes_nothing_but_the_speed() {
+    let tiny = support::write("speculate-cli", support::UNREACHED_EOS);
+    let answer = |draft: &str| {
+        let out = run(
+            &tiny.model,
+            &[
+                "run",
+                "--prompt",
+                "hello hello hello hello",
+                "--max-tokens",
+                "16",
+                "--context",
+                "128",
+                "--temperature",
+                "0",
+                "--speculate",
+                draft,
+            ],
+            "",
+        );
+        let text = out.ok(&format!("--speculate {draft}")).to_string();
+        (text, out.stderr)
+    };
+    let (want, off) = answer("0");
+    assert!(
+        !off.contains("speculation:"),
+        "--speculate 0 reported speculation it did not do:\n{off}"
+    );
+    for draft in ["1", "4"] {
+        let (got, log) = answer(draft);
+        assert_eq!(got, want, "--speculate {draft} streamed different text");
+        assert!(
+            log.contains(&format!("speculation: {draft} drafted tokens per step")),
+            "--speculate {draft} did not say what it was doing:\n{log}"
+        );
+        assert!(
+            log.contains("drafts accepted"),
+            "--speculate {draft} printed no acceptance line:\n{log}"
         );
     }
 }

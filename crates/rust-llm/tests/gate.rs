@@ -15,6 +15,9 @@
 //! # the caches: reset, and the hand-over from prompt to generation   (~30 s)
 //! cargo test -p rust-llm --release --test gate -- --ignored --nocapture resetting
 //!
+//! # speculation: the same tokens, and a rollback that leaves no trace (~4 min)
+//! cargo test -p rust-llm --release --test gate -- --ignored --nocapture speculat
+//!
 //! # re-derive one prompt of the fixture from a local llama.cpp build (~30 s)
 //! RUST_LLM_REFERENCE_BIN=$REF_DIR/llama.cpp/build/bin \
 //!   RUST_LLM_GATE_ONLY=capital_no_think \
@@ -75,7 +78,7 @@ use rust_llm::chat::{self, ChatOptions, Message, Role};
 use rust_llm::forward::Runner;
 use rust_llm::generate::generate;
 use rust_llm::model::Model;
-use rust_llm::sample::{Sampler, argmax};
+use rust_llm::sample::{Sampler, Sampling, argmax};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
 /// Enough for every prompt in the set plus its answer, and small enough that
@@ -681,6 +684,238 @@ fn a_batched_prompt_is_the_same_as_one_token_at_a_time() {
         println!(
             "batch {batch:3}: {batches} batch(es), logits identical, {} tokens identical",
             ids.len()
+        );
+    }
+}
+
+/// Speculation must not change a token of the gate prompt set, greedy or
+/// sampled from a fixed seed.
+///
+/// Greedy is the same comparison [`greedy_output_is_unchanged`] makes, against
+/// the same committed sequence, so a divergence here is a divergence from the
+/// reference's own output and not merely from another run of ours. Sampled is
+/// against this build's own sequential run, which is the only thing it can be
+/// against: the fixture records greedy output.
+///
+/// Equality here is **bit-equality of the token stream**, asserted and not
+/// sampled statistically, which is a property of the accept loop rather than a
+/// hope: the sampler is called once per emitted token in the same order either
+/// way, so the RNG stream and the recent-token window see the same thing. A
+/// statistical check over repeated seeds would be weaker and slower, and it is
+/// not needed; `docs/benchmarks.md` says so where the numbers are.
+///
+/// Both draft lengths, because a longer draft is more rows per batch and a
+/// different walk around the ring.
+#[test]
+#[ignore = "needs the model file"]
+fn speculation_does_not_change_the_output() {
+    let cases = cases();
+    let fixture = fixture();
+    let expected = fixture["cases"].as_array().expect("cases");
+    let gguf = open_model();
+    let tokenizer = tokenizer();
+    let model = Model::load(&gguf).expect("load model");
+    let threads = threads();
+    let sampled = Sampling {
+        temperature: 0.8,
+        top_k: 40,
+        top_p: 0.9,
+        min_p: 0.0,
+        repeat_penalty: 1.1,
+        repeat_last_n: 64,
+        seed: 0x5eed_1234,
+    };
+
+    let mut failures = Vec::new();
+    for (case, want) in cases.iter().zip(expected) {
+        let prompt = tokenizer.encode(&case.prompt, true).expect("encode");
+        for (what, set, committed) in [
+            ("greedy", Sampling::GREEDY, Some(ids_of(&want["tokens"]))),
+            ("sampled", sampled, None),
+        ] {
+            // The sequential side. For greedy this is also the committed
+            // sequence, which is asserted below rather than assumed.
+            let mut off = Runner::new(&model, CONTEXT, threads);
+            let (want_ids, want_stop, _) = generate(
+                &mut off,
+                &mut Sampler::new(model.vocab(), set),
+                &prompt,
+                case.max_tokens,
+                |_| true,
+            );
+            if let Some(committed) = &committed
+                && &want_ids != committed
+            {
+                failures.push(format!(
+                    "{}, {what}: the sequential run already differs from the \
+                     committed output, so this test cannot say anything about \
+                     speculation; run greedy_output_is_unchanged",
+                    case.name
+                ));
+                continue;
+            }
+            for draft in [2usize, 4] {
+                let mut on = Runner::with_speculation(&model, CONTEXT, threads, 16, draft);
+                let (got, stop, timings) = generate(
+                    &mut on,
+                    &mut Sampler::new(model.vocab(), set),
+                    &prompt,
+                    case.max_tokens,
+                    |_| true,
+                );
+                let spec = timings.speculation;
+                println!(
+                    "{:28} {what:7} draft {draft}: {:3} tokens, {:?}, {:.2} tok/s, {}",
+                    case.name,
+                    got.len(),
+                    stop,
+                    timings.generate_per_second(),
+                    spec.report(),
+                );
+                if got != want_ids || stop != want_stop || on.pos() != off.pos() {
+                    let at = got
+                        .iter()
+                        .zip(&want_ids)
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(got.len().min(want_ids.len()));
+                    failures.push(format!(
+                        "{}, {what}, draft {draft}: diverges at token {at} \
+                         ({stop:?} against {want_stop:?}, position {} against {})\n  \
+                         speculated: {:?}\n  sequential: {:?}",
+                        case.name,
+                        on.pos(),
+                        off.pos(),
+                        &got[at.min(got.len())..],
+                        &want_ids[at.min(want_ids.len())..],
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} divergences:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// A runner rolled back after a rejected draft has to be **bit-identical** to
+/// one that never saw the rejected tokens, over the whole 248320-entry logit
+/// vector and over the tokens generated after it.
+///
+/// This is the one thing in the feature that is expensive to get wrong, and it
+/// is checked the way [`resetting_the_caches_is_the_same_as_a_fresh_runner`]
+/// checks the caches, for the same two reasons. The logits alone would miss a
+/// stale recurrent state that only the token after them reads. The tokens alone
+/// would miss a wrong state that the delta net's decay fades below an argmax
+/// before it shows: the state is multiplied by a factor below 1 at every step,
+/// so a rejected token's contribution can be invisible in the tokens and plain
+/// in the logits.
+///
+/// Every number of accepted rows from one to the whole batch, because which
+/// ring slot is live after a commit is arithmetic modulo the ring size, and
+/// rolling back to the first row and to the last are different ends of it. The
+/// drafts are deliberately wrong tokens rather than drafted ones: what is being
+/// checked is the rollback, and a draft the model would have accepted anyway
+/// leaves nothing to roll back.
+#[test]
+#[ignore = "needs the model file"]
+fn a_rejected_draft_leaves_no_trace_in_the_logits() {
+    const DRAFT: usize = 4;
+    let case = &cases()[0];
+    let gguf = open_model();
+    let tokenizer = tokenizer();
+    let model = Model::load(&gguf).expect("load model");
+    let prompt = tokenizer.encode(&case.prompt, true).expect("encode");
+    let threads = threads();
+    let vocab = model.vocab();
+
+    // The batch: its first row is the token the model actually predicts, and
+    // every draft after it is a token it did not, so every draft is rejected
+    // and every uncommitted row is a token no sequential run would have fed.
+    let batch: Vec<u32> = {
+        let mut plain = Runner::new(&model, CONTEXT, threads);
+        let mut logits = Vec::new();
+        for &t in &prompt {
+            logits = plain.forward(t).to_vec();
+        }
+        let mut next = argmax(&logits);
+        let mut batch = Vec::new();
+        for i in 0..=DRAFT {
+            batch.push(if i == 0 {
+                next
+            } else {
+                (next + 1) % vocab as u32
+            });
+            next = argmax(plain.forward(next));
+        }
+        batch
+    };
+
+    for keep in 1..=batch.len() {
+        // The side that never saw the rejected rows: the committed tokens, one
+        // pass at a time, and nothing else. Then the whole logit vector of the
+        // pass after them and the five tokens that follow.
+        let mut plain = Runner::new(&model, CONTEXT, threads);
+        for &t in &prompt {
+            plain.forward(t);
+        }
+        let mut committed = Vec::new();
+        for &t in &batch[..keep] {
+            committed = plain.forward(t).to_vec();
+        }
+        let next = argmax(&committed);
+        let want_logits = plain.forward(next).to_vec();
+        let mut want_tail = vec![next, argmax(&want_logits)];
+        for _ in 0..4 {
+            let last = *want_tail.last().expect("a token");
+            want_tail.push(argmax(plain.forward(last)));
+        }
+
+        // The rolled-back side: the whole batch ran, `keep` rows committed.
+        let mut runner = Runner::with_speculation(&model, CONTEXT, threads, 16, DRAFT);
+        for &t in &prompt {
+            runner.forward(t);
+        }
+        runner.verify(&batch);
+        // Before the rollback: the last committed row's logits have to be the
+        // logits of the pass it replaces, which is what makes a draft
+        // verifiable at all.
+        if let Some(d) = difference(runner.logit_row(keep - 1), &committed) {
+            panic!(
+                "keep {keep}: row {}'s logits are not the pass's: {d}",
+                keep - 1
+            );
+        }
+        runner.accept(keep);
+        assert_eq!(runner.pos(), prompt.len() + keep, "keep {keep}: position");
+
+        if let Some(d) = difference(runner.forward(next), &want_logits) {
+            panic!(
+                "keep {keep} of {}: the logits after the rollback differ from a runner \
+                 that never saw the {} rejected rows: {d}",
+                batch.len(),
+                batch.len() - keep,
+            );
+        }
+        let mut tail = vec![next, argmax(runner.logits())];
+        for _ in 0..4 {
+            let last = *tail.last().expect("a token");
+            tail.push(argmax(runner.forward(last)));
+        }
+        assert_eq!(
+            &tail,
+            &want_tail,
+            "keep {keep} of {}: the tokens after the rollback differ",
+            batch.len()
+        );
+        println!(
+            "committed {keep} of {} rows: {vocab} logits and {} tokens identical to a \
+             runner that never saw the other {}",
+            batch.len(),
+            tail.len(),
+            batch.len() - keep,
         );
     }
 }

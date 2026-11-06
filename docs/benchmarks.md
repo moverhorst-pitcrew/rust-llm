@@ -55,6 +55,15 @@ rust-llm bench --context 1024 --threads 8 --prompt-tokens 192 --max-tokens 8 \
 
 # what the machine can stream, which is the ceiling batch-1 generation hits
 cargo run --release -p llm-core --example bench_bandwidth
+
+# speculation: what a verification row costs, and the drafter on against off
+# with its acceptance histogram. --prompt-tokens above the fixed text's own
+# length repeats that text, which is the deliberately repetitive case.
+rust-llm bench --context 1024 --threads 8 --prompt-tokens 400 \
+  --max-tokens 32 --repeats 5 --speculate 4
+
+# the acceptance histogram for a prompt of your own, from one generation
+rust-llm run --speculate 4 --max-tokens 64 --prompt '<text>'
 ```
 
 **One model run at a time.** A second runner on this box streams the same
@@ -404,6 +413,150 @@ indeterminate band re-derived for the f16 path. The reference's own default is
 an f16 cache, which is part of why its `tg16` column below is ahead of its
 matched-flags column.
 
+## Speculative decoding
+
+`--speculate n` drafts `n` tokens per step from the text so far and verifies
+them in one batch. It never changes what comes out: see `docs/decisions.md`.
+What it changes is how many passes over the weights a run needs, and whether
+that is a win depends on two numbers measured here.
+
+### What a verification row costs
+
+This is the number the whole feature turns on, and it was measured before the
+feature was built. A verification batch runs the output head on **every** row,
+which no other path does: a prompt computes it once per batch and generation
+once per token. So a verification row is a prompt batch's marginal row plus
+whatever the head's extra rows cost, and nothing had that number.
+
+Context 1024, 8 threads, tier `avx2+vnni`, under the model lock, 3 to 5
+repeats, median. The last column is break-even: a draft is worth running when
+the passes it saves cost more than the rows it adds, which at `m` ms per
+marginal row against `t` ms per sequentially generated token is `accepted drafts
+per drafted token > m / t`.
+
+| rows | ms per batch | ms per extra row | break-even acceptance |
+| --- | --- | --- | --- |
+| 1 | 64.3 to 71.4 | | |
+| 2 | 87.8 to 101.2 | 18.7 to 29.7 | 0.27 to 0.42 |
+| 3 | 97.9 to 119.4 | 15.3 to 24.0 | 0.22 to 0.33 |
+| 4 | 118.3 to 136.0 | 16.2 to 21.5 | 0.24 to 0.31 |
+| 5 | 138.2 to 149.7 | 17.1 to 20.3 | 0.27 to 0.30 |
+
+The ranges are across windows, with 64 to 71 ms per sequential token in the same
+windows; read the ratio in the last column, not the level. The `--speculate 8`
+block carries the table out to nine rows, where the marginal row is still 19.2 to
+23.6 ms (189.4 ms at six rows, 225.3 at nine), so it is flat in the row count:
+nothing about a wider batch gets worse. **A marginal
+verification row is a fifth to a third of a token**, where the ticket that
+commissioned this would have stopped the milestone at half a token.
+
+It is that cheap because the output head is one 2560 x 248320 matmul over the
+whole embedding table, 0.5 GiB of weights, and at one row it is bandwidth-bound:
+11 ms of streaming, which is 14.6 per cent of a generation token (see "Where a
+token's time goes"). Extra rows reuse bytes that are already in flight and add
+only arithmetic, so the head on five rows costs nearly what it costs on one, and
+what is left in the 16 to 30 ms is the part of a row that does not batch.
+
+**The ring costs nothing on a pass with no draft.** The same call at the same row
+count, against a runner whose state is a single buffer updated in place, in the
+same window: +0.1, +0.9, -7.0, -0.8, -1.0 and +5.2 per cent over six blocks. The
+sign is not stable, so there is nothing to report beyond the noise, which is what
+the design predicted: writing the next ring slot is the same memory traffic as
+updating one in place. (An earlier reading of 7 per cent compared a verification
+batch against the `generation` row above it, which is a different harness
+measured earlier in the block; that was a window difference, not a cost.)
+
+### What it is worth: the acceptance histograms
+
+Both sides of the same `bench` invocation, on one runner, so the only difference
+between the pair is whether drafts are offered; the ring is allocated and written
+in both. 32 generated tokens, greedy, 3 to 5 repeats. The histogram is summed
+over the repeats and reads `accepted:passes`, so `2:3 4:3` is three passes that
+accepted two drafts and three that accepted four.
+
+**Deliberately repetitive text**, a 400-token prompt that is the fixed bench text
+twice over:
+
+| `--speculate` | sequential | speculated | gain | acceptance | accepted lengths |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 14.93 | 16.61 | +11% | 1.00 | `1:12` |
+| 2 | 13.75 | 16.75 | +22% | 0.83 | `1:5 2:10` |
+| 4 | 15.04 | 16.52 | +10% | 0.75 | `2:3 4:3` |
+| 8 | 13.51 | 17.40 | +29% | 0.88 | `7:3` |
+
+**Prose**, the same text at 192 tokens, which is one copy and so repeats nothing:
+
+| `--speculate` | sequential | speculated | gain | acceptance | accepted lengths |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 12.12 | 12.65 | +4% | 0.31 | `0:6 1:3 4:3` |
+| 8 | not measured | | | 0.16 | `0:10 1:5 4:5` |
+
+The prose pair is from the one window that was quiet enough for it (spreads 3.9
+and 5.5 per cent). Every later attempt came back with 42 to 66 per cent spread on
+the `sequential` row with other work on the box, so the eight-draft pair has no
+timing to report. Its acceptance line is reproducible across windows, because
+acceptance is a property of the model and the text and not of the clock, and it
+is what the conclusion below rests on.
+
+**The gate prompt set**, ten real chat prompts, from
+`speculation_does_not_change_the_output`: 27 verification passes over 384 greedy
+tokens at four drafts, 22 of 105 drafts accepted, so 0.21 per drafted token. Per
+prompt it ranges from nothing at all (`system_persona_no_think` and
+`non_ascii_no_think` never draft, because nothing in them repeats) to 1.00
+(`capital_think`, one pass accepting all four).
+
+What the two tables say:
+
+- **On repetitive text it pays, by 10 to 29 per cent.** Acceptance is 0.75 to
+  1.00 against a break-even of 0.22 to 0.42, so there is room to spare. The
+  gains do not line up neatly with the draft length, and the draft-2 row is the
+  reason to distrust the level rather than the ratio: the same configuration
+  gave `15.10 -> 15.12` in one window and the `13.75 -> 16.75` above in the next,
+  with an identical acceptance line both times. On a shared box the timing moves
+  and the acceptance does not.
+- **On prose it does not.** 0.31 at four drafts is just above break-even and the
+  measured gain, +4 per cent, is inside the spread of the pair that produced it
+  (3.9 and 5.5 per cent). On the gate prompt set 0.21 is at or below it.
+- **A longer draft does not help prose.** At eight drafts the prose histogram is
+  the same as at four, `0:10 1:5 4:5`: the drafter offers twice as many tokens
+  and the model accepts no more of them, so acceptance halves from 0.31 to 0.16
+  and every extra row is paid for nothing. That is the shape of prompt lookup
+  rather than of the batch: the match it finds is short, so what follows it runs
+  out.
+- **The histogram is bimodal, not centred.** A pass either accepts nothing or
+  accepts the whole draft, with little in between; prose is `0:10 1:5 4:5` and
+  repetitive text is `2:3 4:3` or `7:3`. So the mean acceptance understates what
+  a good pass does and overstates what a bad one does, which is why the
+  distribution is reported and not only the rate. It is also what any later draft
+  source, an MTP head included, has to beat.
+
+### The default is 0
+
+Ordinary prose, which is what the gate prompt set is, sits at or below
+break-even, so speculation there pays verification rows for nothing. Repetitive
+text wins by 10 to 29 per cent, but a runner cannot tell in advance which it has
+been given, and the cost of guessing wrong is a slower run. So it is a flag, not
+a default: a caller who knows their text repeats itself, a long quoted passage,
+a diff, boilerplate code, turns it on and gets the numbers above.
+
+**`--speculate 0` measures as the build without this change.** This branch's
+binary against `origin/main`'s (`9bdd45c`), alternated three times in one window,
+context 1024, 192-token prompt, 8 threads, 3 repeats each, medians over the
+rounds:
+
+| | `main` | this branch, `--speculate 0` |
+| --- | --- | --- |
+| prompt | 50.19 tok/s | 50.02 |
+| generation | 14.83 tok/s | 14.63 |
+
+-1.3 per cent on generation against per-block spreads of 1.3 to 33 per cent, so
+inside the spread. It should be: at `--speculate 0` the ring is one buffer, the
+read slot and the write slot are the same, and the recurrence updates it in place
+through the function it always used. What the off path gains is one modulo and
+one branch per row. The stronger check is not a timing one: `greedy_output_is_unchanged`
+and `every_next_token_matches_the_reference` pass unchanged on this branch
+against the committed fixture.
+
 ## Memory
 
 Peak RSS, from `VmHWM`, per configuration:
@@ -431,6 +584,29 @@ is 192 MiB.
 The batched path adds scratch for a batch of 16: every intermediate is 16 rows
 instead of 1, and the score buffer is batch times head count times context
 floats, 4 MiB at context 4096. That is inside the noise of the table above.
+
+**`--speculate n` adds `n` copies of the recurrent state**, which is the one
+thing in this feature that is not free: the rollback is a ring of `n + 1`
+convolution histories and delta-net states instead of one, 2.1 MiB per linear
+block times 24 blocks times `n + 1`.
+
+| `--speculate` | ring | peak RSS | above `--speculate 0` |
+| --- | --- | --- | --- |
+| 0 | 50.3 MiB | 2.76 GiB | |
+| 4 | 252 MiB | 2.94 GiB | +192 MiB |
+| 8 | 453 MiB | 3.15 GiB | +404 MiB |
+
+One `rust-llm run`, 16-token prompt, 16 generated tokens, context 1024, 8
+threads. The ring column is arithmetic and the peak column is `VmHWM`, and they
+agree: 202 MiB of extra ring against 192 MiB of extra resident at four drafts,
+403 against 404 at eight. The pages become resident as they are first written,
+as the KV cache's do, so the ring is resident by the first batch of that width
+and not before.
+
+The ring is allocated by the constructor and only when speculation is on, so
+`--speculate 0` is the 50 MiB it always was, and 2.76 GiB is the same figure as
+the first row of the table above. The logit buffer grows the same way, one row
+of 248320 floats per `n + 1`, which is 0.95 MiB a row and does not show.
 
 ## llama.cpp on the same file, at matching thread counts
 

@@ -386,19 +386,14 @@ of what one token needed, token-major, sized by `Runner::new`, and the
 activation scratch holds `max_batch` rows of blocks. The allocation test covers
 the batched prompt at three batch sizes next to the generation loop.
 
-**Speculative decoding (M3) is what this path was shaped for**, and nothing for
-it is built here. A drafted-token verification is exactly a batch: `n` drafted
-tokens go through `forward_batch` in one pass over the weights, and what M3
-needs that this does not have is the logits of *every* row rather than the last,
-so that it can find the first position where the draft and the model disagree.
-That is one more weight tensor's worth of work per batch (the head on `n` rows
-instead of 1) and a second entry point next to `forward_batch`; the caches
-already end up in the right state, because a batch leaves the state the tokens
-would have left one at a time, and a rejected suffix is a `pos` the KV cache can
-simply be rewound to for the full-attention blocks. The recurrent state cannot
-be rewound, which is the one real design problem M3 has to solve: it will have
-to keep a copy of the conv history and the delta-net state from before the
-batch, 2.1 MiB per linear block, 50 MiB in total.
+**Speculative decoding (M3) is what this path was shaped for**, and it is built
+on it: `Runner::verify` is `forward_batch` with the output head on every row
+instead of only the last, so it can say where the draft and the model first
+disagree, and `Runner::accept` is how far along the batch the runner actually
+is. See "Speculative decoding" below. M1's note here predicted that the
+recurrent state, which cannot be rewound, would have to be copied before each
+batch, 50 MiB per step; that is not what was done, and the section below says
+why.
 
 **Every buffer is allocated by `Runner::new`, from the config.** The pass
 quantizes activations into scratch it owns, hands row ranges to the pool and
@@ -512,7 +507,10 @@ of the weights.
 
 **Recurrent state**, for the twenty-four linear blocks: the convolution
 history (`3 x 8192` f32) and the delta-net state (`32 x 128 x 128` f32), 2.1
-MiB per block, 50 MiB in total and independent of the context length.
+MiB per block, 50 MiB in total and independent of the context length. With
+`--speculate n` there are `n + 1` of each rather than one, for the reason under
+"Speculative decoding" below; at `--speculate 0` there is one, which is what
+there always was.
 
 Both are allocated once by `Runner::new` and never reallocated. `reset` zeroes
 them and sets the position back to 0; zeroing is the whole reset, because the
@@ -687,6 +685,107 @@ both before the loop starts. Greedy and with every sampling stage on, which is
 the same number: the sampler's buffers come out of `Sampler::new`, above the
 window. It is one test and not two because the counter is global and a second
 test in the harness's thread pool would be charged to the same window.
+
+## Speculative decoding
+
+**The draft source is prompt lookup, not an extra head.** An MTP-preserved
+Heretic 4B GGUF exists, but it is a different set of weights from the file this
+runner is built and gated against, so adopting it would be a model swap with a
+new gate fixture behind it and a reference feature that is not released. See
+`docs/models.md`. Prompt lookup needs no weights at all: it guesses the next few
+tokens from the prompt and the text generated so far, and everything an MTP head
+would later need is the same machinery, per-row logits, the rollback, the accept
+loop and the acceptance metric. `prompt_lookup` is a plain function and
+`generate_drafting` takes the draft source as an argument, so a head is a
+different function passed there. There is no trait and no strategy type for one
+implementation.
+
+**The marginal verification row was measured before the feature was built**,
+because the whole milestone turns on it and a verification batch is the one path
+that runs the output head on every row. It is 16 to 30 ms against 64 to 70 ms
+for a sequentially generated token, so break-even is 0.22 to 0.42 accepted
+drafts per drafted token. The ticket's own stop condition was half a token. The
+numbers and the reason the head's extra rows are nearly free are in
+`docs/benchmarks.md` under "Speculative decoding".
+
+**The rollback is a ring of state buffers, not a copy.** The KV cache needs
+nothing: a rejected row's entry is past `pos` and nothing reads it. The
+recurrent state cannot be rewound, and the obvious fix, which the "Forward pass"
+section above predicted, is to copy the convolution history and the delta-net
+state before each batch and restore them on a rejection: 50 MiB of memcpy per
+step, against a 67 ms step that streams 2.5 GiB, so about 4 per cent of a token
+to buy the option of rejecting.
+
+It is cheaper than that. The recurrence already reads the previous state and
+writes the new one, so writing the new one *somewhere else* is the same memory
+traffic. With `n + 1` buffers and row `r` reading the buffer row `r - 1` wrote,
+every row leaves its own snapshot behind for free, and a rollback is choosing
+which buffer is live: `Runner::accept(k)` advances `pos` by `k` and the live
+slot by `k`, and that is the whole operation. The ring turns across batches, so
+the live buffer after a commit is wherever that batch ended rather than a fixed
+slot. A batch of `n + 1` rows fits a ring of `n + 1` because the last row
+overwrites the slot the batch started from, and nothing needs that again: row 0
+is the token the sampler already committed to, so a rollback never goes further
+back than the state row 0 produced.
+
+Measured, the ring is free on the no-draft path as well: the same call at the
+same row count against a runner with a single buffer came out between -7.0 and
++5.2 per cent over six blocks, with no stable sign, so there is nothing to
+report beyond the noise. What it does cost is memory, `n + 1` times 50 MiB,
+about 250 MiB at `--speculate 4`, and it is allocated only when speculation is
+on. At `--speculate 0` there is one slot, the read slot and the write slot are
+the same, and the recurrence updates it in place through the function it always
+used.
+
+The two in-place functions, `delta_net` and `depthwise_conv`, are kept next to
+the ring versions rather than expressed through them, which would need the
+previous and the next buffer to alias when they are the same slot. The
+difference is where the decay writes, about ten lines, and two unit tests hold
+each pair together bit for bit:
+`writing_the_state_to_the_next_ring_slot_changes_nothing` and its convolution
+twin.
+
+**A head writes its own slice of the next slot.** The state is per block and per
+value head, and a head owns its whole batch inside one pool job, so the ssm
+cache is laid out `[block][head][slot][i][j]`: one head's whole ring is the one
+chunk the pool hands it, and the next slot needs no synchronisation beyond the
+chunk itself. At one slot that is the layout it already had.
+
+**The accept loop is the generation loop.** Everything that decides whether a
+token may be fed to the model, the stop set, the output vector, `on_token`,
+`max_tokens` and the context, is the same five questions in the same order; the
+only thing speculation changes is where the logits that follow the token come
+from. A drafted token is accepted when the sampler's own pick happens to be the
+token the batch in flight already ran at the next row. There is no second
+generation loop to keep in step, and at `--speculate 0` every branch takes the
+side it always took.
+
+So the sampler is called once per emitted token, in the same order, over the
+same recent-token window. **Sampled output with a fixed seed is therefore
+bit-equal with speculation on and off, not equal in distribution**, which is why
+the equivalence requirement is a test and not a statistical argument: a
+statistical run over repeated seeds would be a weaker claim and a slower one,
+and there is nothing it could catch that token-for-token equality does not.
+`speculation_does_not_change_the_output` asserts it over the whole gate prompt
+set, greedy against the committed sequence and sampled from a fixed seed against
+this build's own sequential run, at two draft lengths.
+
+This is deliberately **not Leviathan-style speculative sampling**, where a draft
+is accepted or rejected against the drafter's own probability for it. A
+prompt-lookup draft carries no probability to accept against, and an accept rule
+that drew from a residual distribution would consume the RNG differently and
+cost exactly the equivalence above.
+
+**The default is 0**, and that is a measurement rather than caution. On the gate
+prompt set acceptance is about 0.21 per drafted token at four drafts, which is
+at or below the break-even range, so ordinary prose pays verification rows for
+nothing; a longer draft makes it worse, because the drafter offers more and the
+model accepts no more. Deliberately repetitive text is where it wins, by 10 to
+29 per cent. So it is a flag a caller turns on for the text they have, not a
+default. `docs/benchmarks.md` carries the per-draft-length acceptance histograms
+the number comes from, because what a draft length is worth depends on how the
+accepted lengths are distributed and not only on their mean: a pass that accepts
+none still pays for every row it ran.
 
 ## Sampling
 

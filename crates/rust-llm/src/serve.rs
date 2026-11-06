@@ -52,6 +52,10 @@ pub struct Defaults {
     pub max_tokens: usize,
     pub thinking: bool,
     pub sampling: Sampling,
+    /// `--speculate`, which is also the longest draft a request may ask for:
+    /// the ring is allocated when the server starts and a request cannot grow
+    /// it.
+    pub speculate: usize,
     /// `--seed`, if it was given: then every request without a seed of its own
     /// replays that one. Without it each request draws a fresh seed, which is
     /// logged so that request can be replayed.
@@ -292,6 +296,18 @@ impl Server<'_, '_> {
         on_token: impl FnMut(u32) -> bool,
     ) -> (Vec<u32>, Stop, Timings) {
         self.runner.reset();
+        // Checked when the request was parsed, so this cannot be refused here,
+        // and asserted rather than ignored because that is exactly why it
+        // cannot: a refusal would silently leave the previous request's draft
+        // length in place, which is a wrong speed and nothing a client could
+        // see.
+        assert!(
+            self.runner.set_draft(parsed.speculate),
+            "a request asked for {} drafts against a ring of {}, which Parsed::read \
+             is supposed to have refused",
+            parsed.speculate,
+            self.defaults.speculate,
+        );
         let mut sampler = Sampler::new(self.vocab, parsed.sampling);
         generate::generate(
             self.runner,
@@ -409,6 +425,7 @@ struct Parsed {
     prompt: Vec<u32>,
     sampling: Sampling,
     max_tokens: usize,
+    speculate: usize,
     stream: bool,
 }
 
@@ -462,6 +479,23 @@ impl Parsed {
             Some(0) => return Err(Fail::bad("max_tokens must be at least 1")),
             Some(n) => n.min(context as u64) as usize,
             None => defaults.max_tokens.min(context),
+        };
+
+        // Refused above the configured length rather than clamped, unlike
+        // `max_tokens`: the ring is allocated when the server starts, so a
+        // larger number is not something this server can do, and silently
+        // speculating less than was asked for would read as speculation that
+        // does not pay. Lower is fine and changes nothing but the speed.
+        let speculate = match whole(body, "speculate")? {
+            Some(n) if n as usize > defaults.speculate => {
+                return Err(Fail::bad(format!(
+                    "speculate is at most {}, which is what this server was started with; \
+                     a longer draft needs a larger --speculate at start-up",
+                    defaults.speculate,
+                )));
+            }
+            Some(n) => n as usize,
+            None => defaults.speculate,
         };
 
         let prompt = if chat {
@@ -525,6 +559,7 @@ impl Parsed {
             prompt,
             sampling,
             max_tokens,
+            speculate,
             stream: match body.get("stream") {
                 None | Some(Value::Null) => false,
                 Some(Value::Bool(b)) => *b,

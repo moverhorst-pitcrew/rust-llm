@@ -60,8 +60,24 @@ for a development surface.
 | `--context <n>` | 4096 | positions allocated for the KV cache |
 | `--threads <n>` | all cores | worker threads |
 | `--max-tokens <n>` | 512 | stop after this many generated tokens |
+| `--speculate <n>` | 0 (off) | draft n tokens per step and verify them in one batch |
 | `--think`, `--no-think` | thinking on | the model's own thinking mode |
 | `--raw` | off | `run` only: take `--prompt` verbatim, no chat template |
+
+`--speculate` is speculative decoding by prompt lookup: the next few tokens are
+guessed from the text so far, taken from where it last repeated itself, and
+verified in one pass over the weights instead of one pass each. **It never
+changes what comes out.** Every token is drawn by the same sampler in the same
+order, so a fixed seed gives the same answer with it on and off, byte for byte,
+and there is a test over the whole prompt set that says so.
+
+Off by default because it is only worth it on text that repeats itself: 10 to
+29 per cent faster on a long quoted passage, boilerplate or a diff, and nothing
+on ordinary prose, where the drafts are wrong often enough to cost more than
+they save. A draft costs about 50 MiB of memory. `docs/benchmarks.md` has the
+acceptance rates and the gains per draft length, and the number the default
+comes out of; the gains there do not order neatly by draft length, so read the
+table rather than reaching for the largest number the memory allows.
 
 Sampling, with Qwen3.5's own recommended values as the defaults. A value that
 cannot be a setting is refused by name rather than clamped:
@@ -93,10 +109,16 @@ refused.
 
 Every option above is the default for a request that does not send that field;
 the fields a request can override are `messages` or `prompt`, `temperature`,
-`top_p`, `top_k`, `min_p`, `repetition_penalty`, `max_tokens`, `seed`, `stream`
-and `chat_template_kwargs.enable_thinking` for the thinking toggle. Anything
+`top_p`, `top_k`, `min_p`, `repetition_penalty`, `max_tokens`, `seed`,
+`speculate`, `stream` and `chat_template_kwargs.enable_thinking` for the
+thinking toggle. Anything
 else in the body is ignored, `stop` and `n` included; `docs/decisions.md` says
 why.
+
+`speculate` is capped differently from the rest: the ring of state buffers it
+needs is allocated when the server starts, so a request asking for more than
+`--speculate` was given is refused with a 400 rather than quietly served with
+fewer drafts. Less than that, down to 0, is honoured.
 
 `--context` is the ceiling on the prompt plus the answer, so a `max_tokens`
 above it is capped at it: no run could reach the larger number anyway. A prompt
@@ -192,6 +214,19 @@ count:
 rust-llm bench --context 1024 --threads 1,2,3,4,5,6,7,8 --prompt-tokens 192 \
   --max-tokens 16 --repeats 3
 ```
+
+With `--speculate n` the same command also reports what a verification row costs
+per row count, and generation with the drafter on against the drafter off on one
+runner, with the acceptance histogram:
+
+```sh
+rust-llm bench --context 1024 --threads 8 --prompt-tokens 400 \
+  --max-tokens 32 --repeats 5 --speculate 4
+```
+
+A `--prompt-tokens` above the fixed bench text's own length repeats that text,
+which is the case speculation is for. `rust-llm run --speculate n` prints the
+same histogram for a prompt of your own.
 
 The prompt is a fixed text truncated to exactly `--prompt-tokens` tokens, or
 repeated if more are asked for than its 204, and generation runs exactly

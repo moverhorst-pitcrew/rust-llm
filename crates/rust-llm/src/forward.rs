@@ -19,6 +19,17 @@
 //! state in the same order, so the state a batch leaves behind is the state the
 //! single-token path would have left: see `docs/decisions.md`, "Batched prompt
 //! evaluation".
+//!
+//! [`Runner::verify`] is the third entry point, for speculative decoding: the
+//! same pass, but the output head runs on every row rather than only the last,
+//! and the batch is not committed until [`Runner::accept`] says how many of its
+//! rows to keep. What makes a rollback free is that the two pieces of state a
+//! position cannot be rewound out of, the recurrent state and the convolution
+//! history, are a ring of `draft + 1` buffers instead of one: row `r` reads the
+//! buffer row `r - 1` wrote and writes the next one, so every row leaves a
+//! snapshot behind and rolling back is choosing which buffer is live. The ring
+//! exists only when speculation is on; at `draft == 0` it is one buffer and the
+//! recurrence updates it in place, exactly as it always did.
 
 use std::time::Instant;
 
@@ -216,19 +227,25 @@ impl Profile {
     }
 }
 
-/// The caches. Both are sized at load and never reallocated.
+/// The caches. All three are sized at load and never reallocated.
 struct Caches {
     /// `[full block][k, v][kv head][position][head_dim]`.
     kv: Vec<f32>,
-    /// `[linear block][channel][conv_kernel - 1]`, oldest sample first.
+    /// `[linear block][ring slot][channel][conv_kernel - 1]`, oldest sample
+    /// first.
     conv: Vec<f32>,
-    /// `[linear block][value head][d_state i][d_state j]`, so one `i` of a head
-    /// is contiguous over `j` and [`delta_net`] can take a block of `j` at a
-    /// time. The layout is internal: nothing outside the recurrence reads it,
-    /// the reset only zeroes it and no tracer node dumps it.
+    /// `[linear block][value head][ring slot][d_state i][d_state j]`, so one
+    /// `i` of a head is contiguous over `j` and [`delta_net`] can take a block
+    /// of `j` at a time, and one value head's whole ring is contiguous so the
+    /// pool can hand it to that head's job as one chunk. The layout is
+    /// internal: nothing outside the recurrence reads it, the reset only zeroes
+    /// it and no tracer node dumps it.
     ssm: Vec<f32>,
     /// Tokens already in the caches, which is also the next token's position.
     pos: usize,
+    /// Ring slot holding the state those `pos` tokens left behind. Always 0
+    /// with speculation off, where the ring is one buffer.
+    live: usize,
 }
 
 /// Every intermediate the pass writes to, each `max_batch` rows of the width
@@ -256,6 +273,8 @@ struct Buffers {
     /// `alpha`/decay and `beta`, one scalar per value head each.
     decay: Vec<f32>,
     beta: Vec<f32>,
+    /// One row of `vocab` per row the output head can be asked for, which is
+    /// one with speculation off and `draft + 1` with it on.
     logits: Vec<f32>,
 }
 
@@ -265,12 +284,27 @@ struct Buffers {
 /// `docs/benchmarks.md`, "What batched prompt evaluation moved".
 pub const DEFAULT_BATCH: usize = 16;
 
+/// The longest draft [`Runner::with_speculation`] takes.
+///
+/// Not a tuning knob: it is the bound that keeps the ring and the logit buffer
+/// from being sized by an unchecked command-line number. At 16 the ring is
+/// already 850 MiB and the acceptance histogram in `docs/benchmarks.md` is flat
+/// long before it.
+pub const MAX_DRAFT: usize = 16;
+
 /// A loaded model plus the threads, caches and scratch to run it.
 pub struct Runner<'a> {
     model: &'a Model<'a>,
     pool: Pool,
     context: usize,
     max_batch: usize,
+    /// Ring slots for the recurrent state and the convolution history, which is
+    /// `1` with speculation off and the longest verification batch with it on.
+    slots: usize,
+    /// Drafts [`crate::generate::generate`] offers per pass, at most
+    /// `slots - 1`. Separate from `slots` because the ring is allocated once and
+    /// a caller may ask for shorter drafts afterwards.
+    draft: usize,
     caches: Caches,
     bufs: Buffers,
     acts: Activations,
@@ -296,20 +330,50 @@ impl<'a> Runner<'a> {
         threads: usize,
         max_batch: usize,
     ) -> Self {
+        Self::with_speculation(model, context, threads, max_batch, 0)
+    }
+
+    /// The same with room for speculative decoding: `draft` drafted tokens per
+    /// pass, `0` for none.
+    ///
+    /// What `draft` costs is the ring: `draft + 1` copies of the recurrent state
+    /// and the convolution history, about 50 MiB each on this model, allocated
+    /// here and never again. At `0` there is one of each, which is what there
+    /// always was, so nothing about the off path changes.
+    ///
+    /// A verification batch is `draft + 1` rows, so `max_batch` is raised to at
+    /// least that: the scratch has to hold the widest batch either path can ask
+    /// for, and a prompt read in batches of `draft + 1` rather than of 1 is
+    /// faster anyway.
+    pub fn with_speculation(
+        model: &'a Model<'a>,
+        context: usize,
+        threads: usize,
+        max_batch: usize,
+        draft: usize,
+    ) -> Self {
         let c = &model.config;
         let context = context.max(1);
+        assert!(
+            draft <= MAX_DRAFT,
+            "a draft of {draft} tokens, but at most {MAX_DRAFT} are allocated for"
+        );
+        let slots = draft + 1;
         // A batch longer than the context could never be run.
-        let b = max_batch.clamp(1, context);
+        let b = max_batch.max(slots).clamp(1, context);
         let vocab = model.vocab();
         Self {
             pool: Pool::new(threads),
             context,
             max_batch: b,
+            slots,
+            draft,
             caches: Caches {
                 kv: vec![0.0; c.n_full_blocks() * 2 * c.n_head_kv * context * c.head_dim],
-                conv: vec![0.0; c.n_linear_blocks() * c.conv_dim() * (c.conv_kernel - 1)],
-                ssm: vec![0.0; c.n_linear_blocks() * c.n_v_heads * c.d_state * c.d_state],
+                conv: vec![0.0; c.n_linear_blocks() * slots * c.conv_dim() * (c.conv_kernel - 1)],
+                ssm: vec![0.0; c.n_linear_blocks() * c.n_v_heads * slots * c.d_state * c.d_state],
                 pos: 0,
+                live: 0,
             },
             bufs: Buffers {
                 x: vec![0.0; b * c.n_embd],
@@ -327,7 +391,7 @@ impl<'a> Runner<'a> {
                 ffn_b: vec![0.0; b * c.n_ff],
                 decay: vec![0.0; b * c.n_v_heads],
                 beta: vec![0.0; b * c.n_v_heads],
-                logits: vec![0.0; vocab],
+                logits: vec![0.0; vocab * slots],
             },
             acts: Activations::with_batch(c.n_embd.max(c.n_ff).max(c.d_inner).max(c.attn_dim()), b),
             model,
@@ -368,12 +432,31 @@ impl<'a> Runner<'a> {
         self.caches.conv.fill(0.0);
         self.caches.ssm.fill(0.0);
         self.caches.pos = 0;
+        self.caches.live = 0;
         self.tracer.clear();
     }
 
     /// Tokens this runner can take in one [`Runner::forward_batch`].
     pub fn max_batch(&self) -> usize {
         self.max_batch
+    }
+
+    /// Drafted tokens per pass: `0` when speculation is off.
+    pub fn draft(&self) -> usize {
+        self.draft
+    }
+
+    /// Asks for shorter drafts than the ring was allocated for, which is what a
+    /// per-request `speculate` on the HTTP surface sets.
+    ///
+    /// Returns `false` and changes nothing when `draft` is longer than the ring,
+    /// because that would need buffers this runner never allocated.
+    pub fn set_draft(&mut self, draft: usize) -> bool {
+        if draft >= self.slots {
+            return false;
+        }
+        self.draft = draft;
+        true
     }
 
     /// Runs one token and returns the logits for the next one.
@@ -396,11 +479,73 @@ impl<'a> Runner<'a> {
     /// Panics if the batch is longer than the scratch was sized for or does not
     /// fit the remaining context, both of which are the caller's to check.
     pub fn forward_batch(&mut self, tokens: &[u32]) -> &[f32] {
+        let t = self.run(tokens, false);
+        self.accept(t);
+        self.logits()
+    }
+
+    /// Runs `tokens` as one batch and produces the logits of **every** row,
+    /// without committing any of them.
+    ///
+    /// This is the verification half of speculative decoding. Row `r` is the
+    /// token at position `pos + r` and [`Runner::logit_row`] gives what follows
+    /// it, which is what the caller compares against its draft. Nothing moves
+    /// until [`Runner::accept`]: the batch has written the KV cache at
+    /// `pos..pos + tokens.len()` and the next `tokens.len()` ring slots, and
+    /// `accept` picks how far along that chain the runner actually is. Rows that
+    /// are never accepted are overwritten by the next batch and read by nothing
+    /// in between.
+    ///
+    /// Panics unless the batch fits the ring (`tokens.len() <= draft + 1`), the
+    /// scratch and the remaining context.
+    pub fn verify(&mut self, tokens: &[u32]) -> &[f32] {
+        assert!(
+            tokens.len() <= self.slots,
+            "a verification batch of {} rows, but the ring holds {}",
+            tokens.len(),
+            self.slots
+        );
+        let t = self.run(tokens, true);
+        &self.bufs.logits[..t * self.model.vocab()]
+    }
+
+    /// Commits the first `rows` rows of the batch that just ran, which must be
+    /// at least one.
+    ///
+    /// For a committed row the KV cache entry is already written, so this is the
+    /// `pos` that makes it readable and the ring slot that makes the state that
+    /// row produced the live one. Both are a number, which is the whole reason
+    /// the ring is a ring: a rollback is this call with a smaller `rows` and
+    /// never a copy.
+    ///
+    /// **Not with `rows == 0`, though.** A full-width batch is `draft + 1` rows
+    /// and the ring is `draft + 1` slots, so its last row writes
+    /// `(live + draft + 1) % slots`, which is `live`: by the time [`Runner::verify`]
+    /// returns, the state the batch started from has been overwritten. That is
+    /// deliberate and it is what makes the ring exactly as long as the batch,
+    /// because row 0 is a token the caller has already committed to and a
+    /// rollback never needs to go behind the state row 0 produced. Committing
+    /// none of the rows would therefore leave a rejected row's state live rather
+    /// than undoing the batch. See `docs/decisions.md`, "Speculative decoding".
+    pub fn accept(&mut self, rows: usize) {
+        debug_assert!(
+            rows > 0,
+            "a batch commits at least its first row; accept(0) would leave the \
+             last row of the batch live, not the state from before it"
+        );
+        debug_assert!(self.caches.pos + rows <= self.context);
+        self.caches.pos += rows;
+        self.caches.live = (self.caches.live + rows) % self.slots;
+    }
+
+    fn run(&mut self, tokens: &[u32], all_rows: bool) -> usize {
         let Self {
             model,
             pool,
             context,
             max_batch,
+            slots,
+            draft: _,
             caches,
             bufs,
             acts,
@@ -412,6 +557,7 @@ impl<'a> Runner<'a> {
         let model: &'a Model<'a> = model;
         let c = &model.config;
         let context = *context;
+        let slots = *slots;
         let t = tokens.len();
         let ne = c.n_embd;
         assert!(t > 0, "a batch of no tokens");
@@ -460,11 +606,13 @@ impl<'a> Runner<'a> {
                     ex.full_attn(b, il, caches.pos, kv, bufs);
                 }
                 Attn::Linear(b) => {
-                    let conv_span = c.conv_dim() * (c.conv_kernel - 1);
-                    let ssm_span = c.n_v_heads * c.d_state * c.d_state;
+                    // Both spans hold this block's whole ring, which is what
+                    // the rows of the batch walk through.
+                    let conv_span = slots * c.conv_dim() * (c.conv_kernel - 1);
+                    let ssm_span = c.n_v_heads * slots * c.d_state * c.d_state;
                     let conv = &mut caches.conv[b.slot * conv_span..(b.slot + 1) * conv_span];
                     let ssm = &mut caches.ssm[b.slot * ssm_span..(b.slot + 1) * ssm_span];
-                    ex.linear_attn(b, il, conv, ssm, bufs);
+                    ex.linear_attn(b, il, slots, caches.live, conv, ssm, bufs);
                 }
             }
 
@@ -496,33 +644,50 @@ impl<'a> Runner<'a> {
             ex.tracer.node("l_out", Some(il), &bufs.x[..t * ne]);
         }
 
+        // How many rows the output head runs on: the last token's only, which is
+        // all a prompt wants, or every row, which is what verifying a draft
+        // needs. One row is a batch of one through the same code, so the
+        // `all_rows == false` path is byte for byte the pass it always was.
+        let rows = if all_rows { t } else { 1 };
+        let vocab = model.vocab();
         let at = ex.profile.start();
-        rms_norm(
-            &bufs.x[(t - 1) * ne..][..ne],
-            model.output_norm,
-            c.rms_eps,
-            &mut bufs.xn[..ne],
-        );
+        for i in 0..rows {
+            let from = if all_rows { i } else { t - 1 };
+            rms_norm(
+                &bufs.x[from * ne..][..ne],
+                model.output_norm,
+                c.rms_eps,
+                &mut bufs.xn[i * ne..][..ne],
+            );
+        }
         ex.profile.add(Op::Norms, at);
-        ex.tracer.node("result_norm", None, &bufs.xn[..ne]);
-        // The batch is over here: what follows is one row, the last token's.
-        ex.t = 1;
+        ex.tracer.node("result_norm", None, &bufs.xn[..rows * ne]);
+        // The batch the blocks ran is over here: what follows is the rows the
+        // head was asked for.
+        ex.t = rows;
         // Tied embeddings: the table that read the token in is the output head.
         ex.matmul(
             Op::Head,
             &model.token_embd,
-            &bufs.xn[..ne],
-            &mut bufs.logits,
+            &bufs.xn[..rows * ne],
+            &mut bufs.logits[..rows * vocab],
         );
-        ex.tracer.node("result_output", None, &bufs.logits);
+        ex.tracer
+            .node("result_output", None, &bufs.logits[..rows * vocab]);
 
-        caches.pos += t;
-        &bufs.logits
+        t
     }
 
     /// The last logits, for a caller that wants them again without a step.
     pub fn logits(&self) -> &[f32] {
-        &self.bufs.logits
+        self.logit_row(0)
+    }
+
+    /// Row `r` of the logits the last [`Runner::verify`] produced, which is the
+    /// prediction that follows that row's token.
+    pub fn logit_row(&self, r: usize) -> &[f32] {
+        let vocab = self.model.vocab();
+        &self.bufs.logits[r * vocab..][..vocab]
     }
 
     /// Turns on the per-operator timers and the pool's barrier accounting.
@@ -843,10 +1008,22 @@ impl Exec<'_, '_> {
     /// `i - 1` wrote. The parallelism there is over value heads, each of which
     /// owns one state and runs the whole batch over it, so a batch is one pool
     /// job where it used to be `t` of them.
+    ///
+    /// Both of those states are a ring of `slots` buffers, `live` of which holds
+    /// what the committed tokens left behind. Row `i` reads slot
+    /// `(live + i) % slots` and writes the one after it, so the chain over the
+    /// batch is the same chain the single buffer carried and every row leaves
+    /// its own snapshot behind for a rollback to land on. With `slots == 1` the
+    /// two are the same slot and the recurrence updates it in place, which is
+    /// the only path there was before speculation and still the only one with
+    /// `--speculate 0`.
+    #[allow(clippy::too_many_arguments)]
     fn linear_attn(
         &mut self,
         b: &LinearBlock<'_>,
         il: usize,
+        slots: usize,
+        live: usize,
         conv_state: &mut [f32],
         ssm_state: &mut [f32],
         bufs: &mut Buffers,
@@ -906,14 +1083,23 @@ impl Exec<'_, '_> {
         self.tracer.node("beta_sigmoid", Some(il), beta);
 
         let at = self.profile.start();
+        let conv_span = conv_dim * (c.conv_kernel - 1);
         for i in 0..t {
-            depthwise_conv(
-                &qkv[i * conv_dim..][..conv_dim],
-                b.conv1d,
-                c.conv_kernel,
-                conv_state,
-                &mut conv[i * conv_dim..][..conv_dim],
-            );
+            let (from, to) = ((live + i) % slots, (live + i + 1) % slots);
+            let x = &qkv[i * conv_dim..][..conv_dim];
+            let out = &mut conv[i * conv_dim..][..conv_dim];
+            if from == to {
+                depthwise_conv(
+                    x,
+                    b.conv1d,
+                    c.conv_kernel,
+                    &mut conv_state[from * conv_span..][..conv_span],
+                    out,
+                );
+            } else {
+                let (prev, next) = ring_pair(conv_state, conv_span, from, to);
+                depthwise_conv_into(x, b.conv1d, c.conv_kernel, prev, next, out);
+            }
         }
         self.profile.add(Op::Conv, at);
         self.tracer.node("conv_output_raw", Some(il), conv);
@@ -938,16 +1124,18 @@ impl Exec<'_, '_> {
         let scale = 1.0 / (s as f32).sqrt();
         let decay = &*decay;
         let beta = &*beta;
-        // One chunk per value head, holding that head's whole batch: the state
-        // is sequential over tokens, so the tokens cannot be split, and the
-        // readout therefore comes out head-major and is transposed by the
-        // gated norm below.
+        // One chunk per value head, holding that head's whole batch and its
+        // whole ring: the state is sequential over tokens, so the tokens cannot
+        // be split, and the readout therefore comes out head-major and is
+        // transposed by the gated norm below. A head owns its own slice of
+        // every ring slot, so writing the next slot needs no synchronisation
+        // beyond the one the chunk already is.
         self.pool.chunks(
             &mut head_major[..n_vh * t * s],
             t * s,
             ssm_state,
-            s * s,
-            |vh, out, state| {
+            slots * s * s,
+            |vh, out, ring| {
                 // Several value heads share one key head, taken modulo the key
                 // head count as the reference broadcasts it.
                 let kh = vh % n_kh;
@@ -959,7 +1147,22 @@ impl Exec<'_, '_> {
                     let g = decay[i * n_vh + vh].exp();
                     let beta = beta[i * n_vh + vh];
                     let out = &mut out[i * s..][..s];
-                    delta_net(state, q, k, v, g, beta, scale, out);
+                    let (from, to) = ((live + i) % slots, (live + i + 1) % slots);
+                    if from == to {
+                        delta_net(
+                            &mut ring[from * s * s..][..s * s],
+                            q,
+                            k,
+                            v,
+                            g,
+                            beta,
+                            scale,
+                            out,
+                        );
+                    } else {
+                        let (prev, next) = ring_pair(ring, s * s, from, to);
+                        delta_net_into(prev, next, q, k, v, g, beta, scale, out);
+                    }
                 }
             },
         );
@@ -1267,6 +1470,66 @@ fn delta_net(
     }
 }
 
+/// [`delta_net`] reading the state from `prev` and writing it to `next`, which
+/// is how a row of a verification batch leaves the state it found behind.
+///
+/// **The arithmetic is [`delta_net`]'s, unchanged.** The only difference is the
+/// decay in pass one, which reads `prev` and writes `next` where the in-place
+/// version multiplies one element: the same product, written somewhere else.
+/// Pass two then runs over `next`, which is where the state now is.
+/// `tests::writing_the_state_to_the_next_ring_slot_changes_nothing` is what
+/// holds the two together, and it is why the in-place version is kept rather
+/// than expressed through this one: with `prev` and `next` the same buffer they
+/// would have to alias, and nothing here needs that.
+#[allow(clippy::too_many_arguments)]
+fn delta_net_into(
+    prev: &[f32],
+    next: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: f32,
+    beta: f32,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let s = out.len();
+    let (mut sk, mut d, mut o) = ([0.0f32; J_BLOCK], [0.0f32; J_BLOCK], [0.0f32; J_BLOCK]);
+    for j0 in (0..s).step_by(J_BLOCK) {
+        let w = J_BLOCK.min(s - j0);
+        let (sk, d, o) = (&mut sk[..w], &mut d[..w], &mut o[..w]);
+        sk.fill(0.0);
+        o.fill(0.0);
+        for (i, &ki) in k.iter().enumerate() {
+            let from = &prev[i * s + j0..][..w];
+            for ((r, &p), a) in next[i * s + j0..][..w]
+                .iter_mut()
+                .zip(from)
+                .zip(sk.iter_mut())
+            {
+                *r = p * g;
+                *a += *r * ki;
+            }
+        }
+        for ((dj, &vj), &skj) in d.iter_mut().zip(&v[j0..][..w]).zip(sk.iter()) {
+            *dj = (vj - skj) * beta;
+        }
+        for (i, (&ki, &qi)) in k.iter().zip(q).enumerate() {
+            for ((r, &dj), oj) in next[i * s + j0..][..w]
+                .iter_mut()
+                .zip(d.iter())
+                .zip(o.iter_mut())
+            {
+                *r += dj * ki;
+                *oj += *r * qi;
+            }
+        }
+        for (ot, &oj) in out[j0..][..w].iter_mut().zip(o.iter()) {
+            *ot = oj * scale;
+        }
+    }
+}
+
 /// Depthwise causal convolution over `conv_kernel` taps, in place over the
 /// per-channel history.
 ///
@@ -1285,6 +1548,51 @@ fn depthwise_conv(x: &[f32], w: &[f32], kernel: usize, state: &mut [f32], out: &
         *o = sum;
         h.rotate_left(1);
         h[hist - 1] = xc;
+    }
+}
+
+/// [`depthwise_conv`] reading the history from `prev` and writing it to `next`.
+///
+/// The output is the same sum in the same order; where the in-place version
+/// rotates the history down and appends the new sample, this writes the shifted
+/// history into `next` instead.
+fn depthwise_conv_into(
+    x: &[f32],
+    w: &[f32],
+    kernel: usize,
+    prev: &[f32],
+    next: &mut [f32],
+    out: &mut [f32],
+) {
+    let hist = kernel - 1;
+    for (c, (o, &xc)) in out.iter_mut().zip(x).enumerate() {
+        let taps = &w[c * kernel..(c + 1) * kernel];
+        let h = &prev[c * hist..(c + 1) * hist];
+        let mut sum = xc * taps[hist];
+        for (j, &hv) in h.iter().enumerate() {
+            sum += hv * taps[j];
+        }
+        *o = sum;
+        let to = &mut next[c * hist..(c + 1) * hist];
+        to[..hist - 1].copy_from_slice(&h[1..]);
+        to[hist - 1] = xc;
+    }
+}
+
+/// Slot `from` to read and slot `to` to write, out of one owner's ring of
+/// `span`-wide buffers.
+///
+/// The two slots are always different, so they are disjoint pieces of the same
+/// buffer; `split_at_mut` is how that is said to the compiler, and the order of
+/// the two in memory is whichever way round they happen to be.
+fn ring_pair(ring: &mut [f32], span: usize, from: usize, to: usize) -> (&[f32], &mut [f32]) {
+    debug_assert_ne!(from, to);
+    if from < to {
+        let (lo, hi) = ring.split_at_mut(to * span);
+        (&lo[from * span..][..span], &mut hi[..span])
+    } else {
+        let (lo, hi) = ring.split_at_mut(from * span);
+        (&hi[..span], &mut lo[to * span..][..span])
     }
 }
 
@@ -1402,6 +1710,98 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Writing the new state into the next ring slot has to give what updating
+    /// it in place gives, **bit for bit**, in the readout and in the state.
+    ///
+    /// This is the whole claim the ring rests on: a per-row snapshot is free
+    /// because the recurrence already reads the old state and writes the new
+    /// one, so the only thing that changed is the address it writes to. The
+    /// comparison is `==` and not a tolerance for the same reason as everywhere
+    /// else in this file: the model's output is discontinuous in the arithmetic.
+    ///
+    /// Several tokens, so the chain from one row's slot to the next is covered
+    /// and not only one hand-over, and the shapes are this model's `d_state` of
+    /// 128, the tiny model's 32 and a 40 that leaves [`J_BLOCK`] a remainder.
+    #[test]
+    fn writing_the_state_to_the_next_ring_slot_changes_nothing() {
+        let mut rand = noise(0x1115_10c7);
+        for (s, tokens) in [(128usize, 4usize), (32, 3), (40, 3)] {
+            let mut in_place = vec![0.0f32; s * s];
+            // Two slots, used alternately, as a ring of two would be.
+            let mut ring = vec![0.0f32; 2 * s * s];
+            let scale = 1.0 / (s as f32).sqrt();
+            for i in 0..tokens {
+                let q: Vec<f32> = (0..s).map(|_| rand()).collect();
+                let k: Vec<f32> = (0..s).map(|_| rand()).collect();
+                let v: Vec<f32> = (0..s).map(|_| rand()).collect();
+                let g = (rand().abs() * -2.0).exp();
+                let beta = sigmoid(rand() * 4.0);
+                let mut got = vec![0.0f32; s];
+                let mut want = vec![0.0f32; s];
+                let (from, to) = (i % 2, (i + 1) % 2);
+                let (prev, next) = ring_pair(&mut ring, s * s, from, to);
+                delta_net_into(prev, next, &q, &k, &v, g, beta, scale, &mut got);
+                delta_net(&mut in_place, &q, &k, &v, g, beta, scale, &mut want);
+                assert_eq!(got, want, "d_state {s} token {i}: readout");
+                assert_eq!(
+                    &ring[to * s * s..][..s * s],
+                    &in_place[..],
+                    "d_state {s} token {i}: state"
+                );
+            }
+        }
+    }
+
+    /// The same for the convolution's history: the output and the history left
+    /// behind have to be the in-place version's, bit for bit.
+    ///
+    /// The taps are the powers of ten of
+    /// [`the_convolution_is_causal_over_its_history`], so a history written one
+    /// sample out of place shows in the output as a whole decimal digit rather
+    /// than as rounding.
+    #[test]
+    fn writing_the_convolution_history_to_the_next_ring_slot_changes_nothing() {
+        let (kernel, channels) = (4usize, 3usize);
+        let hist = kernel - 1;
+        let w: Vec<f32> = (0..channels)
+            .flat_map(|c| [1.0, 10.0, 100.0, 1000.0].map(|t| t * (c + 1) as f32))
+            .collect();
+        let mut in_place = vec![0.0f32; channels * hist];
+        let mut ring = vec![0.0f32; 2 * channels * hist];
+        for i in 0..6usize {
+            let x: Vec<f32> = (0..channels).map(|c| (i * channels + c) as f32).collect();
+            let mut got = vec![0.0f32; channels];
+            let mut want = vec![0.0f32; channels];
+            let (from, to) = (i % 2, (i + 1) % 2);
+            let (prev, next) = ring_pair(&mut ring, channels * hist, from, to);
+            depthwise_conv_into(&x, &w, kernel, prev, next, &mut got);
+            depthwise_conv(&x, &w, kernel, &mut in_place, &mut want);
+            assert_eq!(got, want, "token {i}: output");
+            assert_eq!(
+                &ring[to * channels * hist..][..channels * hist],
+                &in_place[..],
+                "token {i}: history"
+            );
+        }
+    }
+
+    /// Which slot is read and which is written, whichever way round they sit in
+    /// the buffer, because the ring wraps and `to` is then below `from`.
+    #[test]
+    fn a_ring_pair_is_the_two_slots_asked_for() {
+        // Three slots of two, so a wrap from the last slot to the first is in
+        // the cases below.
+        let mut ring = vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        for (from, to) in [(0usize, 1usize), (1, 2), (2, 0)] {
+            let before = ring.clone();
+            let (prev, next) = ring_pair(&mut ring, 2, from, to);
+            assert_eq!(prev, &before[from * 2..][..2], "read slot {from}");
+            next.fill(-1.0);
+            assert_eq!(&ring[to * 2..][..2], &[-1.0, -1.0], "wrote slot {to}");
+            ring.copy_from_slice(&before);
         }
     }
 

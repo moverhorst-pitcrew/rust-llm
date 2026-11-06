@@ -308,6 +308,14 @@ fn the_http_surface_answers_both_endpoints_and_refuses_bad_input() {
             r#"{"messages":[{"role":"user","content":"hi"}],"stream":"yes"}"#,
             "a stream flag that is not a boolean",
         ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"speculate":3}"#,
+            "more drafts than the server allocated its ring for",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"speculate":-1}"#,
+            "a negative draft length",
+        ),
     ] {
         let (code, error) = post(addr, CHAT, body);
         assert_eq!(code, 400, "{what} has to be refused: {error}");
@@ -322,6 +330,37 @@ fn the_http_surface_answers_both_endpoints_and_refuses_bad_input() {
     }
     let (code, error) = post(addr, "/v1/completions", "{}");
     assert_eq!(code, 400, "a text completion with no prompt: {error}");
+
+    // ------------------------------------- speculation changes nothing but speed
+    // The seed is fixed by the command line, so the same request has one
+    // answer; asking for a different number of drafts must not move it. This is
+    // the HTTP end of the equivalence the gate asserts on the real model, and
+    // the reason `speculate` can be sent at all: a client that sets it is
+    // choosing a speed, not a model.
+    let mut answers = Vec::new();
+    for draft in ["0", "1", "2"] {
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"hello"}}],"max_tokens":8,"speculate":{draft}}}"#
+        );
+        let (code, answer) = post(addr, CHAT, &body);
+        assert_eq!(code, 200, "speculate {draft}: {answer}");
+        answers.push((
+            draft,
+            answer["choices"][0]["message"]["content"]
+                .as_str()
+                .expect("content")
+                .to_string(),
+            answer["usage"]["completion_tokens"].clone(),
+        ));
+    }
+    let (_, first, first_tokens) = &answers[0];
+    for (draft, text, tokens) in &answers[1..] {
+        assert_eq!(
+            text, first,
+            "speculate {draft} answered differently from speculate 0"
+        );
+        assert_eq!(tokens, first_tokens, "speculate {draft}: token count moved");
+    }
 
     // ------------------------------------------ the context is the ceiling
     // A max_tokens no run could reach is capped rather than refused: the
@@ -416,6 +455,9 @@ fn start(tiny: &support::Tiny) -> Server {
         // run for a number, and reads back what it got.
         .args(["--host", "127.0.0.1", "--port", "0"])
         .args(["--max-tokens", "3", "--temperature", "0.8"])
+        // A ring of two drafts, so a request can ask for 0, 1 or 2 and asking
+        // for 3 is the one case the server cannot grow into.
+        .args(["--speculate", "2"])
         .args(["--context", &CONTEXT.to_string()])
         .args(["--seed", DEFAULT_SEED, "--system", DEFAULT_SYSTEM])
         .arg("--model")
