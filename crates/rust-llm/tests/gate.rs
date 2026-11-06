@@ -978,6 +978,10 @@ fn mtp_drafting_does_not_change_the_output() {
     let cases = cases();
     let fixture = fixture();
     let expected = fixture["cases"].as_array().expect("cases");
+    // The same guard the two gates above carry, and for a sharper reason here:
+    // the acceptance floor below is a mean over whatever ran, so a short
+    // fixture would quietly hold the head to fewer prompts and still clear it.
+    assert_eq!(expected.len(), cases.len(), "fixture and prompt set differ");
     let gguf = open_model();
     let tokenizer = tokenizer();
     let model = Model::load(&gguf).expect("load model");
