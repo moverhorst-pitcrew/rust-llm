@@ -10,7 +10,10 @@
 //! rather than `#[target_feature]` at compile time, because the machine that
 //! runs the binary need not be the machine that built it.
 
+// `#[macro_use]`, so the sub-group macro `avx2` defines is in scope for `vnni`
+// below, which uses it on the same shape.
 #[cfg(target_arch = "x86_64")]
+#[macro_use]
 mod avx2;
 #[cfg(target_arch = "x86_64")]
 mod vnni;
