@@ -151,12 +151,68 @@ one on, and an unmeasured kernel is a second rounding behaviour to keep green
 for nothing.
 
 **The batched kernel is bit-identical to the per-row one**, not merely close.
-The same products accumulate in the same order and only the unpacking moves, so
-the kernel test asserts it with `==` rather than a tolerance, for both types on
+The kernel test asserts it with `==` rather than a tolerance, for both types on
 every tier, over the model's shapes and the awkward ones, at batch sizes either
 side of the group boundary. That is what lets a prompt be read in batches
 without changing a single logit, which is the property the correctness gate
 would otherwise have to absorb.
+
+**Why a restructuring of the batched kernel can keep that claim.** Everything
+below the one f32 line of these kernels is integer: the per-lane products and
+their i32 accumulation (`VPDPBUSD`, or `VPMADDUBSW` + `VPMADDWD` on the AVX2
+tier), the horizontal sum over the accumulator, `Q4_K`'s minimum term over the
+sub-block minima and the activation group sums, and `Q6_K`'s bias term of the
+same shape. Integer addition is associative, so reassociating any of it is
+**exact** rather than within a tolerance, and that is the licence the kernel
+restructures under.
+
+There is exactly one order that is not free, and it is the f32 accumulation per
+output: `*o += ab.d * (d * isum - dmin * imin)`, once per super-block, in
+super-block order. f32 addition is not associative, so moving a super-block or
+splitting that sum changes bits. Everything the kernel does is arranged to keep
+the super-block loop outermost, so however the work inside a super-block is
+grouped, every output still sums the same addends in the same order.
+
+Concretely, what that permits and what it forbids:
+
+- A group of tokens whose accumulators stay live across the sub-block loop is
+  free: the sub-blocks of one output are still summed in their own order, the
+  grouping only interleaves independent outputs.
+- Reducing several accumulators' horizontal sums together, and the minimum or
+  bias terms of several tokens together, is free: all integer.
+- Running the f32 line for four tokens as one four-lane SSE expression is free,
+  and this is the subtle one. It is not a reassociation at all: each lane
+  performs the same operations the scalar line performs, in the same order, and
+  SSE single-precision multiply, subtract and add are the same IEEE 754
+  operations on the same bits as Rust's on `f32`. Neither side contracts into an
+  FMA, because Rust does not form one without fast-math and these are explicit
+  instructions. The four outputs of a sub-group are adjacent in the output, which
+  is what makes the vector load and store possible.
+- Repacking the weights along `k`, so that one instruction carries products from
+  more than one super-block, is **not** free. It reorders the f32 block sum by
+  construction, it would move the margins recorded in
+  `fixtures/reference_generations.json`, and it is the thing the kernel does not
+  do. If it is ever wanted it needs its own entry here and a deliberate decision
+  to move the fixture.
+
+The lane bounds are part of this too, and they are a property of the *layout*
+rather than of the arithmetic. A `VPDPBUSD` lane holds at most `4 * 15 * 127 =
+7620` for `Q4_K`, which is what makes packing two of them into i16 with
+`VPACKSSDW` safe against its 32767; a `VPMADDUBSW` lane holds 3810 for `Q4_K`
+and 16002 for `Q6_K`. A restructuring that collects more products in a lane
+before the pack eats that margin silently, so
+`the_saturation_extremes_match_the_single_kernel` drives every nibble to `0xF`,
+every sub-block scale to the largest its field holds and every activation to
+`+/-127`, and checks the batched kernel against the single-row one with `==`
+*and* the single-row one against the f64 reference, because a saturation present
+in both paths would leave the two agreeing with each other.
+
+**A tile over several weight rows was built and is not in the product.** It is
+the same correctness argument and it was bit-identical, but on the real model at
+8 threads it did not move the prompt outside the window's spread, where the
+microbenchmark had promised 12 per cent; see "What was measured and not kept" in
+`docs/benchmarks.md` for the numbers and for what they say about where the
+batched kernel's time actually goes.
 
 **Where the batch's win actually comes from is the caller's loop order**, not
 the kernel: the pool hands a worker a block of weight rows and runs it against

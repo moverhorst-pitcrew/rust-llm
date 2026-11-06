@@ -183,6 +183,14 @@ Kernel microbenchmark:
 cargo run --release -p llm-core --example bench_kernels
 ```
 
+Two tables: the single-row kernels per (type, shape, tier), and the batched ones
+run against one group of activation rows the way the prompt path does. The
+second is where a change to the batched kernel shows without the thread pool and
+the rest of the forward pass in the way. Both are one thread on synthetic
+weights, so they need no model and no lock, and neither decides anything on
+their own: this box cannot resolve a few per cent here, and the numbers that
+settle a change are the alternated real-model pairs in `docs/benchmarks.md`.
+
 ## Measuring
 
 Throughput, as a median of repeated runs with the spread reported, per thread
