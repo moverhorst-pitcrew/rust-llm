@@ -650,33 +650,41 @@ What those three tables say, and it is the opposite of prompt lookup's shape:
 - **Both histograms are bimodal**, as prompt lookup's are: a pass either
   accepts nothing or accepts most of the draft.
 
-#### The measured gain: one reading, at the edge of its own spread
+#### The measured gain: +9.5 per cent on prose at two drafts
 
-**Prose, two drafts**, the only pair taken in a window that started quiet
-(load 1.99, and 4.35 by the end of the block), 5 repeats:
+**Prose, two drafts**, 5 repeats, in the quietest window this box offered
+(load average 2.35 at the start of the block and 4.90 at the end):
 
 | | tok/s | spread |
 | --- | --- | --- |
-| sequential | 15.31 | 5.7% |
-| speculated | 16.24 | 6.4% |
+| sequential | 15.85 | 2.5% |
+| speculated | 17.36 | 2.9% |
 
-**+6.1 per cent**, at acceptance 0.87, against spreads of 5.7 and 6.4 per cent.
-So it is positive and it is inside the noise of the pair that produced it. That
-is the whole timing result, and it is one number.
+**+9.5 per cent** at acceptance 0.87, against spreads of 2.5 and 2.9 per cent,
+so the gain is three times the noise of the pair that produced it. The same
+configuration in an earlier and less quiet window (load 1.99 to 4.35, spreads
+5.7 and 6.4) gave `15.31 -> 16.24`, +6.1 per cent, with a **byte-identical**
+acceptance line: 45 passes, 45 of them drafting nothing, 65 of 75 drafts
+accepted. So the acceptance reproduces exactly and the level does not, which is
+the same thing the prompt-lookup tables above say about this box.
 
-Every other attempt landed in a window with another ticket's benchmark on the
-box: load average 4.2 to 8.6 across ten further blocks, with the `sequential`
-row swinging from 11.11 to 15.64 tok/s on the same configuration, which is
-further than the effect. Those pairs are not quoted. Acceptance is, because it
-is a property of the model and the text and not of the clock, and it came out
-the same in every one of those windows.
+It also lands on what the pieces predict. At two drafts the measured costs give
+about +10 per cent, from 15 verification batches of three rows, 15 passes that
+draft nothing and about 25 draft steps per 32 tokens.
 
-What the pieces predict, for something to check a quiet reading against: at four
-drafts on prose a round is seven verification batches of about 3.6 rows, ten
-passes that draft nothing and about 25 draft steps per 32 tokens, which is
-roughly 59 ms a token against 68 sequential, about +15 per cent. At two drafts
-the same arithmetic gives about +10. That is arithmetic and not a measurement.
-The gap between it and the +6.1 above is what a quiet window has to settle.
+**At four drafts there is no level to quote.** Three windows gave +2.5, +4.9 and
++9.7 per cent at an identical acceptance of 0.78, with spreads of 9.5, 7.6 and
+9.9 per cent on the `sequential` row: every reading is positive and every one is
+at or inside its own noise. What the pieces predict there is about +15 per cent.
+Seven further blocks across the sweeps ran at load averages of 4.2 to 8.6 with
+the `sequential` row swinging from 11.11 to 15.64 tok/s on one configuration,
+which is further than the effect; those are not quoted at all.
+
+The reason the numbers are this hard to pin down is in "The machine": one model
+run at a time is the rule on this box, and another ticket was benchmarking
+through most of this work. Acceptance is quoted everywhere above because it is a
+property of the model and the text and not of the clock, and it came out the
+same in every window, quiet or not.
 
 ### The default is 0
 
@@ -688,14 +696,16 @@ been given, and the cost of guessing wrong is a slower run. So it is a flag, not
 a default: a caller who knows their text repeats itself, a long quoted passage,
 a diff, boilerplate code, turns it on and gets the numbers above.
 
-**The head does not change that on these numbers, and the reason is not its
-accuracy.** It accepts 0.67 on the gate prompt set against a break-even of 0.38
-to 0.45, which is the first draft source here that is clearly above its own
-break-even on ordinary prose. What is missing is the measured pair: every window
-on this box during this work had another ticket's benchmark in it, and the
-`sequential` row moved further than the effect. So the default stays 0 and the
-draft source stays `prompt-lookup`, and whether the numbers flip either is a
-decision taken against a quiet-window reading, not against this paragraph.
+**The head is the first draft source here that is above its own break-even on
+ordinary prose**, and it has a measured gain: 0.67 accepted on the gate prompt
+set against a break-even of 0.38 to 0.45, and +9.5 per cent on prose at two
+drafts. That is a real case for turning it on, and it is still not this
+section's call to make: one clean pair at one draft length, on a box where
+another ticket was benchmarking throughout, is thinner evidence than the
+prompt-lookup tables rest on, and there is no quiet reading at all at four
+drafts. So the default stays 0 and the draft source stays `prompt-lookup`.
+Flipping either is a decision taken against the numbers in code review, which
+is where the ticket that commissioned this put it.
 
 **The two draft sources are for opposite texts, which is worth knowing whichever
 default wins.** Prompt lookup is for text that repeats literally and does
