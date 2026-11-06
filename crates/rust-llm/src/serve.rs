@@ -296,8 +296,18 @@ impl Server<'_, '_> {
         on_token: impl FnMut(u32) -> bool,
     ) -> (Vec<u32>, Stop, Timings) {
         self.runner.reset();
-        // Checked when the request was parsed, so this cannot be refused here.
-        self.runner.set_draft(parsed.speculate);
+        // Checked when the request was parsed, so this cannot be refused here,
+        // and asserted rather than ignored because that is exactly why it
+        // cannot: a refusal would silently leave the previous request's draft
+        // length in place, which is a wrong speed and nothing a client could
+        // see.
+        assert!(
+            self.runner.set_draft(parsed.speculate),
+            "a request asked for {} drafts against a ring of {}, which Parsed::read \
+             is supposed to have refused",
+            parsed.speculate,
+            self.defaults.speculate,
+        );
         let mut sampler = Sampler::new(self.vocab, parsed.sampling);
         generate::generate(
             self.runner,

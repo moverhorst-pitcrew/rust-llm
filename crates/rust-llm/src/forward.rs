@@ -509,14 +509,30 @@ impl<'a> Runner<'a> {
         &self.bufs.logits[..t * self.model.vocab()]
     }
 
-    /// Commits the first `rows` rows of the batch that just ran.
+    /// Commits the first `rows` rows of the batch that just ran, which must be
+    /// at least one.
     ///
     /// For a committed row the KV cache entry is already written, so this is the
     /// `pos` that makes it readable and the ring slot that makes the state that
     /// row produced the live one. Both are a number, which is the whole reason
     /// the ring is a ring: a rollback is this call with a smaller `rows` and
     /// never a copy.
+    ///
+    /// **Not with `rows == 0`, though.** A full-width batch is `draft + 1` rows
+    /// and the ring is `draft + 1` slots, so its last row writes
+    /// `(live + draft + 1) % slots`, which is `live`: by the time [`Runner::verify`]
+    /// returns, the state the batch started from has been overwritten. That is
+    /// deliberate and it is what makes the ring exactly as long as the batch,
+    /// because row 0 is a token the caller has already committed to and a
+    /// rollback never needs to go behind the state row 0 produced. Committing
+    /// none of the rows would therefore leave a rejected row's state live rather
+    /// than undoing the batch. See `docs/decisions.md`, "Speculative decoding".
     pub fn accept(&mut self, rows: usize) {
+        debug_assert!(
+            rows > 0,
+            "a batch commits at least its first row; accept(0) would leave the \
+             last row of the batch live, not the state from before it"
+        );
         debug_assert!(self.caches.pos + rows <= self.context);
         self.caches.pos += rows;
         self.caches.live = (self.caches.live + rows) % self.slots;

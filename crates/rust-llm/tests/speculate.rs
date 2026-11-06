@@ -276,8 +276,8 @@ fn a_burst_stops_exactly_where_a_sequential_run_stops() {
                 truth.extend_from_slice(&want);
                 truth.extend(std::iter::repeat_n(want.last().copied().unwrap_or(0), 16));
 
-                for (drafter, draft) in [("right", DRAFT), ("wrong", DRAFT)] {
-                    let mut runner = Runner::with_speculation(&model, context, THREADS, 8, draft);
+                for drafter in ["right", "wrong"] {
+                    let mut runner = Runner::with_speculation(&model, context, THREADS, 8, DRAFT);
                     let mut sampler = Sampler::new(model.vocab(), set);
                     let mut seen = 0usize;
                     let mut offered = 0usize;
