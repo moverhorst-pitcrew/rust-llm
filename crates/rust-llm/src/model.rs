@@ -229,9 +229,38 @@ pub struct Block<'a> {
     pub ffn_down: TensorView<'a>,
 }
 
+/// The multi-token-prediction block, `blk.{n_blocks}`.
+///
+/// It is a full-attention block of the trunk's own shape plus four tensors,
+/// and that is why [`Self::block`] is a plain [`Block`]: the forward pass runs
+/// it through the same attention and the same feed-forward as any full block,
+/// so the head cannot drift away from the trunk it drafts for.
+///
+/// What it does not have is an embedding table or an output head of its own.
+/// The file carries no `nextn.embed_tokens` and no `nextn.shared_head_head`, so
+/// tokens come in through `token_embd` and logits go out through it too, the
+/// same tied tensor the trunk uses.
+pub struct MtpBlock<'a> {
+    /// RMSNorm weights for the embedding of the token being predicted from.
+    pub enorm: &'a [f32],
+    /// RMSNorm weights for the hidden state handed in.
+    pub hnorm: &'a [f32],
+    /// `[2 * n_embd, n_embd]`, reading the normed embedding followed by the
+    /// normed hidden state: `ggml_concat(e_norm, h_norm, dim = 0)` in the
+    /// reference, so the embedding is the first half.
+    pub eh_proj: TensorView<'a>,
+    /// Stands in for `output_norm` in front of the tied head.
+    pub shared_head_norm: &'a [f32],
+    pub block: Block<'a>,
+}
+
 pub struct Model<'a> {
     pub config: Config,
     pub blocks: Vec<Block<'a>>,
+    /// The multi-token-prediction block, when the conversion kept it. `None`
+    /// leaves the runner exactly as it was: drafting from the head is then
+    /// unavailable and nothing else differs.
+    pub mtp: Option<MtpBlock<'a>>,
     /// Doubles as the output head: this model ties them.
     pub token_embd: TensorView<'a>,
     pub output_norm: &'a [f32],
@@ -249,7 +278,7 @@ impl<'a> Model<'a> {
 
     pub fn with_kernels(g: &'a Gguf, kernels: Kernels) -> Result<Self> {
         let c = Config::from_gguf(g)?;
-        let (n_embd, n_ff) = (c.n_embd as u64, c.n_ff as u64);
+        let n_embd = c.n_embd as u64;
 
         let token_embd = g.tensor("token_embd.weight")?;
         check_dims(&token_embd, &[n_embd, token_embd.dims[1]])?;
@@ -266,75 +295,37 @@ impl<'a> Model<'a> {
         let mut blocks = Vec::with_capacity(c.n_blocks);
         let (mut full, mut linear) = (0, 0);
         for il in 0..c.n_blocks {
-            let t = |suffix: &str| -> Result<TensorView<'a>> {
-                Ok(g.tensor(&format!("blk.{il}.{suffix}"))?)
+            let slot = match c.recurrent[il] {
+                true => &mut linear,
+                false => &mut full,
             };
-            let f32s = |suffix: &str, want: &[u64]| -> Result<&'a [f32]> {
-                let name = format!("blk.{il}.{suffix}");
-                let info = g.tensor_info(&name)?;
-                check_info(&name, info, want)?;
-                Ok(g.tensor_f32(&name)?)
-            };
-
-            let attn = if c.recurrent[il] {
-                let slot = linear;
-                linear += 1;
-                let block = LinearBlock {
-                    slot,
-                    qkv: t("attn_qkv.weight")?,
-                    gate: t("attn_gate.weight")?,
-                    conv1d: f32s(
-                        "ssm_conv1d.weight",
-                        &[c.conv_kernel as u64, c.conv_dim() as u64],
-                    )?,
-                    a: f32s("ssm_a", &[c.n_v_heads as u64])?,
-                    dt_bias: f32s("ssm_dt.bias", &[c.n_v_heads as u64])?,
-                    alpha: t("ssm_alpha.weight")?,
-                    beta: t("ssm_beta.weight")?,
-                    norm: f32s("ssm_norm.weight", &[c.d_state as u64])?,
-                    out: t("ssm_out.weight")?,
-                };
-                check_dims(&block.qkv, &[n_embd, c.conv_dim() as u64])?;
-                check_dims(&block.gate, &[n_embd, c.d_inner as u64])?;
-                check_dims(&block.alpha, &[n_embd, c.n_v_heads as u64])?;
-                check_dims(&block.beta, &[n_embd, c.n_v_heads as u64])?;
-                check_dims(&block.out, &[c.d_inner as u64, n_embd])?;
-                Attn::Linear(block)
-            } else {
-                let slot = full;
-                full += 1;
-                let block = FullBlock {
-                    slot,
-                    qg: t("attn_q.weight")?,
-                    k: t("attn_k.weight")?,
-                    v: t("attn_v.weight")?,
-                    o: t("attn_output.weight")?,
-                    q_norm: f32s("attn_q_norm.weight", &[c.head_dim as u64])?,
-                    k_norm: f32s("attn_k_norm.weight", &[c.head_dim as u64])?,
-                };
-                check_dims(&block.qg, &[n_embd, c.qg_dim() as u64])?;
-                check_dims(&block.k, &[n_embd, c.kv_dim() as u64])?;
-                check_dims(&block.v, &[n_embd, c.kv_dim() as u64])?;
-                check_dims(&block.o, &[c.attn_dim() as u64, n_embd])?;
-                Attn::Full(block)
-            };
-
-            let block = Block {
-                attn_norm: f32s("attn_norm.weight", &[n_embd])?,
-                post_attn_norm: f32s("post_attention_norm.weight", &[n_embd])?,
-                attn,
-                ffn_gate: t("ffn_gate.weight")?,
-                ffn_up: t("ffn_up.weight")?,
-                ffn_down: t("ffn_down.weight")?,
-            };
-            check_dims(&block.ffn_gate, &[n_embd, n_ff])?;
-            check_dims(&block.ffn_up, &[n_embd, n_ff])?;
-            check_dims(&block.ffn_down, &[n_ff, n_embd])?;
-            for w in [&block.ffn_gate, &block.ffn_up, &block.ffn_down] {
-                kernels.vec_dot(w.ty)?;
-            }
+            let block = load_block(g, &c, &kernels, il, c.recurrent[il], *slot)?;
+            *slot += 1;
             blocks.push(block);
         }
+
+        // The MTP block's own KV cache is one block's worth, so its slot is 0;
+        // it is a full-attention block whatever the trunk's last block was.
+        let mtp = match qwen35::layer_plan(g)?.mtp {
+            None => None,
+            Some(il) => {
+                let f32s = |suffix: &str| -> Result<&'a [f32]> {
+                    let name = format!("blk.{il}.nextn.{suffix}.weight");
+                    check_info(&name, g.tensor_info(&name)?, &[n_embd])?;
+                    Ok(g.tensor_f32(&name)?)
+                };
+                let eh_proj = g.tensor(&format!("blk.{il}.nextn.eh_proj.weight"))?;
+                check_dims(&eh_proj, &[2 * n_embd, n_embd])?;
+                kernels.vec_dot(eh_proj.ty)?;
+                Some(MtpBlock {
+                    enorm: f32s("enorm")?,
+                    hnorm: f32s("hnorm")?,
+                    eh_proj,
+                    shared_head_norm: f32s("shared_head_norm")?,
+                    block: load_block(g, &c, &kernels, il, false, 0)?,
+                })
+            }
+        };
 
         let output_norm = {
             let info = g.tensor_info("output_norm.weight")?;
@@ -345,6 +336,7 @@ impl<'a> Model<'a> {
         Ok(Self {
             config: c,
             blocks,
+            mtp,
             token_embd,
             output_norm,
             kernels,
@@ -356,6 +348,84 @@ impl<'a> Model<'a> {
     pub fn vocab(&self) -> usize {
         self.token_embd.dims[1] as usize
     }
+}
+
+/// One block's weights, checked against the config.
+///
+/// The MTP block goes through this as well, with `recurrent` false and its own
+/// cache slot: it is a full-attention block of the same shape, and loading it
+/// anywhere else would be a second place for a tensor name to be wrong.
+fn load_block<'a>(
+    g: &'a Gguf,
+    c: &Config,
+    kernels: &Kernels,
+    il: usize,
+    recurrent: bool,
+    slot: usize,
+) -> Result<Block<'a>> {
+    let (n_embd, n_ff) = (c.n_embd as u64, c.n_ff as u64);
+    let t = |suffix: &str| -> Result<TensorView<'a>> { Ok(g.tensor(&format!("blk.{il}.{suffix}"))?) };
+    let f32s = |suffix: &str, want: &[u64]| -> Result<&'a [f32]> {
+        let name = format!("blk.{il}.{suffix}");
+        let info = g.tensor_info(&name)?;
+        check_info(&name, info, want)?;
+        Ok(g.tensor_f32(&name)?)
+    };
+
+    let attn = if recurrent {
+        let block = LinearBlock {
+            slot,
+            qkv: t("attn_qkv.weight")?,
+            gate: t("attn_gate.weight")?,
+            conv1d: f32s(
+                "ssm_conv1d.weight",
+                &[c.conv_kernel as u64, c.conv_dim() as u64],
+            )?,
+            a: f32s("ssm_a", &[c.n_v_heads as u64])?,
+            dt_bias: f32s("ssm_dt.bias", &[c.n_v_heads as u64])?,
+            alpha: t("ssm_alpha.weight")?,
+            beta: t("ssm_beta.weight")?,
+            norm: f32s("ssm_norm.weight", &[c.d_state as u64])?,
+            out: t("ssm_out.weight")?,
+        };
+        check_dims(&block.qkv, &[n_embd, c.conv_dim() as u64])?;
+        check_dims(&block.gate, &[n_embd, c.d_inner as u64])?;
+        check_dims(&block.alpha, &[n_embd, c.n_v_heads as u64])?;
+        check_dims(&block.beta, &[n_embd, c.n_v_heads as u64])?;
+        check_dims(&block.out, &[c.d_inner as u64, n_embd])?;
+        Attn::Linear(block)
+    } else {
+        let block = FullBlock {
+            slot,
+            qg: t("attn_q.weight")?,
+            k: t("attn_k.weight")?,
+            v: t("attn_v.weight")?,
+            o: t("attn_output.weight")?,
+            q_norm: f32s("attn_q_norm.weight", &[c.head_dim as u64])?,
+            k_norm: f32s("attn_k_norm.weight", &[c.head_dim as u64])?,
+        };
+        check_dims(&block.qg, &[n_embd, c.qg_dim() as u64])?;
+        check_dims(&block.k, &[n_embd, c.kv_dim() as u64])?;
+        check_dims(&block.v, &[n_embd, c.kv_dim() as u64])?;
+        check_dims(&block.o, &[c.attn_dim() as u64, n_embd])?;
+        Attn::Full(block)
+    };
+
+    let block = Block {
+        attn_norm: f32s("attn_norm.weight", &[n_embd])?,
+        post_attn_norm: f32s("post_attention_norm.weight", &[n_embd])?,
+        attn,
+        ffn_gate: t("ffn_gate.weight")?,
+        ffn_up: t("ffn_up.weight")?,
+        ffn_down: t("ffn_down.weight")?,
+    };
+    check_dims(&block.ffn_gate, &[n_embd, n_ff])?;
+    check_dims(&block.ffn_up, &[n_embd, n_ff])?;
+    check_dims(&block.ffn_down, &[n_ff, n_embd])?;
+    for w in [&block.ffn_gate, &block.ffn_up, &block.ffn_down] {
+        kernels.vec_dot(w.ty)?;
+    }
+    Ok(block)
 }
 
 fn check_dims(t: &TensorView<'_>, want: &[u64]) -> Result<()> {

@@ -36,7 +36,7 @@ use std::time::Instant;
 use llm_core::quant::Activations;
 use llm_core::{Kernels, TensorView};
 
-use crate::model::{Attn, Config, FullBlock, LinearBlock, Model};
+use crate::model::{Attn, Config, FullBlock, LinearBlock, Model, MtpBlock};
 use crate::pool::{Matvec, Pool};
 
 /// Per-layer activations for the reference comparison, off unless asked for.
@@ -137,6 +137,9 @@ pub enum Op {
     FfnDown,
     /// The output head over the tied embedding table.
     Head,
+    /// The MTP block's `nextn.eh_proj`, which is the one matmul it has that
+    /// the trunk's blocks do not.
+    MtpProj,
     /// Every RMS and L2 norm, including the per-head ones, and RoPE.
     Norms,
     /// Residual adds, SwiGLU, the sigmoid and SiLU gates, argmax-free.
@@ -144,7 +147,7 @@ pub enum Op {
 }
 
 impl Op {
-    const COUNT: usize = 13;
+    const COUNT: usize = 14;
     const ALL: [Op; Op::COUNT] = [
         Op::Embed,
         Op::FullQkv,
@@ -157,6 +160,7 @@ impl Op {
         Op::FfnGateUp,
         Op::FfnDown,
         Op::Head,
+        Op::MtpProj,
         Op::Norms,
         Op::Elementwise,
     ];
@@ -174,6 +178,7 @@ impl Op {
             Op::FfnGateUp => "ffn: gate and up matmul",
             Op::FfnDown => "ffn: down matmul",
             Op::Head => "output head matmul",
+            Op::MtpProj => "mtp: eh_proj matmul",
             Op::Norms => "norms and rope",
             Op::Elementwise => "elementwise",
         }
@@ -278,11 +283,55 @@ struct Buffers {
     logits: Vec<f32>,
 }
 
+impl Buffers {
+    /// Every buffer at once, `b` rows wide, with room for `logit_rows` rows of
+    /// the output head.
+    ///
+    /// The MTP block allocates a second one of these rather than borrowing the
+    /// trunk's. Two of them are live at the same moment: the trunk's `xn` holds
+    /// the hidden states the block reads and its `logits` are still the
+    /// caller's, so sharing would mean aliasing exactly the two buffers that
+    /// carry a result across the call.
+    fn new(c: &Config, context: usize, b: usize, vocab: usize, logit_rows: usize) -> Self {
+        Self {
+            x: vec![0.0; b * c.n_embd],
+            xn: vec![0.0; b * c.n_embd],
+            y: vec![0.0; b * c.n_embd],
+            qkv: vec![0.0; b * c.qg_dim().max(c.conv_dim())],
+            kb: vec![0.0; b * c.kv_dim()],
+            vb: vec![0.0; b * c.kv_dim()],
+            z: vec![0.0; b * c.d_inner],
+            conv: vec![0.0; b * c.conv_dim()],
+            heads: vec![0.0; b * c.attn_dim().max(c.d_inner)],
+            head_major: vec![0.0; b * c.d_inner.max(c.attn_dim())],
+            scores: vec![0.0; b * c.n_head * context],
+            ffn_a: vec![0.0; b * c.n_ff],
+            ffn_b: vec![0.0; b * c.n_ff],
+            decay: vec![0.0; b * c.n_v_heads],
+            beta: vec![0.0; b * c.n_v_heads],
+            logits: vec![0.0; vocab * logit_rows],
+        }
+    }
+}
+
 /// Tokens per batch when the caller does not say.
 ///
 /// Taken from the measured crossover rather than from a round number: see
 /// `docs/benchmarks.md`, "What batched prompt evaluation moved".
 pub const DEFAULT_BATCH: usize = 16;
+
+/// How sure the MTP head has to be of a token before it is worth drafting.
+///
+/// The reference calls this `p_min` and defaults it to zero, which drafts every
+/// step however hopeless. It is not a tuning knob here, it is a measured
+/// constant: see `docs/benchmarks.md`, "Drafting from the MTP head".
+///
+/// A rejected draft costs a verification row, and the row after the first
+/// rejection is thrown away as well, so a step the head is not confident about
+/// is paid for twice. The floor is the probability of the top token after a
+/// softmax over the whole vocabulary, which is one pass over logits the matmul
+/// just wrote and does not show next to it.
+pub const MTP_P_MIN: f32 = 0.35;
 
 /// The longest draft [`Runner::with_speculation`] takes.
 ///
@@ -308,8 +357,49 @@ pub struct Runner<'a> {
     caches: Caches,
     bufs: Buffers,
     acts: Activations,
+    /// The MTP block's cache and scratch, allocated by
+    /// [`Runner::enable_mtp`] and `None` until then.
+    mtp: Option<Mtp>,
+    /// Rows the last [`Runner::run`] produced, and how many of them
+    /// [`Runner::accept`] has committed so far. Only the MTP catch-up reads
+    /// them: it has to know which rows of the batch in flight are the ones
+    /// being committed.
+    batch: usize,
+    committed: usize,
+    /// The tokens of that batch, for the same reason.
+    tokens: Vec<u32>,
     pub tracer: Tracer,
     pub profile: Profile,
+}
+
+/// Everything the multi-token-prediction block needs beside its weights.
+struct Mtp {
+    /// `[k, v][kv head][position][head_dim]`: one full-attention block's cache
+    /// over the whole context, the layout and the walk the trunk's full blocks
+    /// already use.
+    ///
+    /// No ring and no rollback. An entry is written at an absolute position and
+    /// read only from that position onwards, so what a rejected draft left
+    /// behind is overwritten by the catch-up after the next trunk pass and read
+    /// by nothing in between. That is the reference's "own KV, growing in the
+    /// draft region" mode.
+    kv: Vec<f32>,
+    /// Positions the block has been caught up on: the trunk's `pos` outside a
+    /// draft, and above it inside one.
+    caught_up: usize,
+    /// The trunk's post-`output_norm` row at `caught_up - 1`, which is the
+    /// hidden state the token at `caught_up` pairs with. Zero at the start of a
+    /// sequence, which is what the first token gets in the reference too.
+    h: Vec<f32>,
+    /// `enorm(embed(token))` followed by `hnorm(h)`, one row of `2 * n_embd`
+    /// per row of the call: the order `eh_proj` reads them in.
+    eh: Vec<f32>,
+    /// The hidden states handed in, one `n_embd` row per row of the call. A
+    /// buffer of its own rather than a slice of the trunk's, because a catch-up
+    /// reads one row of the trunk's `xn` per row and a draft step reads this
+    /// block's own previous output.
+    h_in: Vec<f32>,
+    bufs: Buffers,
 }
 
 impl<'a> Runner<'a> {
@@ -375,29 +465,63 @@ impl<'a> Runner<'a> {
                 pos: 0,
                 live: 0,
             },
-            bufs: Buffers {
-                x: vec![0.0; b * c.n_embd],
-                xn: vec![0.0; b * c.n_embd],
-                y: vec![0.0; b * c.n_embd],
-                qkv: vec![0.0; b * c.qg_dim().max(c.conv_dim())],
-                kb: vec![0.0; b * c.kv_dim()],
-                vb: vec![0.0; b * c.kv_dim()],
-                z: vec![0.0; b * c.d_inner],
-                conv: vec![0.0; b * c.conv_dim()],
-                heads: vec![0.0; b * c.attn_dim().max(c.d_inner)],
-                head_major: vec![0.0; b * c.d_inner.max(c.attn_dim())],
-                scores: vec![0.0; b * c.n_head * context],
-                ffn_a: vec![0.0; b * c.n_ff],
-                ffn_b: vec![0.0; b * c.n_ff],
-                decay: vec![0.0; b * c.n_v_heads],
-                beta: vec![0.0; b * c.n_v_heads],
-                logits: vec![0.0; vocab * slots],
-            },
-            acts: Activations::with_batch(c.n_embd.max(c.n_ff).max(c.d_inner).max(c.attn_dim()), b),
+            bufs: Buffers::new(c, context, b, vocab, slots),
+            // `2 * n_embd` is the MTP block's `eh_proj`, the widest activation
+            // either path quantizes; it is wider than `n_embd` on every shape
+            // and wider than the feed-forward on a small enough one.
+            acts: Activations::with_batch(
+                (2 * c.n_embd)
+                    .max(c.n_ff)
+                    .max(c.d_inner)
+                    .max(c.attn_dim()),
+                b,
+            ),
+            mtp: None,
+            batch: 0,
+            committed: 0,
+            tokens: Vec::with_capacity(b),
             model,
             tracer: Tracer::default(),
             profile: Profile::default(),
         }
+    }
+
+    /// Allocates the MTP block's cache and scratch, so this runner can draft
+    /// from the model's own head.
+    ///
+    /// Returns `false` and changes nothing when the file has no MTP block,
+    /// which is what the conversion before this model's shipped
+    /// (`docs/models.md`).
+    ///
+    /// It allocates, where everything else this runner owns comes out of the
+    /// constructor. That is on purpose: a runner that does not draft from the
+    /// head should not carry a second block's cache, and the three constructors
+    /// and every caller of them stay as they were. It is still once per run and
+    /// before the first token, which is what the assert holds it to.
+    pub fn enable_mtp(&mut self) -> bool {
+        if self.model.mtp.is_none() {
+            return false;
+        }
+        assert_eq!(
+            self.caches.pos, 0,
+            "enable_mtp before the first token: the block is caught up as tokens \
+             go through and cannot be caught up on positions already past"
+        );
+        let c = &self.model.config;
+        self.mtp = Some(Mtp {
+            kv: vec![0.0; 2 * c.n_head_kv * self.context * c.head_dim],
+            caught_up: 0,
+            h: vec![0.0; c.n_embd],
+            eh: vec![0.0; self.max_batch * 2 * c.n_embd],
+            h_in: vec![0.0; self.max_batch * c.n_embd],
+            bufs: Buffers::new(c, self.context, self.max_batch, self.model.vocab(), 1),
+        });
+        true
+    }
+
+    /// Whether [`Runner::draft_mtp`] can produce anything.
+    pub fn drafts_from_mtp(&self) -> bool {
+        self.mtp.is_some()
     }
 
     pub fn config(&self) -> &Config {
@@ -433,6 +557,18 @@ impl<'a> Runner<'a> {
         self.caches.ssm.fill(0.0);
         self.caches.pos = 0;
         self.caches.live = 0;
+        self.batch = 0;
+        self.committed = 0;
+        self.tokens.clear();
+        if let Some(mtp) = &mut self.mtp {
+            // The cache is only read up to `caught_up`, so zeroing it is not
+            // what makes the reset a reset; the carried hidden state is. It is
+            // zeroed anyway, for the same reason the trunk's is: a fresh runner
+            // and a reset one have to be the same thing bit for bit.
+            mtp.kv.fill(0.0);
+            mtp.h.fill(0.0);
+            mtp.caught_up = 0;
+        }
         self.tracer.clear();
     }
 
@@ -527,6 +663,11 @@ impl<'a> Runner<'a> {
     /// rollback never needs to go behind the state row 0 produced. Committing
     /// none of the rows would therefore leave a rejected row's state live rather
     /// than undoing the batch. See `docs/decisions.md`, "Speculative decoding".
+    /// Also where the MTP block is rolled back, which is the same thing as
+    /// catching it up: its cache is written at absolute positions and read
+    /// only from a position onwards, so committing fewer rows than the batch
+    /// ran leaves the rejected positions holding entries nothing will read
+    /// until the next catch-up overwrites them.
     pub fn accept(&mut self, rows: usize) {
         debug_assert!(
             rows > 0,
@@ -534,11 +675,109 @@ impl<'a> Runner<'a> {
              last row of the batch live, not the state from before it"
         );
         debug_assert!(self.caches.pos + rows <= self.context);
+        if self.mtp.is_some() {
+            self.catch_up(rows);
+        }
         self.caches.pos += rows;
         self.caches.live = (self.caches.live + rows) % self.slots;
+        self.committed += rows;
+    }
+
+    /// Runs the MTP block over the `rows` rows of the batch in flight that
+    /// [`Runner::accept`] is committing, so its cache holds every position the
+    /// trunk holds.
+    ///
+    /// Row `r` of the batch is the token at position `pos + r`, and what the
+    /// block takes with it is the hidden state of the position *before* it:
+    /// the trunk's own post-`output_norm` row `r - 1`, or the state carried
+    /// over from the previous call when `r` is the batch's first row. All of
+    /// those are known before the call, so however many rows are being
+    /// committed go through as one batch; nothing here is sequential, unlike a
+    /// draft.
+    ///
+    /// The whole block runs, head excluded. Only the key and value projections
+    /// feed its cache, so a catch-up could stop after them and read 11 MB of
+    /// weights per row rather than 75; that is about 1.7 ms a row on this box,
+    /// against the 15 ms a draft step costs, so it is the block as it is until
+    /// the profile says otherwise. Running it through the same two functions the
+    /// trunk's full blocks use is worth more than the 1.7 ms: the head cannot
+    /// drift away from the block it drafts for.
+    fn catch_up(&mut self, rows: usize) {
+        let Self {
+            model,
+            pool,
+            context,
+            caches,
+            bufs,
+            acts,
+            mtp,
+            tracer,
+            profile,
+            tokens,
+            batch,
+            committed,
+            ..
+        } = self;
+        let model: &'a Model<'a> = model;
+        let block = model.mtp.as_ref().expect("enable_mtp checked the file");
+        let Mtp {
+            kv,
+            caught_up,
+            h,
+            eh,
+            h_in,
+            bufs: mbufs,
+        } = mtp.as_mut().expect("the caller checked");
+        let ne = model.config.n_embd;
+        let from = *committed;
+        let pos = caches.pos + from;
+        debug_assert!(from + rows <= *batch);
+        debug_assert!(
+            *caught_up >= pos,
+            "the block is at {caught_up} and is being caught up from {pos}, so it \
+             would skip a position"
+        );
+
+        // Row `from` of the batch pairs with the carried hidden state; every
+        // row after it with the trunk's own from the row in front of it.
+        for r in from..from + rows {
+            let row: &[f32] = match r {
+                0 => h,
+                _ => &bufs.xn[(r - 1) * ne..][..ne],
+            };
+            h_in[(r - from) * ne..][..ne].copy_from_slice(row);
+        }
+        Exec {
+            model,
+            pool,
+            context: *context,
+            t: rows,
+            acts,
+            tracer,
+            profile,
+        }
+        .mtp_block(
+            block,
+            pos,
+            &tokens[from..from + rows],
+            h_in,
+            eh,
+            mbufs,
+            kv,
+            false,
+        );
+        h.copy_from_slice(&bufs.xn[(from + rows - 1) * ne..][..ne]);
+        *caught_up = pos + rows;
     }
 
     fn run(&mut self, tokens: &[u32], all_rows: bool) -> usize {
+        self.batch = tokens.len();
+        self.committed = 0;
+        self.tokens.clear();
+        if self.mtp.is_some() {
+            self.tokens.extend_from_slice(tokens);
+        }
+        let mtp = self.mtp.is_some();
         let Self {
             model,
             pool,
@@ -551,6 +790,7 @@ impl<'a> Runner<'a> {
             acts,
             tracer,
             profile,
+            ..
         } = self;
         // Copied out of `self` so the borrow of the model outlives the mutable
         // borrows of the caches and the scratch rather than conflicting.
@@ -644,15 +884,24 @@ impl<'a> Runner<'a> {
             ex.tracer.node("l_out", Some(il), &bufs.x[..t * ne]);
         }
 
-        // How many rows the output head runs on: the last token's only, which is
-        // all a prompt wants, or every row, which is what verifying a draft
-        // needs. One row is a batch of one through the same code, so the
-        // `all_rows == false` path is byte for byte the pass it always was.
+        // How many rows get normed, and how many the output head then runs
+        // on. The head wants the last token's row only, which is all a prompt
+        // needs, or every row, which is what verifying a draft needs. The MTP
+        // block is a third reader: it has to be caught up on every position the
+        // trunk ran, including a whole prompt, and what it takes is exactly
+        // this norm's output. So with the block live every row is normed and
+        // the head still runs on one, which is one extra `rms_norm` per row and
+        // not one extra weight read.
+        //
+        // With the block off and `all_rows` false this is one row through the
+        // same code it always was, from the same input, so `--speculate 0` is
+        // byte for byte the pass it was.
         let rows = if all_rows { t } else { 1 };
+        let normed = if all_rows || mtp { t } else { 1 };
         let vocab = model.vocab();
         let at = ex.profile.start();
-        for i in 0..rows {
-            let from = if all_rows { i } else { t - 1 };
+        for i in 0..normed {
+            let from = if normed == t { i } else { t - 1 };
             rms_norm(
                 &bufs.x[from * ne..][..ne],
                 model.output_norm,
@@ -661,7 +910,12 @@ impl<'a> Runner<'a> {
             );
         }
         ex.profile.add(Op::Norms, at);
-        ex.tracer.node("result_norm", None, &bufs.xn[..rows * ne]);
+        // What the head is fed: the last row that was normed when it wants one,
+        // and all of them when it wants all of them. The reference calls the
+        // whole thing `h_nextn` and what it crops out of it `result_norm`,
+        // which is the same two tensors.
+        let head_in = &bufs.xn[(normed - rows) * ne..][..rows * ne];
+        ex.tracer.node("result_norm", None, head_in);
         // The batch the blocks ran is over here: what follows is the rows the
         // head was asked for.
         ex.t = rows;
@@ -669,13 +923,99 @@ impl<'a> Runner<'a> {
         ex.matmul(
             Op::Head,
             &model.token_embd,
-            &bufs.xn[..rows * ne],
+            head_in,
             &mut bufs.logits[..rows * vocab],
         );
         ex.tracer
             .node("result_output", None, &bufs.logits[..rows * vocab]);
 
         t
+    }
+
+    /// Drafts up to `out.len()` tokens from the model's own MTP head, and
+    /// returns how many it wrote. The same contract as
+    /// [`crate::generate::prompt_lookup`], and `0` when the head is not
+    /// available or has nothing it is confident about.
+    ///
+    /// Step 0 is `(the last token, the carried hidden state)` at the trunk's
+    /// own next position, which is exactly the pair a catch-up would use there;
+    /// step `i` is `(what step i - 1 drafted, the block's own hidden state from
+    /// step i - 1)` at the position after. Every step writes the block's cache
+    /// at its own position and attends over everything in front of it, which is
+    /// the reference's `common_speculative_impl_draft_mtp` with `is_mem_shared`
+    /// and `chain_heads` both false.
+    ///
+    /// The steps are sequential by construction: step `i` reads what step
+    /// `i - 1` produced. That is why a draft of `n` tokens costs `n` passes
+    /// over the block and the output head, and why [`MTP_P_MIN`] exists.
+    ///
+    /// It allocates nothing, so it can sit in the generation loop.
+    pub fn draft_mtp(&mut self, history: &[u32], out: &mut [u32]) -> usize {
+        if out.is_empty() || self.mtp.is_none() {
+            return 0;
+        }
+        let Self {
+            model,
+            pool,
+            context,
+            caches,
+            acts,
+            mtp,
+            tracer,
+            profile,
+            ..
+        } = self;
+        let model: &'a Model<'a> = model;
+        let block = model.mtp.as_ref().expect("enable_mtp checked the file");
+        let Mtp {
+            kv,
+            caught_up,
+            h,
+            eh,
+            h_in,
+            bufs,
+        } = mtp.as_mut().expect("checked above");
+        let ne = model.config.n_embd;
+        let vocab = model.vocab();
+        debug_assert_eq!(
+            *caught_up, caches.pos,
+            "the block drafts from the position the trunk is at"
+        );
+
+        let mut token = *history.last().expect("a draft needs a last token");
+        h_in[..ne].copy_from_slice(h);
+        let mut n = 0;
+        while n < out.len() {
+            let pos = caches.pos + n;
+            // The cache has a row per context position and no more. The caller
+            // caps the draft by the room it has left for the verification
+            // batch, so this is the second half of the same bound.
+            if pos >= *context {
+                break;
+            }
+            Exec {
+                model,
+                pool,
+                context: *context,
+                t: 1,
+                acts,
+                tracer,
+                profile,
+            }
+            .mtp_block(block, pos, &[token], h_in, eh, bufs, kv, true);
+            let (pick, p) = top_probability(&bufs.logits[..vocab]);
+            if p < MTP_P_MIN {
+                break;
+            }
+            out[n] = pick;
+            n += 1;
+            token = pick;
+            // What the block just produced is what the next step pairs with
+            // its token: `bufs.xn` is this block's own post-`shared_head_norm`
+            // row, the reference's `h_nextn` out of the MTP graph.
+            h_in[..ne].copy_from_slice(&bufs.xn[..ne]);
+        }
+        n
     }
 
     /// The last logits, for a caller that wants them again without a step.
@@ -995,6 +1335,120 @@ impl Exec<'_, '_> {
         self.tracer.node("attn_output", Some(il), &y[..t * ne]);
     }
 
+    /// `bufs.xn = rms_norm(bufs.x, w)`, row by row, traced under `name`.
+    fn norm_rows(&mut self, w: &[f32], name: &str, il: usize, t: usize, bufs: &mut Buffers) {
+        let ne = self.model.config.n_embd;
+        let eps = self.model.config.rms_eps;
+        let at = self.profile.start();
+        for i in 0..t {
+            rms_norm(
+                &bufs.x[i * ne..][..ne],
+                w,
+                eps,
+                &mut bufs.xn[i * ne..][..ne],
+            );
+        }
+        self.profile.add(Op::Norms, at);
+        self.tracer.node(name, Some(il), &bufs.xn[..t * ne]);
+    }
+
+    /// `bufs.x += bufs.y`, which is what both of a block's residuals are.
+    fn residual(&mut self, t: usize, bufs: &mut Buffers) {
+        let ne = self.model.config.n_embd;
+        let at = self.profile.start();
+        for (x, y) in bufs.x[..t * ne].iter_mut().zip(&bufs.y[..t * ne]) {
+            *x += y;
+        }
+        self.profile.add(Op::Elementwise, at);
+    }
+
+    /// The multi-token-prediction block on `tokens.len()` rows.
+    ///
+    /// Row `i` is `tokens[i]` at position `pos + i`, paired with the hidden
+    /// state in row `i` of `h`. The reference's `graph_mtp` step for step:
+    /// `hnorm(h)` and `enorm(embed(token))`, concatenated along the embedding
+    /// axis with the embedding first, `eh_proj`, and from there a
+    /// full-attention Qwen3.5 block, which is why the rest of this goes through
+    /// the same [`Exec::full_attn`] and [`Exec::ffn`] the trunk's full blocks
+    /// use rather than through a copy of them.
+    ///
+    /// `head` asks for `shared_head_norm` and the tied output head. A draft
+    /// step needs both: the logits to pick a token from and the normed row to
+    /// hand the step after it. A catch-up needs neither, because nothing
+    /// downstream of the second residual feeds this block's own cache.
+    ///
+    /// On return `bufs.xn` holds the post-`shared_head_norm` rows and
+    /// `bufs.logits` the head's, when `head` was asked for.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_block(
+        &mut self,
+        m: &MtpBlock<'_>,
+        pos: usize,
+        tokens: &[u32],
+        h: &[f32],
+        eh: &mut [f32],
+        bufs: &mut Buffers,
+        kv: &mut [f32],
+        head: bool,
+    ) {
+        let model = self.model;
+        let c = &model.config;
+        let ne = c.n_embd;
+        let t = tokens.len();
+        // The block index the reference gives these nodes, which is the trunk's
+        // block count: `blk.32` on this model.
+        let il = c.n_blocks;
+        self.t = t;
+
+        let at = self.profile.start();
+        for (i, &token) in tokens.iter().enumerate() {
+            let (e, hn) = eh[i * 2 * ne..][..2 * ne].split_at_mut(ne);
+            rms_norm(&h[i * ne..][..ne], m.hnorm, c.rms_eps, hn);
+            self.embed(token, e);
+            rms_norm_in_place(e, m.enorm, c.rms_eps);
+        }
+        self.profile.add(Op::Norms, at);
+        self.tracer.node("mtp_concat", Some(il), &eh[..t * 2 * ne]);
+
+        // `eh_proj` is the residual stream the block-shaped half runs on, which
+        // is `inpSA` in the reference.
+        self.matmul(
+            Op::MtpProj,
+            &m.eh_proj,
+            &eh[..t * 2 * ne],
+            &mut bufs.x[..t * ne],
+        );
+        self.tracer.node("mtp_eh_proj", Some(il), &bufs.x[..t * ne]);
+
+        let Attn::Full(full) = &m.block.attn else {
+            unreachable!("the MTP block is loaded as a full-attention block")
+        };
+        self.norm_rows(m.block.attn_norm, "mtp_attn_norm", il, t, bufs);
+        self.full_attn(full, il, pos, kv, bufs);
+        self.residual(t, bufs);
+        self.tracer
+            .node("mtp_attn_residual", Some(il), &bufs.x[..t * ne]);
+
+        self.norm_rows(m.block.post_attn_norm, "mtp_attn_post_norm", il, t, bufs);
+        self.ffn(&m.block, il, bufs);
+        self.residual(t, bufs);
+        self.tracer.node("mtp_post_ffn", Some(il), &bufs.x[..t * ne]);
+
+        if !head {
+            return;
+        }
+        self.norm_rows(m.shared_head_norm, "mtp_h_nextn", il, t, bufs);
+        let vocab = model.vocab();
+        self.matmul(
+            Op::Head,
+            &model.token_embd,
+            &bufs.xn[..t * ne],
+            &mut bufs.logits[..t * vocab],
+        );
+        self.tracer
+            .node("mtp_result_output", Some(il), &bufs.logits[..t * vocab]);
+    }
+
     /// The gated delta net: a depthwise causal convolution over the q/k/v
     /// projection, then the delta rule against a per-head recurrent state.
     ///
@@ -1198,6 +1652,22 @@ impl Exec<'_, '_> {
         );
         self.tracer.node("linear_attn_out", Some(il), &y[..t * ne]);
     }
+}
+
+/// The argmax and its probability under a softmax over the whole vector.
+///
+/// One pass for the maximum and one for the sum, over logits the output head
+/// has just written, so this is memory the matmul left in cache. The
+/// normalising sum is accumulated in f64 as everywhere else in this file.
+fn top_probability(logits: &[f32]) -> (u32, f32) {
+    let mut best = (f32::NEG_INFINITY, 0usize);
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best.0 {
+            best = (v, i);
+        }
+    }
+    let sum: f64 = logits.iter().map(|&v| (v - best.0).exp() as f64).sum();
+    (best.1 as u32, (1.0 / sum) as f32)
 }
 
 /// `out = x / sqrt(mean(x^2) + eps) * w`.
