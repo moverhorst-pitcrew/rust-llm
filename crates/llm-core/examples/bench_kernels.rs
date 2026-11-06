@@ -6,6 +6,13 @@
 //! speedup over the scalar tier and the weight bandwidth, because a 4B model
 //! on CPU is bound by how fast the quantized weights can be streamed.
 //!
+//! The second table is the batched kernels, which is the prompt path and the
+//! compute-bound one. It runs a whole weight tensor against one group of
+//! activation rows, the way `Part::run` does, and reports what that costs per
+//! token next to the single-row kernel run once per token. This is where a
+//! change to the sub-group or tile shape shows without the thread pool, the
+//! batch's other fixed costs or the rest of the forward pass in the way.
+//!
 //! ```text
 //! cargo run --release -p llm-core --example bench_kernels
 //! ```
@@ -104,6 +111,90 @@ fn main() {
                     format!("{ty:?}"),
                     tier.as_str(),
                     scalar_ms / ms
+                );
+            }
+        }
+    }
+
+    batched();
+}
+
+/// The batched kernels at one group of activation rows, which is the prompt
+/// path's shape: a block of weight rows run against every row of the batch
+/// before the next block is touched.
+fn batched() {
+    let t = Kernels::BATCH_GROUP;
+    println!();
+    println!("batched, {t} activation rows per group, one thread");
+    println!(
+        "{:<28} {:>9} {:>10} {:>11} {:>11} {:>9}",
+        "shape", "type", "tier", "ms/group", "ms/token", "vs per-row"
+    );
+
+    for &ty in TYPES {
+        for &(label, k, rows) in SHAPES {
+            let stride = ty.bytes_for(k as u64).expect("fits") as usize;
+            let mut w = vec![0u8; stride * rows];
+            fill(&mut w, 0x9e37 + k as u64);
+            let scale_at = match ty {
+                GgmlType::Q6_K => 208,
+                _ => 0,
+            };
+            for block in w.chunks_mut(ty.block_bytes()) {
+                block[scale_at..scale_at + 2].copy_from_slice(&[0x00, 0x2c]);
+                if ty == GgmlType::Q4_K {
+                    block[2..4].copy_from_slice(&[0x00, 0x24]);
+                }
+            }
+
+            let x: Vec<f32> = (0..t * k)
+                .map(|i| ((i % 17) + i / k) as f32 * 0.37 - 3.0)
+                .collect();
+            let mut a = Activations::with_batch(k, t);
+            a.quantize_batch(&x, k);
+            let mut out = vec![0.0f32; t * rows];
+
+            for &tier in TIERS {
+                let Some(kernels) = Kernels::for_tier(tier) else {
+                    continue;
+                };
+                let Some(dot) = kernels.vec_dot_batch(ty) else {
+                    continue;
+                };
+                let per_row = time(Duration::from_millis(400), || {
+                    for tt in 0..t {
+                        kernels
+                            .matvec_row(
+                                ty,
+                                &w,
+                                k,
+                                &a,
+                                tt,
+                                black_box(&mut out[tt * rows..(tt + 1) * rows]),
+                            )
+                            .expect("kernel");
+                    }
+                    black_box(&out);
+                });
+                let best = time(Duration::from_millis(400), || {
+                    out.fill(0.0);
+                    for r in 0..rows {
+                        let row = &w[r * stride..(r + 1) * stride];
+                        let mut vals = [0.0f32; 64];
+                        dot(row, &a, 0, black_box(&mut vals[..t]));
+                        for (tt, &v) in vals[..t].iter().enumerate() {
+                            out[tt * rows + r] = v;
+                        }
+                    }
+                    black_box(&out);
+                });
+                let ms = best.as_secs_f64() * 1e3;
+                println!(
+                    "{label:<28} {:>9} {:>10} {ms:>11.3} {:>11.4} {:>8.2}x",
+                    format!("{ty:?}"),
+                    tier.as_str(),
+                    ms / t as f64,
+                    per_row.as_secs_f64() / best.as_secs_f64()
                 );
             }
         }

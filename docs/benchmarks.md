@@ -142,6 +142,12 @@ Context 1024, 192-token prompt, batch 16, 16 generated tokens, tier
 | 7 | 43.88 | 1.7% | 13.46 | 4.7% | 19.30 | 70% | 3.3 |
 | 8 | 47.16 | 7.1% | 14.87 | 3.0% | 19.19 | **77%** | **3.2** |
 
+This sweep is from the end of M2 and has not been re-run since. The kernel work
+in "What the kernel work moved" below moves the prompt column by 15 to 21 per
+cent and leaves the generation column where it is; its pairs are the comparable
+numbers, and a fresh eight-thread-count sweep needs a quiet window this box has
+not offered.
+
 Peak RSS 2.82 GiB for the whole bench process, which loads the model once and
 runs every configuration in it. Per configuration, from a single `rust-llm run`
 with a 16-token prompt: 2.76 GiB at context 1024 and 2.75 GiB at context 4096,
@@ -222,6 +228,58 @@ scratch, of which the score buffer alone is batch times context times 16 floats.
 16 is also exactly one group of the batched kernel, which is not a coincidence:
 past one group the weight block's unpacking is already divided by 16 and only
 the fixed costs are left to amortise.
+
+## What the kernel work moved
+
+Two changes inside the batched kernels, each measured against the previous
+commit's binary by alternating passes in one window under the model lock. Prompt
+tok/s, context 1024, 192-token prompt, batch 16.
+
+| commit | change | 8 threads | 1 thread |
+| --- | --- | --- | --- |
+| `a7ed504` | the `Q4_K` minimum and `Q6_K` bias terms as one `VPMADDWD` each | 46.04, 46.72 -> 51.27, 50.60 | 11.12, 11.55 -> 12.95, 13.08 |
+| `1d0dd23` | a sub-group of tokens stays live across the sub-blocks, and its epilogue is reduced across the sub-group | 51.05, 50.32 -> 51.55, 53.78 | 13.31, 12.34 -> 13.80, 13.68 |
+
+Loads 2.36 -> 4.84 for the first row and 5.70 -> 8.59 for the second. The two
+windows are hours apart on a shared box, which is why the second row's "before"
+does not match the first row's "after" more closely than it does: compare inside
+a row, never across them.
+
+And the branch end to end, `9bdd45c` against `1d0dd23`, alternated in one window
+at a load of 2.65 -> 4.29:
+
+| | main | this branch |
+| --- | --- | --- |
+| 8 threads, prompt | 47.71, 41.42 | 48.99, 53.73 |
+| 1 thread, prompt | 11.80, 10.63 | 13.47, 13.57 |
+| 8 threads, generation | 14.50, 11.53 | 13.57, 13.58 |
+| 1 thread, generation | 4.40, 4.15 | 4.56, 4.43 |
+
+21 per cent on the 1-thread prompt, where the spreads are 0.5 to 2.3 per cent
+and the kernel shows without the scheduler in the way, and 15 per cent on the
+8-thread prompt on the means, where `main`'s two passes spread 8.1 and 13.8 per
+cent and the figure is correspondingly softer. The quietest window this branch
+was measured in at all gave 60.5 to 63.6 tok/s at 8 threads, which is what the
+same binary does on an idle box; the pair above is the comparable thing.
+
+**Generation, which is batch 1 and goes through `matvec` rather than the batched
+kernel.** The caller is untouched by this branch (`git diff` over
+`crates/rust-llm/` is empty), so a batch of one takes the same path it always
+did. It is not unchanged in level, because the single-row kernels got the same
+reduction of the minimum and bias terms, and the output head is `Q6_K`. Four
+alternated batch-1 passes at 8 threads, load 7.3 -> 8.5 throughout:
+
+| | main | this branch |
+| --- | --- | --- |
+| prompt, batch 1 | 15.23, 15.12, 14.46, 14.23 | 14.94, 14.41, 13.77, 14.07 |
+| generation | 15.52, 14.98, 13.68, 13.48 | 15.08, 13.87, 13.93, 13.82 |
+
+3.1 per cent below on the batch-1 prompt means and 1.7 on generation, against
+per-pass spreads of 0.1 to 18.2 per cent, and the sign is not consistent: this
+branch is ahead on generation in passes 3 and 4 and behind in 1 and 2, and ahead
+by 4 to 7 per cent at 1 thread. Every per-pass difference is inside at least one
+of the pair's spreads, so this reads as the box rather than the change, but it is
+reported as what it measured rather than as "unchanged".
 
 ## The long-context configuration
 
@@ -715,6 +773,62 @@ waiting for the last worker is part of what that matmul costs.
 `bench` by what is not inside a timed operator, which at these sizes is the
 argmax over 248320 logits.
 
+### After the kernel work
+
+One invocation of `rust-llm profile --context 1024 --threads 8 --prompt-tokens
+192 --max-tokens 8` on the head of this branch, at a load of 6.50 on a box with
+other work on it. **Read the shares, not the level**, for the reason the M2
+tables below give.
+
+```
+profile: prompt, 192 tokens, 8 threads, context 1024, batch 16, tier avx2+vnni
+operator                           calls/t   ms/token       %
+ffn: gate and up matmul                2.0       4.60    25.9
+ffn: down matmul                       2.0       3.72    21.0
+linear: qkv, gate, alpha, beta matmul     1.5       2.63    14.8
+linear: output matmul                  1.5       1.28     7.2
+elementwise                           11.5       1.24     7.0
+linear: delta-net recurrence           1.5       0.87     4.9
+linear: convolution                    1.5       0.77     4.3
+full: qg, k and v matmul               0.5       0.70     3.9
+output head matmul                     0.1       0.68     3.8
+norms and rope                         7.6       0.54     3.0
+full: output matmul                    0.5       0.42     2.4
+full: attention                        0.5       0.31     1.7
+embed                                  1.0       0.00     0.0
+measured total                                  17.74   100.0
+of which pool hand-out                10.1       0.90     5.1
+of which pool join (last worker)      10.1       0.92     5.2
+```
+
+```
+profile: generation, 8 tokens, 8 threads, context 1024, tier avx2+vnni
+operator                           calls/t   ms/token       %
+ffn: gate and up matmul               32.0      22.47    31.5
+ffn: down matmul                      32.0      14.30    20.0
+output head matmul                     1.0      11.15    15.6
+linear: qkv, gate, alpha, beta matmul    24.0      10.58    14.8
+linear: output matmul                 24.0       3.40     4.8
+full: qg, k and v matmul               8.0       2.48     3.5
+linear: delta-net recurrence          24.0       2.13     3.0
+elementwise                          184.0       1.30     1.8
+full: output matmul                    8.0       1.12     1.6
+full: attention                        8.0       0.95     1.3
+linear: convolution                   24.0       0.88     1.2
+norms and rope                       121.0       0.59     0.8
+embed                                  1.0       0.00     0.0
+measured total                                  71.37   100.0
+of which pool hand-out               161.0       2.09     2.9
+of which pool join (last worker)     161.0       9.47    13.3
+```
+
+The prompt token is 17.74 ms against the 21.21 of the M2 table below, and every
+matmul row moved: the two feed-forward rows 5.96 and 4.17 -> 4.60 and 3.72, the
+projection group 3.29 -> 2.63, `linear: output` 1.53 -> 1.28. The matmuls other
+than the output head are 75 per cent of a prompt token now (79 with the head),
+against 77 and 80 before, so they shrank slightly faster than the token did. The
+operators this branch does not touch are where they were, as they should be.
+
 ### Now, at the end of M2
 
 Re-run on the final head of the branch, so the shares match what ships. Both
@@ -778,11 +892,17 @@ in a quiet window the two are 1.64 and 3.24 ms, which is the same story.
 
 What is left to win, in order:
 
-- **The matmuls other than the output head are 77 per cent of a prompt token
-  and 76 per cent of a generation token** (80 and 90 with the head). In
-  generation they are streaming weights and so are the ceiling itself. In the prompt they are compute, and the next factor is in the
-  kernel: register blocking over several weight rows, which is the shape the
-  reference's repacked GEMM has and ours does not.
+- **The matmuls other than the output head are 75 per cent of a prompt token
+  and 78 per cent of a generation token** (79 and 94 with the head), from the
+  refreshed profile above. In generation they are streaming weights and so are
+  the ceiling itself. In the prompt the kernel work on this branch took what
+  was reachable without touching the weight layout, and what is left in them is
+  not register blocking: both a token sub-group and a tile over weight rows were
+  built and measured, and the tile does not show at 8 threads (see "What was
+  measured and not kept"). The next factor needs the weights repacked along `k`
+  so that fewer instructions carry more products, which is the one thing that
+  would reorder the f32 block sum and move the recorded fixture margins. It
+  needs its own decision, not a tuning commit.
 - **The output head is 14.6 per cent of a generation token** and 3.3 of a prompt
   token, because a batch computes it once. It is a single 2560 x 248320 matmul
   over the whole embedding table and it cannot be fused with anything.
@@ -887,6 +1007,34 @@ records at 0.00937, 0.01035, 0.04748 and 0.12625, to the last digit.
   a gate that would stop comparing two roundings of one model.
 - **A batch larger than 16 as the default**: measured, 8 per cent more prompt
   tok/s at batch 64 for four times the scratch. See the batch-size curve.
+- **A tile over weight rows**, the register blocking this branch's ticket was
+  named for. Built on both tiers for both k-quants, bit-identical, every test
+  green, and reverted. In the microbenchmark it is worth 12 per cent on the
+  `Q4_K` shapes and 5 on the `Q6_K` ones at the best shape of the five tried
+  (`ROW_TILE` 2 by sub-group 8, against 1x8, 2x4, 2x2 and 4x2). On the real
+  model at 8 threads it is 60.51, 61.57, 61.61 -> 61.06, 61.34, 63.59 tok/s over
+  three alternated passes, 1.2 per cent on the means and inside the window's
+  spread, and at 1 thread 13.92, 14.35, 13.86 -> 15.18, 13.74, 14.71, which does
+  not hold its sign. The rule on this branch is that a commit which does not
+  move the 8-thread number outside the spread is reverted, so it was. What it
+  says is that the operand traffic the tile removes is not what constrains the
+  kernel once eight workers share the machine: a throwaway probe that gives every
+  token of a sub-group the same activation block, so all but one activation load
+  disappears, takes `Q4_K` `avx2+vnni` `2560x8192` from 7.665 to 2.824 ms at one
+  thread, and none of that reaches the whole model at the real thread count.
+- **Making the group of activation rows the caller's outer loop**, with the group
+  sized to fit L1 (11 rows at `K` 2560, 3 at `K` 9216). 1-thread prompt 13.71,
+  13.42 -> 11.26, 11.41, a 17 per cent regression, reverted. Two things were
+  wrong with it. The nesting itself is a no-op at the shipped batch, because the
+  kernel already takes the whole group of 16 for one weight row and there is
+  only one group; and the smaller group multiplies the per-super-block unpacking
+  back up by 16/3 on the widest tensor. The activations are re-walked per weight
+  row because the kernel *is* per weight row, and nothing above it can share
+  that pass.
+- **A token sub-group larger than 8, and 2 and 4**: see the pairs under "What the
+  kernel work moved". 2 and 4 measure at or below 1 on the real model; 6 and
+  above, before the epilogue was reduced across the sub-group, measured 10 to 20
+  per cent worse in the microbenchmark.
 - **A batched Q8_0 kernel**: not written. This file holds no `Q8_0` tensor, so
   there is nothing here to measure it on, and a kernel nobody can measure is a
   second rounding behaviour to keep green for nothing.
