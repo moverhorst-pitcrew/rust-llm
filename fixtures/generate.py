@@ -40,6 +40,11 @@ TOKENIZER_CASES = [
     ("emoji", "\U0001f680 ship it \U0001f389\U0001f3fd‍♂️ ❤️\U0001f525"),
     ("emoji_only", "\U0001f602\U0001f602\U0001f602"),
     ("nfc_decomposed", "café vs café"),
+    # Combining marks that NFC cannot fold into one code point. This is the
+    # one thing the MTP-preserved repository's tokenizer does differently from
+    # the stripped one's: its pre-tokenizer regex matches `\p{L}+` where the
+    # older one matched `[\p{L}\p{M}]+`, so a matra now starts its own piece.
+    ("combining_marks", "नमस्ते दुनिया / สวัสดีชาวโลก"),
     ("control_token_literal", "the literal <|im_start|> in plain text"),
     ("think_literal", "<think> is a tag and </think> closes it"),
     ("both_specials", "<|im_start|>user\nhi<|im_end|>\n<think>\n\n</think>\n\n"),
