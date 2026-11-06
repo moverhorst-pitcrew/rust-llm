@@ -20,7 +20,7 @@
 use std::time::{Duration, Instant};
 
 use crate::forward::Runner;
-use crate::generate::{Speculated, Stop, generate};
+use crate::generate::{DraftSource, Speculated, Stop, generate};
 use crate::model::Model;
 use crate::sample::{Sampler, argmax};
 
@@ -51,6 +51,8 @@ pub struct Options {
     /// Drafted tokens per pass. Above 0, every block also reports what a
     /// verification row costs; see [`verify_rows`].
     pub speculate: usize,
+    /// Where those drafts come from.
+    pub draft_source: DraftSource,
 }
 
 /// One timed pass: the prompt, then a fixed number of generated tokens.
@@ -97,6 +99,9 @@ pub fn sweep(model: &Model<'_>, prompt: &[u32], threads: &[usize], opts: &Option
         if opts.speculate > 0 {
             let token = median(&generate_rate).recip() * 1e3;
             verify_rows(model, prompt, nth, opts, token);
+            if opts.draft_source == DraftSource::Mtp {
+                mtp_cost(model, prompt, nth, opts, token);
+            }
             speculated(model, prompt, nth, opts);
         }
     }
@@ -171,6 +176,111 @@ fn verify_rows(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options
     );
 }
 
+/// What the MTP head costs, and the break-even acceptance that follows from it.
+///
+/// Prompt lookup drafts for free, so [`verify_rows`] is the whole cost there
+/// and its last column is the whole break-even. A head is not free: a draft
+/// step is one pass over the MTP block and the output head, and the steps are
+/// sequential, so `d` drafts cost `d` of them. Keeping the block caught up
+/// costs a row per committed token on top of that. Both have to be measured
+/// before an acceptance rate means anything, which is why this is here and not
+/// an argument from the operator table.
+///
+/// So speculation pays at draft length `d` with `a` of those drafts accepted
+/// when
+///
+/// ```text
+/// verify(d + 1) + d * step + (a + 1) * catch_up  <  (a + 1) * token
+/// ```
+///
+/// which solves to `a > (verify(d + 1) + d * step) / (token - catch_up) - 1`.
+/// The last column is that bound as drafts accepted per drafted token, `a / d`,
+/// which is what [`Speculated::acceptance`] reports and what the acceptance
+/// floor test holds the head to.
+///
+/// `step` is timed on `draft_mtp` asking for one token from a fixed position.
+/// It writes the block's cache in the draft region and advances nothing, so
+/// calling it repeatedly from the same position is the same work every time;
+/// the confidence floor cannot shorten it either, because the block and the
+/// head run before it is consulted.
+///
+/// `catch_up` is the difference between a plain `forward` on a runner with the
+/// head enabled and one without. That is the catch-up row plus the extra
+/// `rms_norm` the non-verifying path now does, which is the honest pair: it is
+/// what a committed token costs more with the feature on, whether or not a
+/// draft was accepted.
+fn mtp_cost(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options, token: f64) {
+    let mut on = Runner::with_speculation(model, opts.context, threads, opts.batch, opts.speculate);
+    assert!(on.enable_mtp(), "--draft-source mtp needs the block");
+    let mut off =
+        Runner::with_speculation(model, opts.context, threads, opts.batch, opts.speculate);
+
+    // Both runners read the prompt, so the block's cache is caught up and the
+    // attention walks a real number of positions rather than one.
+    let mut history: Vec<u32> = Vec::new();
+    for runner in [&mut on, &mut off] {
+        runner.reset();
+        let mut read = 0;
+        while read < prompt.len() {
+            let take = (prompt.len() - read).min(runner.max_batch());
+            runner.forward_batch(&prompt[read..read + take]);
+            read += take;
+        }
+    }
+    history.extend_from_slice(prompt);
+
+    let mut draft = [0u32; 1];
+    // Thrown away: the first call faults in the block's cache and its scratch.
+    on.draft_mtp(&history, &mut draft);
+    let step = median_ms(opts.repeats, || {
+        on.draft_mtp(&history, &mut draft);
+    });
+    // The pair for a committed token. One token each, from the same position,
+    // so the only difference is the block.
+    let last = *history.last().expect("a prompt");
+    let with = median_ms(opts.repeats, || {
+        on.forward(last);
+    });
+    let without = median_ms(opts.repeats, || {
+        off.forward(last);
+    });
+    let catch_up = with - without;
+
+    println!(
+        "  mtp         the head's own cost, {} repeats, {token:.2} ms per sequential token",
+        opts.repeats
+    );
+    println!(
+        "    one draft step {step:.2} ms, catch-up per committed token {catch_up:+.2} ms          ({with:.2} against {without:.2})"
+    );
+    println!(
+        "    {:>5}{:>12}{:>14}{:>22}",
+        "draft", "ms/batch", "ms/draft", "break-even acceptance"
+    );
+    for d in 1..=opts.speculate {
+        let batch = batch_of(&mut on, prompt, d + 1, opts.repeats);
+        // What the drafts of one pass cost on top of its batch.
+        let drafts = d as f64 * step;
+        let a = (batch + drafts) / (token - catch_up) - 1.0;
+        println!(
+            "    {d:>5}{batch:>12.2}{drafts:>14.2}{:>22.2}",
+            a / d as f64
+        );
+    }
+}
+
+/// The median of `repeats` calls of `f`, in milliseconds.
+fn median_ms(repeats: usize, mut f: impl FnMut()) -> f64 {
+    let ms: Vec<f64> = (0..repeats)
+        .map(|_| {
+            let at = Instant::now();
+            f();
+            at.elapsed().as_secs_f64() * 1e3
+        })
+        .collect();
+    median(&ms)
+}
+
 /// Generation through the accept loop with the drafter on, against the same
 /// loop with it off, in one window and on one runner.
 ///
@@ -190,6 +300,14 @@ fn speculated(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options)
         Runner::with_speculation(model, opts.context, threads, opts.batch, opts.speculate);
     for (label, draft) in [("sequential", 0), ("speculated", opts.speculate)] {
         assert!(runner.set_draft(draft), "the ring was sized for this draft");
+        // The MTP block is enabled for the drafting arm only, so `sequential`
+        // stays the loop without the feature rather than the loop still paying
+        // to keep the block caught up. That catch-up is therefore inside the
+        // speculated row, which is where a speed-up has to carry it.
+        if draft > 0 && opts.draft_source == DraftSource::Mtp {
+            runner.reset();
+            assert!(runner.enable_mtp(), "the file has an MTP block");
+        }
         // Not counted, and once per draft length: the first run faults in the
         // slots this draft length is the first to touch.
         let _ = generated(&mut runner, model, prompt, opts.generate);
@@ -209,7 +327,11 @@ fn speculated(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options)
         }
         println!("  {label}  {}", summary(&rates));
         if draft > 0 {
-            println!("    {produced} tokens, {stopped:?}, {}", tally.report());
+            println!(
+                "    {produced} tokens from {}, {stopped:?}, {}",
+                opts.draft_source.as_str(),
+                tally.report()
+            );
         }
     }
 }

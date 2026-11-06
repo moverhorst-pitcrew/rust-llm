@@ -18,6 +18,9 @@
 //! # speculation: the same tokens, and a rollback that leaves no trace (~4 min)
 //! cargo test -p rust-llm --release --test gate -- --ignored --nocapture speculat
 //!
+//! # the MTP head: the same tokens, and drafts that are still worth it (~5 min)
+//! cargo test -p rust-llm --release --test gate -- --ignored --nocapture mtp
+//!
 //! # re-derive one prompt of the fixture from a local llama.cpp build (~30 s)
 //! RUST_LLM_REFERENCE_BIN=$REF_DIR/llama.cpp/build/bin \
 //!   RUST_LLM_GATE_ONLY=capital_no_think \
@@ -50,10 +53,19 @@
 //! model; it is determined by rounding.
 //!
 //! This is not specific to this runner. llama.cpp disagrees with *itself*
-//! across its own two kernel paths on this prompt set: with weight repacking
-//! on it answers "Here's a thinking process that leads to the answer", with
-//! `--no-repack` it answers "Here's my thought process for solving this word
-//! problem", from the same file and the same greedy sampler.
+//! across its own two kernel paths on this prompt set, from the same file and
+//! the same greedy sampler, so the fixture records **both** of its outputs and
+//! the gate uses the pair: a position where the reference's two kernel paths
+//! choose differently is a position the model does not determine, whatever the
+//! top-two margin says there.
+//!
+//! That second justification is needed, and a wider margin band is not. On
+//! `capital_think` the reference's plain kernels open the fourth heading with
+//! "Identify" and its repacked kernels with "Analyze", which is ours, and the
+//! gap between those two in our logits is 0.75: wide, because they are two
+//! different sentences and not two spellings of one. Widening the band to
+//! cover that would blind the gate everywhere, so what is recorded is the
+//! evidence instead.
 //!
 //! So free-running token-for-token agreement is not a property an
 //! implementation can have unless its kernels are bit-identical to the
@@ -76,7 +88,7 @@ use llm_core::Gguf;
 use rust_llm::Tokenizer;
 use rust_llm::chat::{self, ChatOptions, Message, Role};
 use rust_llm::forward::Runner;
-use rust_llm::generate::generate;
+use rust_llm::generate::{Speculated, generate};
 use rust_llm::model::Model;
 use rust_llm::sample::{Sampler, Sampling, argmax};
 
@@ -234,6 +246,11 @@ fn every_next_token_matches_the_reference() {
         );
         let prompt = ids_of(&want["prompt_tokens"]);
         let reference = ids_of(&want["reference_tokens"]);
+        let repacked = ids_of(&want["reference_repacked_tokens"]);
+        // The first position the reference's own two kernel paths disagree on,
+        // which is the only position where the pair says anything: after it,
+        // the two runs are reading different contexts.
+        let undetermined = reference.iter().zip(&repacked).position(|(a, b)| a != b);
         let allowed = indeterminate_positions(want);
         assert_eq!(
             prompt,
@@ -260,13 +277,17 @@ fn every_next_token_matches_the_reference() {
                 agreed += 1;
                 continue;
             }
-            disagreed.push((at, margin));
+            disagreed.push((at, margin, ours));
             if !allowed.iter().any(|&(p, _)| p == at) {
                 failures.push(format!(
                     "{}: position {at} is not recorded as indeterminate, but we predict \
                      {ours} where the reference chose {}; margin {margin:.6}",
                     case.name, reference[at]
                 ));
+            } else if undetermined == Some(at) && repacked[at] == ours {
+                // The reference's repacked kernels choose our token here, so
+                // the model does not determine this position and the margin
+                // between two whole phrasings says nothing about it.
             } else if margin > INDETERMINATE {
                 failures.push(format!(
                     "{}: position {at} disagrees with a margin of {margin:.6}, which is \
@@ -282,7 +303,7 @@ fn every_next_token_matches_the_reference() {
             }
         }
         for &(at, _) in &allowed {
-            if !disagreed.iter().any(|&(p, _)| p == at) {
+            if !disagreed.iter().any(|&(p, ..)| p == at) {
                 failures.push(format!(
                     "{}: position {at} is recorded as indeterminate but now agrees, so \
                      the arithmetic of this path has changed; bring that to a decision \
@@ -293,7 +314,7 @@ fn every_next_token_matches_the_reference() {
         }
         let margins: Vec<String> = disagreed
             .iter()
-            .map(|&(at, margin)| {
+            .map(|&(at, margin, ours)| {
                 let was = allowed
                     .iter()
                     .find(|&&(p, _)| p == at)
@@ -320,7 +341,11 @@ fn every_next_token_matches_the_reference() {
                     ));
                 }
                 moved.push(drift);
-                format!("at {at} margin {margin:.5} (fixture {was:.5}, {drift:+.5})")
+                let why = match undetermined == Some(at) && repacked[at] == ours {
+                    true => ", the reference's repacked kernels choose ours",
+                    false => "",
+                };
+                format!("at {at} margin {margin:.5} (fixture {was:.5}, {drift:+.5}){why}")
             })
             .collect();
         println!(
@@ -920,6 +945,115 @@ fn a_rejected_draft_leaves_no_trace_in_the_logits() {
     }
 }
 
+/// How far the MTP head's acceptance may fall before this is no longer a
+/// feature.
+///
+/// **This is the test that matters most, and it is the only one that can
+/// fail.** Verification is exact, so a wrong MTP block cannot change a token:
+/// acceptance collapses and the feature quietly becomes plain decode with a
+/// block and an output head running in front of it. Nothing in the output, the
+/// gates or the tiny fixture would show that.
+///
+/// The floor is set from the measured value with room for the model and the
+/// prompt set to move, not from the break-even: it is a regression test for the
+/// head, not a judgement on whether drafting pays. What it costs is in
+/// `docs/benchmarks.md`; measured on this prompt set the head sits well above
+/// this, and the break-even on this box is 0.38 to 0.45.
+const MTP_ACCEPTANCE_FLOOR: f64 = 0.35;
+
+/// The head must not change a token of the gate prompt set either.
+///
+/// The same comparison [`speculation_does_not_change_the_output`] makes for
+/// prompt lookup, which is the one that matters for a draft source: greedy is
+/// against the committed sequence, so a divergence is a divergence from the
+/// reference's own output and not merely from another run of ours.
+///
+/// It also prints the acceptance per prompt, which is the measurement
+/// `docs/benchmarks.md` carries, and asserts the floor over the set as a whole.
+/// Per prompt would be a different test: a 32-token answer is a handful of
+/// verification passes and one unlucky prompt is not a regression.
+#[test]
+#[ignore = "needs the model file"]
+fn mtp_drafting_does_not_change_the_output() {
+    let cases = cases();
+    let fixture = fixture();
+    let expected = fixture["cases"].as_array().expect("cases");
+    // The same guard the two gates above carry, and for a sharper reason here:
+    // the acceptance floor below is a mean over whatever ran, so a short
+    // fixture would quietly hold the head to fewer prompts and still clear it.
+    assert_eq!(expected.len(), cases.len(), "fixture and prompt set differ");
+    let gguf = open_model();
+    let tokenizer = tokenizer();
+    let model = Model::load(&gguf).expect("load model");
+    assert!(
+        model.mtp.is_some(),
+        "this file has no MTP block, so there is nothing to draft from; see docs/models.md"
+    );
+    let threads = threads();
+
+    let mut failures = Vec::new();
+    let mut total = Speculated::default();
+    for (case, want) in cases.iter().zip(expected) {
+        let prompt = tokenizer.encode(&case.prompt, true).expect("encode");
+        let committed = ids_of(&want["tokens"]);
+        for draft in [2usize, 4] {
+            let mut on = Runner::with_speculation(&model, CONTEXT, threads, 16, draft);
+            assert!(on.enable_mtp(), "the file has an MTP block");
+            let (got, stop, timings) = generate(
+                &mut on,
+                &mut Sampler::greedy(model.vocab()),
+                &prompt,
+                case.max_tokens,
+                |_| true,
+            );
+            let spec = timings.speculation;
+            println!(
+                "{:28} draft {draft}: {:3} tokens, {:?}, {:.2} tok/s, {}",
+                case.name,
+                got.len(),
+                stop,
+                timings.generate_per_second(),
+                spec.report(),
+            );
+            if got != committed {
+                let at = got
+                    .iter()
+                    .zip(&committed)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(got.len().min(committed.len()));
+                failures.push(format!(
+                    "{}, draft {draft}: diverges from the committed output at token {at}\n                       drafted: {:?}\n  committed: {:?}",
+                    case.name,
+                    &got[at.min(got.len())..],
+                    &committed[at.min(committed.len())..],
+                ));
+            }
+            total.plain += spec.plain;
+            total.offered += spec.offered;
+            for (a, b) in total.accepted.iter_mut().zip(spec.accepted) {
+                *a += b;
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} divergences:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+    println!("over the whole set: {}", total.report());
+    assert!(
+        total.acceptance() >= MTP_ACCEPTANCE_FLOOR,
+        "the head accepted {:.3} drafts per drafted token over the prompt set, below \
+         the {MTP_ACCEPTANCE_FLOOR} floor. The output is still right, because \
+         verification is exact, so this is what a wrong MTP block looks like: the \
+         feature has become plain decode with a block and an output head in front \
+         of it. {}",
+        total.acceptance(),
+        total.report()
+    );
+}
+
 #[test]
 #[ignore = "needs the model file and a local reference build"]
 fn the_fixture_is_still_what_the_reference_produces() {
@@ -955,24 +1089,34 @@ fn the_fixture_is_still_what_the_reference_produces() {
 
     let mut out = Vec::new();
     for case in &selected {
-        let (reference_prompt, pieces) = reference_run(&bin, &case.prompt, case.max_tokens);
+        let ids_of_pieces = |pieces: &[String]| -> Vec<u32> {
+            pieces
+                .iter()
+                .map(|p| {
+                    *by_piece.get(p).unwrap_or_else(|| {
+                        panic!(
+                            "{}: the reference printed a piece that maps to no single \
+                             token: {p:?}",
+                            case.name
+                        )
+                    })
+                })
+                .collect()
+        };
+        let (reference_prompt, pieces) = reference_run(&bin, &case.prompt, case.max_tokens, false);
         let prompt_ids = tokenizer.encode(&case.prompt, true).expect("encode");
         assert_eq!(
             prompt_ids, reference_prompt,
             "{}: the reference tokenizes the prompt differently",
             case.name
         );
-        let reference: Vec<u32> = pieces
-            .iter()
-            .map(|p| {
-                *by_piece.get(p).unwrap_or_else(|| {
-                    panic!(
-                        "{}: the reference printed a piece that maps to no single token: {p:?}",
-                        case.name
-                    )
-                })
-            })
-            .collect();
+        let reference = ids_of_pieces(&pieces);
+        // The same reference on its repacked kernels, which is the other
+        // implementation of the same arithmetic. Where the two disagree, the
+        // position is one the model does not determine; the gate's module
+        // comment says why that has to be recorded rather than argued.
+        let (_, repacked_pieces) = reference_run(&bin, &case.prompt, case.max_tokens, true);
+        let repacked = ids_of_pieces(&repacked_pieces);
 
         // Our own free-running output, and the positions where a next-token
         // prediction from the reference's context lands inside the rounding
@@ -1004,11 +1148,15 @@ fn the_fixture_is_still_what_the_reference_produces() {
         }
         println!(
             "{:28} {:4} prompt + {:3} reference tokens, {} indeterminate position(s), \
-             free-running {}",
+             repacked reference {}, free-running {}",
             case.name,
             prompt_ids.len(),
             reference.len(),
             indeterminate.len(),
+            match reference.iter().zip(&repacked).position(|(a, b)| a != b) {
+                None => "identical".to_string(),
+                Some(at) => format!("diverges at {at}"),
+            },
             if ours == reference {
                 "identical".to_string()
             } else {
@@ -1027,6 +1175,8 @@ fn the_fixture_is_still_what_the_reference_produces() {
             "prompt_tokens": prompt_ids,
             "reference_tokens": reference,
             "reference_text": tokenizer.decode(&reference, false).unwrap_or_default(),
+            "reference_repacked_tokens": repacked,
+            "reference_repacked_text": tokenizer.decode(&repacked, false).unwrap_or_default(),
             "tokens": ours,
             "text": tokenizer.decode(&ours, false).unwrap_or_default(),
             "indeterminate": indeterminate,
@@ -1068,6 +1218,11 @@ fn the_fixture_is_still_what_the_reference_produces() {
             ids_of(&is["reference_tokens"]),
             "{name}: the reference no longer produces the committed output"
         );
+        assert_eq!(
+            ids_of(&was["reference_repacked_tokens"]),
+            ids_of(&is["reference_repacked_tokens"]),
+            "{name}: the reference's repacked kernels no longer produce the committed output"
+        );
     }
     println!(
         "the fixture still matches the reference on {} of its {} prompts",
@@ -1090,28 +1245,16 @@ fn the_fixture_is_still_what_the_reference_produces() {
 /// `model` and `model_sha256` are read off the file this ran against, not
 /// written from a literal: the hash is the only field that ties the fixture to
 /// a set of weights, and one that is typed in says nothing about its own
-/// origin. A partial write against a different model file is refused outright,
-/// because two models' cases in one fixture is exactly what that field exists
-/// to rule out.
+/// origin. Cases from a *different* model file are therefore dropped rather
+/// than merged: two models' cases in one fixture is exactly what that field
+/// exists to rule out. A model swap then leaves a short file, the gates fail on
+/// the case count, and the next command continues with what is missing, which
+/// is the same resumable path a stopped run leaves behind.
 fn merge_into_fixture(all: &[Case], fresh: &[serde_json::Value], reference: &str) {
     let path = format!("{FIXTURES}/reference_generations.json");
     let existing: Option<serde_json::Value> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
-    let old = existing
-        .as_ref()
-        .and_then(|d| d["cases"].as_array())
-        .map_or(&[][..], |a| a.as_slice());
-    if let Some(was) = existing.as_ref().and_then(|d| d["reference"].as_str())
-        && was != reference
-        && fresh.len() < all.len()
-    {
-        println!(
-            "note: the {} case(s) already in the fixture were produced by\n  {was}\nand this \
-             write records\n  {reference}\nso regenerate the rest before trusting the file",
-            old.len()
-        );
-    }
 
     let path_of_model = model_path();
     let model_name = std::path::Path::new(&path_of_model)
@@ -1121,11 +1264,31 @@ fn merge_into_fixture(all: &[Case], fresh: &[serde_json::Value], reference: &str
             |n| n.to_string_lossy().into_owned(),
         );
     let sha = sha256_of(&path_of_model);
-    if let Some(was) = existing.as_ref().and_then(|d| d["model_sha256"].as_str()) {
-        assert!(
-            was == sha || fresh.len() == all.len(),
-            "the fixture holds cases from a model with sha256 {was} and this run used \
-             {sha}; regenerate every case, not one, or the file would describe two files"
+    let same_model = existing
+        .as_ref()
+        .and_then(|d| d["model_sha256"].as_str())
+        .is_none_or(|was| was == sha);
+
+    let old = match same_model {
+        true => existing
+            .as_ref()
+            .and_then(|d| d["cases"].as_array())
+            .map_or(&[][..], |a| a.as_slice()),
+        false => &[][..],
+    };
+    if !same_model {
+        println!(
+            "note: the fixture described another model file, so its cases are dropped \
+             rather than merged with this run's"
+        );
+    } else if let Some(was) = existing.as_ref().and_then(|d| d["reference"].as_str())
+        && was != reference
+        && fresh.len() < all.len()
+    {
+        println!(
+            "note: the {} case(s) already in the fixture were produced by\n  {was}\nand this \
+             write records\n  {reference}\nso regenerate the rest before trusting the file",
+            old.len()
         );
     }
 
@@ -1275,7 +1438,17 @@ fn pieces_to_ids(tokenizer: &Tokenizer, vocab: usize) -> std::collections::HashM
 /// every token the gate uses is bounded by an `n_past` line on both sides and
 /// the newlines the reference prints on exit cannot be mistaken for part of
 /// the last one.
-fn reference_run(bin: &Path, prompt: &str, max_tokens: usize) -> (Vec<u32>, Vec<String>) {
+///
+/// `repack` picks which of the reference's two kernel paths runs. Off is the
+/// one this runner's kernels are written against; on is the reference's own
+/// second implementation of the same arithmetic, and the fixture records both,
+/// because where the two differ the model does not determine the token.
+fn reference_run(
+    bin: &Path,
+    prompt: &str,
+    max_tokens: usize,
+    repack: bool,
+) -> (Vec<u32>, Vec<String>) {
     let dir = std::env::temp_dir().join(format!("rust-llm-gate-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let prompt_file = dir.join("prompt.txt");
@@ -1324,15 +1497,19 @@ fn reference_run(bin: &Path, prompt: &str, max_tokens: usize) -> (Vec<u32>, Vec<
             "f32",
             "-ctv",
             "f32",
-            // The reference's repacked kernels are a different implementation
-            // of the same arithmetic, with the quantization blocks reordered
-            // and the f32 block scales accumulated in another order. Its plain
-            // Q8_K path is the one this runner's kernels are written against.
-            "--no-repack",
             "--verbose-prompt",
             "--no-display-prompt",
             "-v",
         ])
+        // The reference's repacked kernels are a different implementation of
+        // the same arithmetic, with the quantization blocks reordered and the
+        // f32 block scales accumulated in another order. Its plain Q8_K path is
+        // the one this runner's kernels are written against.
+        .args(if repack {
+            &[][..]
+        } else {
+            &["--no-repack"][..]
+        })
         .status()
         .expect("run llama-completion");
     let merged = std::fs::read(&log_file).expect("read reference log");
@@ -1470,7 +1647,9 @@ fn reference_description(bin: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string());
     format!(
         "llama.cpp {version}, llama-completion --temp 0 --top-k 1 --seed 1 -t 8 -c 2048 \
-         -no-cnv -sp -fa off -ctk f32 -ctv f32 --no-repack, same GGUF file"
+         -no-cnv -sp -fa off -ctk f32 -ctv f32, same GGUF file, run twice: with \
+         --no-repack for reference_tokens and without it for \
+         reference_repacked_tokens"
     )
 }
 

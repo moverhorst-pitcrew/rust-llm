@@ -6,9 +6,18 @@
 //! stronger reason: there is one loop, and with `--speculate 0` it is the loop
 //! it always was, so there is no second generation path to keep in step.
 //!
+//! # Where a draft comes from
+//!
+//! Two sources, and the loop below cannot tell them apart. [`prompt_lookup`]
+//! guesses from the text so far and needs no weights at all;
+//! [`Runner::draft_mtp`] runs the model's own multi-token-prediction block,
+//! which needs the head, its cache and the hidden state the trunk produced, so
+//! the draft callback is handed the runner. Whichever it is, it fills a buffer
+//! with tokens and says how many, and everything below this line is the same.
+//!
 //! # How a draft is accepted
 //!
-//! [`prompt_lookup`] guesses the next few tokens from the text so far,
+//! The draft source guesses the next few tokens,
 //! [`Runner::verify`] runs them as one batch and produces the logits of every
 //! row, and the loop below then does exactly what it does without speculation:
 //! one `sampler.sample` per token, in order. The only difference is where the
@@ -47,6 +56,45 @@ pub const MAX_MATCH: usize = 8;
 /// verification row, so the floor is two.
 pub const MIN_MATCH: usize = 2;
 
+/// Where [`generate`] gets its drafts.
+///
+/// A selector rather than a function the caller passes, because it comes off a
+/// command line and out of an HTTP request. What it actually does is decide
+/// whether [`Runner::enable_mtp`] is called; the loop itself asks the runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DraftSource {
+    /// Guesses from the prompt and the text generated so far. Needs no weights
+    /// and works on any file, which is why it is the default.
+    #[default]
+    PromptLookup,
+    /// The model's own multi-token-prediction block. Needs a conversion that
+    /// kept it; see `docs/models.md`.
+    Mtp,
+}
+
+impl DraftSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PromptLookup => "prompt-lookup",
+            Self::Mtp => "mtp",
+        }
+    }
+}
+
+impl std::str::FromStr for DraftSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "prompt-lookup" => Ok(Self::PromptLookup),
+            "mtp" => Ok(Self::Mtp),
+            other => Err(format!(
+                "unknown draft source {other:?}; it is prompt-lookup or mtp"
+            )),
+        }
+    }
+}
+
 /// What a run cost, split the way the two phases differ: the prompt is read
 /// with the caches growing from nothing, generation reads all the weights per
 /// token.
@@ -74,8 +122,8 @@ impl Timings {
 /// The histogram is the point of this and not the acceptance rate it averages
 /// to: what a longer draft is worth depends on how the accepted lengths are
 /// distributed, because a pass that accepts none still pays for every row it
-/// ran. It is also the measurement any later draft source, an MTP head
-/// included, has to beat.
+/// ran. It is also the measurement the MTP head is held against, by the
+/// acceptance floor in `tests/gate.rs`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Speculated {
     /// Passes that ran a plain [`Runner::forward`], because the drafter found
@@ -228,30 +276,54 @@ pub fn generate(
     max_tokens: usize,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Stop, Timings) {
-    generate_drafting(runner, sampler, prompt, max_tokens, prompt_lookup, on_token)
+    // Which source drafts is the runner's: whether the MTP block was enabled is
+    // what `--draft-source` decided, and a runner without one drafts from the
+    // prompt. One `if` rather than a parameter here, because every caller of
+    // `generate` would otherwise have to pass the same thing twice.
+    match runner.drafts_from_mtp() {
+        true => generate_drafting(
+            runner,
+            sampler,
+            prompt,
+            max_tokens,
+            |r, history, out| r.draft_mtp(history, out),
+            on_token,
+        ),
+        false => generate_drafting(
+            runner,
+            sampler,
+            prompt,
+            max_tokens,
+            |_, history, out| prompt_lookup(history, out),
+            on_token,
+        ),
+    }
 }
 
 /// [`generate`] with the drafts coming from somewhere other than
 /// [`prompt_lookup`].
 ///
-/// `draft_with` is handed the prompt plus everything generated so far and a
-/// buffer of `runner.draft()` tokens to fill, and returns how many it wrote,
-/// which is the same contract as [`prompt_lookup`]. It is called once per pass
-/// and must not allocate, because it sits in the generation loop.
+/// `draft_with` is handed the runner, the prompt plus everything generated so
+/// far, and a buffer of `runner.draft()` tokens to fill; it returns how many it
+/// wrote. It is called once per pass and must not allocate, because it sits in
+/// the generation loop.
 ///
-/// This exists for two reasons and is not a strategy type: a different draft
-/// source, an MTP head being the obvious one, is a different function passed
-/// here and nothing else, and the tests need a draft source whose acceptance
-/// they choose. On the tiny fixture's random weights a natural match is never
-/// accepted, so the burst boundaries, a stop token, `max_tokens`, a cancelling
-/// `on_token` and the end of the context inside one batch, would otherwise only
-/// be reachable with the 2.7 GB model.
+/// The runner is in that signature for [`Runner::draft_mtp`], which cannot
+/// guess from the text: it needs the MTP block, its cache and the hidden state
+/// the trunk left behind. [`prompt_lookup`] ignores it.
+///
+/// This exists for two reasons and is not a strategy type: a draft source is a
+/// different function passed here and nothing else, and the tests need a draft
+/// source whose acceptance they choose. On the tiny fixture's random weights a
+/// natural match is never accepted, so the burst boundaries, a stop token,
+/// `max_tokens`, a cancelling `on_token` and the end of the context inside one
+/// batch, would otherwise only be reachable with the 2.8 GB model.
 pub fn generate_drafting(
     runner: &mut Runner<'_>,
     sampler: &mut Sampler,
     prompt: &[u32],
     max_tokens: usize,
-    mut draft_with: impl FnMut(&[u32], &mut [u32]) -> usize,
+    mut draft_with: impl FnMut(&mut Runner<'_>, &[u32], &mut [u32]) -> usize,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Stop, Timings) {
     assert!(!prompt.is_empty(), "the prompt is empty");
@@ -362,7 +434,7 @@ pub fn generate_drafting(
         let n = if draft == 0 || room < 2 {
             0
         } else {
-            draft_with(&history, &mut drafts[..draft.min(room - 1)])
+            draft_with(runner, &history, &mut drafts[..draft.min(room - 1)])
         };
         if n == 0 {
             timings.speculation.plain += usize::from(draft > 0);

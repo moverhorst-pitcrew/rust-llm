@@ -41,7 +41,7 @@ the wrong thing. `cargo bench` inherits this profile.
 
 | crate | why |
 | --- | --- |
-| `memmap2` | The only sane way to get 2.7 GB of weights addressable without reading them. Thin, pure Rust, no build script. |
+| `memmap2` | The only sane way to get 2.8 GB of weights addressable without reading them. Thin, pure Rust, no build script. |
 | `half` | `f16` decoding for the ggml block scales. `f16` in `core` is still unstable, and hand-rolling the subnormal cases is a silent-wrongness risk for twenty saved lines. |
 | `thiserror` | Error enums with a `Display` that names the file, the key or the tensor. Derive only, nothing at runtime. |
 | `tokenizers` | See the tokenizer section. |
@@ -78,14 +78,21 @@ owning-reference crate.
 **Metadata arrays hold `Value`s, including nested arrays.** GGUF allows an
 array of arrays, so a parallel element-type enum would have to recurse anyway.
 The cost is the enum tag per element, about 16 MB on the vocabulary, which is
-noise against a 2.7 GB model and is paid once at load.
+noise against a 2.8 GB model and is paid once at load.
 
-**The block count comes out of the tensors, not out of `block_count`.** In this
-conversion `qwen35.block_count` is 33 while `blk.32` does not exist, because
-the MTP block was stripped. `qwen35::layer_plan` takes
-`block_count - nextn_predict_layers` and then requires every block it implies
-to be present, so a file that really is missing a block fails with the name of
-the missing tensor instead of producing a 31-block model.
+**The block count comes out of the tensors, not out of `block_count`.**
+`qwen35.block_count` is 33 and counts the multi-token-prediction block, so
+`qwen35::layer_plan` takes `block_count - nextn_predict_layers` for the trunk
+and then requires every block that implies to be present: a file that really is
+missing a block fails with the name of the missing tensor instead of producing
+a 31-block model.
+
+Whether the MTP block itself is in the file is a property of the conversion,
+not of the architecture, so it comes back as an `Option` rather than as a
+requirement. The file this runner is gated against has it as `blk.32`; the
+conversion before it stripped it (`docs/models.md`). A block past the ones
+`block_count` accounts for is still an error, because one trained head is what
+`nextn_predict_layers` says and a second one would be a file we cannot read.
 
 **Layer typing comes from `qwen35.attention.recurrent_layers`.** Deriving it
 from `full_attention_interval` would be arithmetic that happens to agree with
@@ -744,17 +751,25 @@ test in the harness's thread pool would be charged to the same window.
 
 ## Speculative decoding
 
-**The draft source is prompt lookup, not an extra head.** An MTP-preserved
-Heretic 4B GGUF exists, but it is a different set of weights from the file this
-runner is built and gated against, so adopting it would be a model swap with a
-new gate fixture behind it and a reference feature that is not released. See
-`docs/models.md`. Prompt lookup needs no weights at all: it guesses the next few
-tokens from the prompt and the text generated so far, and everything an MTP head
-would later need is the same machinery, per-row logits, the rollback, the accept
-loop and the acceptance metric. `prompt_lookup` is a plain function and
-`generate_drafting` takes the draft source as an argument, so a head is a
-different function passed there. There is no trait and no strategy type for one
-implementation.
+**There are two draft sources and one loop.** Prompt lookup guesses the next
+few tokens from the prompt and the text generated so far and needs no weights at
+all; the MTP head runs the model's own prediction block. `prompt_lookup` and
+`Runner::draft_mtp` are plain functions, `generate_drafting` takes one of them
+as an argument, and `generate` picks by asking the runner whether the block was
+enabled. There is no trait and no strategy type for two implementations, and
+there is deliberately no second generation path: everything below the point
+where the drafts come from is the same code, which is what keeps the output
+bit-equal to speculation off and what a second loop would quietly stop
+guaranteeing.
+
+The callback takes the runner, which prompt lookup ignores. A head cannot guess
+from a token slice: it needs the block, its cache and the hidden state the trunk
+left behind.
+
+**Prompt lookup came first and stays.** It works on any file, and the file this
+runner was originally gated against had the MTP block stripped on conversion
+(`docs/models.md`). Everything the head later needed was already there for it:
+per-row logits, the rollback, the accept loop and the acceptance metric.
 
 **The marginal verification row was measured before the feature was built**,
 because the whole milestone turns on it and a verification batch is the one path
@@ -763,6 +778,88 @@ for a sequentially generated token, so break-even is 0.22 to 0.42 accepted
 drafts per drafted token. The ticket's own stop condition was half a token. The
 numbers and the reason the head's extra rows are nearly free are in
 `docs/benchmarks.md` under "Speculative decoding".
+
+### The MTP block
+
+**It is loaded and run as a full-attention block of the trunk's own shape, not
+as a special case.** `MtpBlock` holds a plain `Block` plus the four tensors the
+head adds, `model.rs` loads it through the same `load_block` the trunk's 32 go
+through, and the forward pass runs it through the same `full_attn` and `ffn`.
+The reference's `graph_mtp` is that too: `hnorm(h)` and `enorm(embed(token))`,
+concatenated along the embedding axis with the embedding first, which is why
+`eh_proj` is `[2 * n_embd, n_embd]`, and from there an ordinary Qwen3.5 block
+with the gated query split, the two residuals, the feed-forward,
+`shared_head_norm` and the tied head.
+
+The reason that matters is the failure mode. **Verification is exact, so a wrong
+MTP block cannot change a token.** Acceptance collapses and the feature becomes
+plain decode with a block and an output head running in front of it, and
+nothing in the output, in either gate or in the tiny fixture would show it. A
+second copy of the attention is exactly where that would hide, and the
+`--ignored` acceptance floor in `tests/gate.rs` is the only test here that can
+catch it at all.
+
+**The block's cache needs no ring and no rollback**, where the trunk's
+recurrent state needs both. An entry is written at an absolute position and read
+only from that position onwards, so the entries a rejected draft leaves behind
+are overwritten by the catch-up after the next trunk pass and read by nothing in
+between. That is the reference's "own KV, growing in the draft region" mode, and
+it is why `accept` is both the catch-up and the rollback rather than two calls.
+
+**The hidden state the block pairs with a token is the trunk's post-`output_norm`
+row.** That is `bufs.xn`, which the reference calls `h_nextn`. The non-verifying
+path normed only the last row of a batch, so with the block live every row is
+normed and the head still runs on one: one extra `rms_norm` per row and not one
+extra weight read. With the block off it is the same single row from the same
+input, so `--speculate 0` is byte for byte the pass it was.
+
+**The catch-up is the rows `accept` is committing, not the rows that ran.** A
+verification batch runs `draft + 1` rows and commits as few as one, so the block
+is caught up inside `accept`, a row at a time if that is how the burst goes.
+`accept` advances `pos` itself, which is the one trap here: by the time it calls
+the catch-up, `pos` already *is* the absolute position of the first row being
+committed, so adding the rows committed before it puts every row after the first
+somewhere else. That is unreachable without an accepted draft, which is why it
+survived five tests and was caught by the sixth.
+
+**A catch-up row runs the whole block bar the head**, though only the key and
+value projections feed its cache. Stopping after them would read 11 MB of
+weights instead of 75, which is under 2 ms against a 68 ms token; running the
+whole thing through the trunk's own two functions is worth more than that. The
+ceiling is named in the comment on `catch_up`.
+
+**Its scratch is a second set of buffers, not the trunk's.** Two are live at the
+same moment: the trunk's `xn` holds the hidden states the block is reading and
+its `logits` are still the caller's, which are precisely the two buffers that
+carry a result across the call.
+
+### Drafting from the head
+
+**The steps are sequential and each one costs the output head**, which is what
+makes a head a different economic proposition from prompt lookup. Step 0 is the
+last emitted token with the carried hidden state, at the trunk's own next
+position, which is exactly the pair a catch-up would use there; step `i` is what
+step `i - 1` drafted with the block's own post-`shared_head_norm` row. So `d`
+drafts are `d` passes over the block and the head, measured at 13.2 to 14.8 ms
+each against a 64 to 78 ms token, and break-even acceptance is 0.38 to 0.45
+rather than prompt lookup's 0.22 to 0.42. `docs/benchmarks.md` has the
+measurement and what the head then actually accepts.
+
+**`MTP_P_MIN` is a measured constant, not a flag.** The reference exposes
+`p_min` and defaults it to zero. What a floor saves here is a verification row
+and not a draft step, because the block and the head run before it is consulted,
+so it belongs where a drafted token's chance of being accepted stops covering
+the row it costs: 14.3 ms against 68.4, about 0.21. Swept from 0.0 to 0.70, the
+gain peaks between 0.15 and 0.35 and falls away on both sides. 0.25.
+
+**The draft source is chosen at start-up, not per request.** `--draft-source`
+on `run`, `chat`, `serve` and `bench`, defaulting to prompt lookup so that
+nothing changes silently, and `serve` fixes it for its lifetime: the block's
+cache is caught up as tokens go through, so it is not something a request can
+switch on. A request's `speculate` still chooses the draft length within it.
+Asking for the head on a file that has no block is refused by name rather than
+served by prompt lookup, because the two differ only in speed and a silent
+fallback reads as a feature that does nothing.
 
 **The rollback is a ring of state buffers, not a copy.** The KV cache needs
 nothing: a rejected row's entry is past `pos` and nothing reads it. The
@@ -1208,8 +1305,8 @@ Ten prompts in `fixtures/gate_prompts.json`, 32 to 48 tokens each: thinking on
 and off, a system persona, a multi-turn conversation, a non-ASCII prompt, Dutch
 diacritics, two code prompts (one with tabs) and one raw completion with no
 chat template. `fixtures/reference_generations.json` holds the reference's
-tokens, ours, and the model's sha256, so CI needs neither llama.cpp nor the
-weights.
+tokens from **both** of its kernel paths, ours, and the model's sha256, so CI
+needs neither llama.cpp nor the weights.
 
 **There are two gates rather than one, and the reason is not a concession.**
 Free-running token-for-token agreement is not a property an implementation can
@@ -1218,20 +1315,32 @@ deliberately are not. On a logit scale whose next-token margins are typically
 0.25 to 1.2, the two implementations' logits differ by about 1e-2, which leaves
 a band of roughly +/-0.1 inside which neither one's choice is determined by the
 model. llama.cpp disagrees with *itself* across its own two kernel paths on
-these prompts for the same reason: with repacking on it answers "Here's a
-thinking process that leads to the answer", with `--no-repack` "Here's my
-thought process for solving this word problem", same file, same greedy sampler.
+these prompts for the same reason, same file and same greedy sampler, and that
+is not an anecdote: the fixture records both of its outputs per prompt, and the
+two differ on 5 of the 10.
 
 So:
 
 - `every_next_token_matches_the_reference` is the correctness gate. It feeds
   the reference's own tokens and checks the prediction at every position
   independently, so a flipped near-tie cannot hide the predictions behind it. A
-  disagreement is accepted only where the fixture records one and only when the
-  top-two margin is inside the 0.25 band and the reference's token is at least
-  our runner-up. Currently 380 of 384 positions are identical and the four that
-  are not have margins of 0.0094, 0.0104, 0.0475 and 0.1262, against typical
-  margins twenty times that.
+  disagreement is accepted only where the fixture records one, and then on one
+  of two grounds: the top-two margin is inside the 0.25 band and the
+  reference's token is at least our runner-up, or the reference's repacked
+  kernels choose *our* token at exactly the position where its two paths first
+  part, which says the model does not determine that position whatever the
+  margin is. Currently 379 of 384 positions are identical and the five that are
+  not have margins of 0.0135, 0.0577, 0.1042, 0.1104 and 0.7516; four of them
+  are positions the reference itself does not settle.
+
+  **The second ground is why the band is still 0.25.** On `capital_think` the
+  reference's plain kernels open the fourth heading with "Identify the core
+  question" and its repacked kernels with "Analyze the Request", which is ours.
+  Those are two sentences rather than two spellings of one, so the gap between
+  them in our logits is 0.75: wide, and widening the band to cover it would
+  blind the gate on every other prompt. Recording what the reference does
+  instead costs one extra reference run per prompt when the fixture is written
+  and nothing at all when the gate runs.
 - `greedy_output_is_unchanged` is the regression gate: free-running output must
   equal the committed sequence token for token. For 7 of the 10 prompts that
   sequence is the reference's own output for its whole length; the fixture
@@ -1258,9 +1367,15 @@ keeps its work and the next one continues with what is missing. A case that is
 in neither the fresh run nor the file is left out, and the two gates then fail
 on the case count rather than quietly running a short set.
 
+Cases describing a **different model file** are dropped rather than merged,
+because two models' cases in one fixture is what `model_sha256` exists to rule
+out. A model swap therefore leaves a short file and takes the same resumable
+path as a stopped run: the gates fail on the case count until every prompt has
+been re-derived against the new weights.
+
 Omitting `RUST_LLM_GATE_ONLY` does the whole set in one command, which is about
-four minutes. Per prompt it is 20 to 35 seconds, which is the size to keep a
-check at.
+three minutes. Per prompt it is two reference runs, one per kernel path, plus
+our own free-running and teacher-forced passes.
 
 **Forgetting `RUST_LLM_REFERENCE_BIN` in the whole `--ignored` run costs more
 than this one test.** It panics on the missing variable, a failing test binary
@@ -1281,7 +1396,7 @@ dropped, so every token the gate uses is bounded by a log line on both sides.
 
 ## The tiny model, so the surfaces are covered without the weights
 
-The gate above proves what the model produces, and needs 2.7 GB of weights to
+The gate above proves what the model produces, and needs 2.8 GB of weights to
 do it. What it does not touch is the product around the model: argument parsing,
 streaming, the stop conditions, the sampling flags, the conversation. That was
 only ever exercised by hand.

@@ -64,11 +64,17 @@ fn the_committed_tokenizer_matches_the_weights() {
             .as_bool()
             .unwrap()
     );
-    assert!(
+    // This conversion writes no `tokenizer.ggml.normalizer.nfc`,
+    // `.clean_spaces` or `.add_eos_token`; the one that stripped the MTP block
+    // did. Nothing reads them, and the normalizer is pinned on the
+    // `tokenizer.json` side by `the_committed_tokenizer_is_the_shape_the_
+    // weights_expect`. What is asserted here is that the file does not claim
+    // something *other* than NFC, which would mean these ids are not these
+    // weights' ids.
+    assert_ne!(
         g.meta("tokenizer.ggml.normalizer.nfc")
-            .unwrap()
-            .as_bool()
-            .unwrap()
+            .and_then(|v| v.as_bool()),
+        Some(false)
     );
 
     // The merge list is not reachable through the tokenizers crate, so compare

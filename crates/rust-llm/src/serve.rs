@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 
 use crate::chat::{self, ChatOptions, Message, Role};
 use crate::forward::Runner;
-use crate::generate::{self, Stop, Timings};
+use crate::generate::{self, DraftSource, Stop, Timings};
 use crate::sample::{Sampler, Sampling, entropy_seed};
 use crate::tokenizer::Tokenizer;
 
@@ -56,6 +56,11 @@ pub struct Defaults {
     /// the ring is allocated when the server starts and a request cannot grow
     /// it.
     pub speculate: usize,
+    /// `--draft-source`. Fixed for the server's lifetime: the MTP block's
+    /// cache is allocated and caught up as tokens go through, so it is not
+    /// something a request can switch on. A request's `speculate` chooses the
+    /// draft length within it.
+    pub draft_source: DraftSource,
     /// `--seed`, if it was given: then every request without a seed of its own
     /// replays that one. Without it each request draws a fresh seed, which is
     /// logged so that request can be replayed.

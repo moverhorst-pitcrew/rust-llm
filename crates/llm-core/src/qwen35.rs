@@ -1,10 +1,12 @@
 //! The qwen35 facts that have to come out of the file rather than out of
 //! arithmetic.
 //!
-//! Two of them bite immediately. `qwen35.block_count` is 33 in the Q4_K_M
-//! conversion while only `blk.0..blk.31` exist, because the MTP block was
-//! stripped; and the hybrid layer split is published as a bool array, which
-//! does not have to agree with `full_attention_interval`.
+//! Two of them bite immediately. `qwen35.block_count` counts the
+//! multi-token-prediction block, so the trunk is `block_count` minus
+//! `nextn_predict_layers`, and whether that last block is in the file at all
+//! depends on the conversion: the MTP-preserved build ships it as `blk.32`,
+//! the older one dropped it. And the hybrid layer split is published as a bool
+//! array, which does not have to agree with `full_attention_interval`.
 
 use crate::gguf::{Gguf, GgufError};
 
@@ -14,11 +16,15 @@ const RECURRENT_KEY: &str = "qwen35.attention.recurrent_layers";
 /// Which blocks exist and what kind each one is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerPlan {
-    /// Blocks actually present in the file.
+    /// Trunk blocks actually present in the file.
     pub n_blocks: usize,
     /// `true` where the block is linear (gated delta net) attention, `false`
     /// where it is full attention with a KV cache.
     pub recurrent: Vec<bool>,
+    /// Index of the multi-token-prediction block, `blk.{n_blocks}`, when the
+    /// conversion kept it. `None` where it was stripped: the trunk is the
+    /// same either way and only drafting from the head is unavailable.
+    pub mtp: Option<usize>,
 }
 
 impl LayerPlan {
@@ -86,9 +92,15 @@ pub fn layer_plan(g: &Gguf) -> Result<LayerPlan, ConfigError> {
             });
         }
     }
-    if g.has_tensor(&format!("blk.{expected}.attn_norm.weight")) {
+    // The blocks the metadata skips are the MTP ones, `blk.{expected}` up to
+    // `blk.{declared}`. Whether they are in the file is the one thing that
+    // differs between the two conversions of these weights.
+    let mtp = (skipped > 0 && g.has_tensor(&format!("blk.{expected}.attn_norm.weight")))
+        .then_some(expected);
+    let past = expected + usize::from(mtp.is_some());
+    if g.has_tensor(&format!("blk.{past}.attn_norm.weight")) {
         return Err(ConfigError::UnexpectedBlock {
-            found: expected,
+            found: past,
             expected,
         });
     }
@@ -104,5 +116,6 @@ pub fn layer_plan(g: &Gguf) -> Result<LayerPlan, ConfigError> {
     Ok(LayerPlan {
         n_blocks: expected,
         recurrent: recurrent[..expected].to_vec(),
+        mtp,
     })
 }

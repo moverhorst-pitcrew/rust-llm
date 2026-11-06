@@ -260,7 +260,7 @@ fn the_generation_loop_allocates_nothing_per_token() {
                 &mut sampler,
                 &prompt,
                 max_tokens,
-                |seen, out| {
+                |_, seen, out| {
                     let take = out.len().min(known.len() - seen.len());
                     out[..take].copy_from_slice(&known[seen.len()..][..take]);
                     take

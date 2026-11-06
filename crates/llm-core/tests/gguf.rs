@@ -543,11 +543,31 @@ fn qwen35_fixture(
 
 #[test]
 fn derives_the_real_block_count_from_the_tensors() {
+    // The conversion that stripped the MTP block: the trunk is complete, so
+    // the file loads and only drafting from the head is unavailable.
     let g = qwen35_fixture("qwen35", 33, 1, &(0..32).collect::<Vec<_>>(), 33)
         .open()
         .expect("fixture opens");
     let plan = llm_core::qwen35::layer_plan(&g).expect("layer plan");
     assert_eq!(plan.n_blocks, 32);
+    assert_eq!(plan.mtp, None);
+    assert_eq!(
+        plan.full_attention_layers(),
+        vec![3, 7, 11, 15, 19, 23, 27, 31]
+    );
+    assert_eq!(plan.linear_attention_layers().len(), 24);
+}
+
+#[test]
+fn the_mtp_block_is_the_one_the_metadata_skips() {
+    // The MTP-preserved conversion, which has the block the metadata counts
+    // but excludes from the trunk. The trunk is the same 32 blocks either way.
+    let g = qwen35_fixture("qwen35", 33, 1, &(0..33).collect::<Vec<_>>(), 33)
+        .open()
+        .expect("fixture opens");
+    let plan = llm_core::qwen35::layer_plan(&g).expect("layer plan");
+    assert_eq!(plan.n_blocks, 32);
+    assert_eq!(plan.mtp, Some(32));
     assert_eq!(
         plan.full_attention_layers(),
         vec![3, 7, 11, 15, 19, 23, 27, 31]
@@ -570,7 +590,29 @@ fn a_missing_block_is_an_error() {
 
 #[test]
 fn a_block_beyond_the_metadata_is_an_error() {
-    let g = qwen35_fixture("qwen35", 33, 1, &(0..33).collect::<Vec<_>>(), 33)
+    // One MTP block is `nextn_predict_layers`; a second one is a file this
+    // runner does not know how to read, and saying so beats guessing.
+    let g = qwen35_fixture("qwen35", 33, 1, &(0..34).collect::<Vec<_>>(), 34)
+        .open()
+        .expect("fixture opens");
+    let err = llm_core::qwen35::layer_plan(&g).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            llm_core::qwen35::ConfigError::UnexpectedBlock {
+                found: 33,
+                expected: 32
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_block_count_without_an_mtp_layer_still_rejects_an_extra_block() {
+    // `nextn_predict_layers` of zero leaves no room for an MTP block, so
+    // `blk.{block_count}` is an extra block rather than a head.
+    let g = qwen35_fixture("qwen35", 32, 0, &(0..33).collect::<Vec<_>>(), 33)
         .open()
         .expect("fixture opens");
     let err = llm_core::qwen35::layer_plan(&g).unwrap_err();

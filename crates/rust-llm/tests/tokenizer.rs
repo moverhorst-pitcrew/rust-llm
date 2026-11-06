@@ -144,7 +144,7 @@ fn the_committed_tokenizer_is_the_shape_the_weights_expect() {
     assert_eq!(f["vocab_size"].as_u64(), Some(248077));
     assert_eq!(
         f["tokenizer_json_sha256"].as_str(),
-        Some("a5cd9732badce41de57e6efce8302930ded1c1188c5f81feb2bd6c24c4a1941f")
+        Some("06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523")
     );
 
     let raw: serde_json::Value = fixture("tokenizer.json");
