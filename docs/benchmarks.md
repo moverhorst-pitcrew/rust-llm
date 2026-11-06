@@ -547,7 +547,7 @@ repeats, median, from `bench --draft-source mtp`'s own `mtp` block.
 | | measured |
 | --- | --- |
 | one draft step | 13.2 to 14.8 ms, over eight blocks |
-| catch-up per committed token | +1.02 ms in the quietest block |
+| catch-up per committed token | +1.02 and +1.15 ms in the two quietest blocks |
 | a sequential token in the same windows | 64 to 78 ms |
 
 A draft step is one pass over the MTP block, about 75 MB of weights, plus
@@ -561,9 +561,9 @@ The catch-up is a row through the same block per committed token, so the block's
 cache holds every position the trunk holds. It is the one number here the pair
 method could not pin down: it is the difference between a `forward` on a runner
 with the head enabled and one without, and over eight blocks that difference
-came out between -1.02 and +4.98 ms with the box under load. +1.02 ms is the
-reading from the quietest block, and it is the one the arithmetic agrees with:
-75 MB against a token's 2.5 GiB is 2.8 per cent of 68 ms, which is 1.9 ms.
+came out between -14.4 and +4.98 ms with the box under load. The two quietest
+blocks give +1.02 and +1.15 ms, and they are the readings the arithmetic agrees
+with: 75 MB against a token's 2.5 GiB is 2.8 per cent of 68 ms, which is 1.9 ms.
 Treat it as one to two per cent of a token.
 
 **A catch-up row runs more of the block than it has to.** Only the key and
@@ -650,41 +650,46 @@ What those three tables say, and it is the opposite of prompt lookup's shape:
 - **Both histograms are bimodal**, as prompt lookup's are: a pass either
   accepts nothing or accepts most of the draft.
 
-#### The measured gain: +9.5 per cent on prose at two drafts
+#### The measured gain: +9.5 per cent at two drafts, +5.6 at four
 
-**Prose, two drafts**, 5 repeats, in the quietest window this box offered
-(load average 2.35 at the start of the block and 4.90 at the end):
+Prose, 5 repeats, the two blocks taken in the quietest windows this box offered.
+Both are a `sequential` against `speculated` pair on one runner, so the only
+difference between the two rows is whether drafts are offered.
 
-| | tok/s | spread |
-| --- | --- | --- |
-| sequential | 15.85 | 2.5% |
-| speculated | 17.36 | 2.9% |
+| `--speculate` | load | sequential | speculated | gain | acceptance |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 2.35 -> 4.90 | 15.85 (2.5%) | 17.36 (2.9%) | **+9.5%** | 0.87 |
+| 4 | 2.13 -> 4.20 | 16.01 (3.6%) | 16.91 (3.6%) | **+5.6%** | 0.78 |
 
-**+9.5 per cent** at acceptance 0.87, against spreads of 2.5 and 2.9 per cent,
-so the gain is three times the noise of the pair that produced it. The same
-configuration in an earlier and less quiet window (load 1.99 to 4.35, spreads
-5.7 and 6.4) gave `15.31 -> 16.24`, +6.1 per cent, with a **byte-identical**
-acceptance line: 45 passes, 45 of them drafting nothing, 65 of 75 drafts
-accepted. So the acceptance reproduces exactly and the level does not, which is
-the same thing the prompt-lookup tables above say about this box.
+The per-cent in brackets is that row's own spread over its five runs. At two
+drafts the gain is three times the spread; at four it is one and a half times.
 
-It also lands on what the pieces predict. At two drafts the measured costs give
-about +10 per cent, from 15 verification batches of three rows, 15 passes that
-draft nothing and about 25 draft steps per 32 tokens.
+**Two drafts beats four, and the break-even table says why.** A round at four
+drafts spends four draft steps, 52 ms, where one at two spends 27, and it
+accepts a smaller fraction of them (0.78 against 0.87). The extra verification
+rows are nearly free, as the prompt-lookup table above shows; the draft steps
+are not. So depth buys less here than it does for a drafter that guesses for
+nothing, and the shallow end is where this head pays best.
 
-**At four drafts there is no level to quote.** Three windows gave +2.5, +4.9 and
-+9.7 per cent at an identical acceptance of 0.78, with spreads of 9.5, 7.6 and
-9.9 per cent on the `sequential` row: every reading is positive and every one is
-at or inside its own noise. What the pieces predict there is about +15 per cent.
-Seven further blocks across the sweeps ran at load averages of 4.2 to 8.6 with
+The levels reproduce less well than the acceptance does. The same two-draft
+configuration in a less quiet window (load 1.99 to 4.35, spreads 5.7 and 6.4)
+gave `15.31 -> 16.24`, +6.1 per cent, and three earlier four-draft blocks gave
++2.5, +4.9 and +9.7 at spreads of 6.8 to 9.9. Every one of those blocks had a
+**byte-identical** acceptance line to its counterpart above, down to the
+histogram. The acceptance reproduces exactly and the tok/s does not, which is
+the same thing the prompt-lookup tables say about this box.
+
+What the pieces predict is a little more than this: about +10 per cent at two
+drafts and +15 at four, from the step cost, the batch cost and the number of
+passes that draft nothing. Two drafts lands on it and four does not, and the
+four-draft gap is the one thing in this section a better window could still
+move.
+
+Seven further blocks across the sweeps ran at load averages of 4.2 to 8.6, with
 the `sequential` row swinging from 11.11 to 15.64 tok/s on one configuration,
-which is further than the effect; those are not quoted at all.
-
-The reason the numbers are this hard to pin down is in "The machine": one model
-run at a time is the rule on this box, and another ticket was benchmarking
-through most of this work. Acceptance is quoted everywhere above because it is a
-property of the model and the text and not of the clock, and it came out the
-same in every window, quiet or not.
+which is further than the effect; those are not quoted at all. The reason is in
+"The machine": one model run at a time is the rule on this box, and another
+ticket was benchmarking through most of this work.
 
 ### The default is 0
 
@@ -698,14 +703,14 @@ a diff, boilerplate code, turns it on and gets the numbers above.
 
 **The head is the first draft source here that is above its own break-even on
 ordinary prose**, and it has a measured gain: 0.67 accepted on the gate prompt
-set against a break-even of 0.38 to 0.45, and +9.5 per cent on prose at two
-drafts. That is a real case for turning it on, and it is still not this
-section's call to make: one clean pair at one draft length, on a box where
-another ticket was benchmarking throughout, is thinner evidence than the
-prompt-lookup tables rest on, and there is no quiet reading at all at four
-drafts. So the default stays 0 and the draft source stays `prompt-lookup`.
-Flipping either is a decision taken against the numbers in code review, which
-is where the ticket that commissioned this put it.
+set against a break-even of 0.38 to 0.45, and +9.5 per cent at two drafts and
++5.6 at four. That is a real case for turning it on, and it is still not this
+section's call to make: two clean pairs on a box where another ticket was
+benchmarking throughout is thinner evidence than the prompt-lookup tables rest
+on, and the levels move between windows where the acceptance does not. So the
+default stays 0 and the draft source stays `prompt-lookup`. Flipping either is
+a decision taken against the numbers in code review, which is where the ticket
+that commissioned this put it.
 
 **The two draft sources are for opposite texts, which is worth knowing whichever
 default wins.** Prompt lookup is for text that repeats literally and does
