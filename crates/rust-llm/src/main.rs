@@ -299,9 +299,11 @@ fn draft_source(
         return Ok(());
     }
     if model.mtp.is_none() {
-        return Err("--draft-source mtp needs a file that kept the multi-token-prediction \
+        return Err(
+            "--draft-source mtp needs a file that kept the multi-token-prediction \
                     block, and this one has no blk.N.nextn.eh_proj; see docs/models.md"
-            .into());
+                .into(),
+        );
     }
     if speculate > 0 {
         assert!(runner.enable_mtp(), "the file has an MTP block");

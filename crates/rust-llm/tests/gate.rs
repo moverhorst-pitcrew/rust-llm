@@ -1501,7 +1501,11 @@ fn reference_run(
         // the same arithmetic, with the quantization blocks reordered and the
         // f32 block scales accumulated in another order. Its plain Q8_K path is
         // the one this runner's kernels are written against.
-        .args(if repack { &[][..] } else { &["--no-repack"][..] })
+        .args(if repack {
+            &[][..]
+        } else {
+            &["--no-repack"][..]
+        })
         .status()
         .expect("run llama-completion");
     let merged = std::fs::read(&log_file).expect("read reference log");

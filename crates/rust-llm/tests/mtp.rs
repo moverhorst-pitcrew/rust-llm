@@ -144,13 +144,9 @@ fn the_head_drafts_the_same_however_the_trunk_got_there() {
     // The committed history every route ends on: the prompt plus what greedy
     // generation produces, so the tokens are ones the trunk really predicts.
     let mut plain = Runner::new(&model, CONTEXT, THREADS);
-    let (tail, _, _) = generate(
-        &mut plain,
-        &mut Sampler::greedy(vocab),
-        &prompt,
-        12,
-        |_| true,
-    );
+    let (tail, _, _) = generate(&mut plain, &mut Sampler::greedy(vocab), &prompt, 12, |_| {
+        true
+    });
     let mut history: Vec<u32> = prompt.clone();
     history.extend_from_slice(&tail);
 
@@ -208,7 +204,10 @@ fn the_head_drafts_the_same_however_the_trunk_got_there() {
 
     let mut drafts = [[0u32; DRAFT]; 3];
     let mut counts = [0usize; 3];
-    for (slot, runner) in [&mut one, &mut batched, &mut rolled].into_iter().enumerate() {
+    for (slot, runner) in [&mut one, &mut batched, &mut rolled]
+        .into_iter()
+        .enumerate()
+    {
         assert_eq!(runner.pos(), history.len(), "route {slot}: wrong position");
         counts[slot] = runner.draft_mtp(&history, &mut drafts[slot]);
     }
@@ -359,7 +358,11 @@ fn a_file_without_the_block_cannot_draft_from_it() {
     let tokenizer = Tokenizer::from_file(&tiny.tokenizer).expect("the fixture tokenizer");
     let model = Model::load(&gguf).expect("a file without the block still loads");
     assert!(model.mtp.is_none());
-    assert_eq!(model.config.n_blocks, support::N_BLOCKS, "the trunk is intact");
+    assert_eq!(
+        model.config.n_blocks,
+        support::N_BLOCKS,
+        "the trunk is intact"
+    );
 
     let prompt = tokenizer.encode(REPETITIVE, true).expect("encode");
     let mut runner = Runner::with_speculation(&model, CONTEXT, THREADS, 16, DRAFT);
@@ -411,8 +414,16 @@ fn a_stop_token_inside_a_burst_ends_the_run() {
         48,
         |_| true,
     );
-    assert_eq!(want_stop, Stop::Eos(eos), "the probe's token is not the stop");
-    assert_eq!(want.len(), 6, "the stop landed somewhere else than expected");
+    assert_eq!(
+        want_stop,
+        Stop::Eos(eos),
+        "the probe's token is not the stop"
+    );
+    assert_eq!(
+        want.len(),
+        6,
+        "the stop landed somewhere else than expected"
+    );
 
     let mut truth: Vec<u32> = prompt.clone();
     truth.extend_from_slice(&want);
@@ -433,5 +444,9 @@ fn a_stop_token_inside_a_burst_ends_the_run() {
     );
     assert_eq!(got, want, "a burst produced different tokens");
     assert_eq!(stop, want_stop, "a burst did not stop on the stop token");
-    assert_eq!(runner.pos(), off.pos(), "a burst committed a different count");
+    assert_eq!(
+        runner.pos(),
+        off.pos(),
+        "a burst committed a different count"
+    );
 }

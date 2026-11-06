@@ -212,7 +212,8 @@ fn verify_rows(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options
 fn mtp_cost(model: &Model<'_>, prompt: &[u32], threads: usize, opts: &Options, token: f64) {
     let mut on = Runner::with_speculation(model, opts.context, threads, opts.batch, opts.speculate);
     assert!(on.enable_mtp(), "--draft-source mtp needs the block");
-    let mut off = Runner::with_speculation(model, opts.context, threads, opts.batch, opts.speculate);
+    let mut off =
+        Runner::with_speculation(model, opts.context, threads, opts.batch, opts.speculate);
 
     // Both runners read the prompt, so the block's cache is caught up and the
     // attention walks a real number of positions rather than one.

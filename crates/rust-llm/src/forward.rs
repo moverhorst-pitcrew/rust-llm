@@ -477,10 +477,7 @@ impl<'a> Runner<'a> {
             // either path quantizes; it is wider than `n_embd` on every shape
             // and wider than the feed-forward on a small enough one.
             acts: Activations::with_batch(
-                (2 * c.n_embd)
-                    .max(c.n_ff)
-                    .max(c.d_inner)
-                    .max(c.attn_dim()),
+                (2 * c.n_embd).max(c.n_ff).max(c.d_inner).max(c.attn_dim()),
                 b,
             ),
             mtp: None,
@@ -1443,7 +1440,8 @@ impl Exec<'_, '_> {
         self.norm_rows(m.block.post_attn_norm, "mtp_attn_post_norm", il, t, bufs);
         self.ffn(&m.block, il, bufs);
         self.residual(t, bufs);
-        self.tracer.node("mtp_post_ffn", Some(il), &bufs.x[..t * ne]);
+        self.tracer
+            .node("mtp_post_ffn", Some(il), &bufs.x[..t * ne]);
 
         if !head {
             return;

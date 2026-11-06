@@ -364,7 +364,8 @@ fn load_block<'a>(
     slot: usize,
 ) -> Result<Block<'a>> {
     let (n_embd, n_ff) = (c.n_embd as u64, c.n_ff as u64);
-    let t = |suffix: &str| -> Result<TensorView<'a>> { Ok(g.tensor(&format!("blk.{il}.{suffix}"))?) };
+    let t =
+        |suffix: &str| -> Result<TensorView<'a>> { Ok(g.tensor(&format!("blk.{il}.{suffix}"))?) };
     let f32s = |suffix: &str, want: &[u64]| -> Result<&'a [f32]> {
         let name = format!("blk.{il}.{suffix}");
         let info = g.tensor_info(&name)?;

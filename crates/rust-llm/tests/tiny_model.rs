@@ -483,8 +483,11 @@ fn the_draft_source_flag_changes_nothing_but_the_speed() {
             &with_mtp.model,
             &["--speculate", "4", "--draft-source", source],
         );
-        assert!(ok, "--draft-source {source} failed:
-{log}");
+        assert!(
+            ok,
+            "--draft-source {source} failed:
+{log}"
+        );
         assert_eq!(got, want, "--draft-source {source} streamed different text");
         assert!(
             log.contains(&format!("4 drafted tokens per step from {source}")),
@@ -495,8 +498,11 @@ fn the_draft_source_flag_changes_nothing_but_the_speed() {
     // The file the runner started on: it loads and runs, and the flag that
     // needs a head it does not have is refused by name.
     let (ok, _, log) = answer(&without.model, &["--speculate", "4"]);
-    assert!(ok, "a file without the block failed to run at all:
-{log}");
+    assert!(
+        ok,
+        "a file without the block failed to run at all:
+{log}"
+    );
     assert!(
         log.contains("no MTP block"),
         "a file without the block did not say so:
