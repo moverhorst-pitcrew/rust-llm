@@ -695,17 +695,25 @@ test in the harness's thread pool would be charged to the same window.
 
 ## Speculative decoding
 
-**The draft source is prompt lookup, not an extra head.** An MTP-preserved
-Heretic 4B GGUF exists, but it is a different set of weights from the file this
-runner is built and gated against, so adopting it would be a model swap with a
-new gate fixture behind it and a reference feature that is not released. See
-`docs/models.md`. Prompt lookup needs no weights at all: it guesses the next few
-tokens from the prompt and the text generated so far, and everything an MTP head
-would later need is the same machinery, per-row logits, the rollback, the accept
-loop and the acceptance metric. `prompt_lookup` is a plain function and
-`generate_drafting` takes the draft source as an argument, so a head is a
-different function passed there. There is no trait and no strategy type for one
-implementation.
+**There are two draft sources and one loop.** Prompt lookup guesses the next
+few tokens from the prompt and the text generated so far and needs no weights at
+all; the MTP head runs the model's own prediction block. `prompt_lookup` and
+`Runner::draft_mtp` are plain functions, `generate_drafting` takes one of them
+as an argument, and `generate` picks by asking the runner whether the block was
+enabled. There is no trait and no strategy type for two implementations, and
+there is deliberately no second generation path: everything below the point
+where the drafts come from is the same code, which is what keeps the output
+bit-equal to speculation off and what a second loop would quietly stop
+guaranteeing.
+
+The callback takes the runner, which prompt lookup ignores. A head cannot guess
+from a token slice: it needs the block, its cache and the hidden state the trunk
+left behind.
+
+**Prompt lookup came first and stays.** It works on any file, and the file this
+runner was originally gated against had the MTP block stripped on conversion
+(`docs/models.md`). Everything the head later needed was already there for it:
+per-row logits, the rollback, the accept loop and the acceptance metric.
 
 **The marginal verification row was measured before the feature was built**,
 because the whole milestone turns on it and a verification batch is the one path
@@ -714,6 +722,88 @@ for a sequentially generated token, so break-even is 0.22 to 0.42 accepted
 drafts per drafted token. The ticket's own stop condition was half a token. The
 numbers and the reason the head's extra rows are nearly free are in
 `docs/benchmarks.md` under "Speculative decoding".
+
+### The MTP block
+
+**It is loaded and run as a full-attention block of the trunk's own shape, not
+as a special case.** `MtpBlock` holds a plain `Block` plus the four tensors the
+head adds, `model.rs` loads it through the same `load_block` the trunk's 32 go
+through, and the forward pass runs it through the same `full_attn` and `ffn`.
+The reference's `graph_mtp` is that too: `hnorm(h)` and `enorm(embed(token))`,
+concatenated along the embedding axis with the embedding first, which is why
+`eh_proj` is `[2 * n_embd, n_embd]`, and from there an ordinary Qwen3.5 block
+with the gated query split, the two residuals, the feed-forward,
+`shared_head_norm` and the tied head.
+
+The reason that matters is the failure mode. **Verification is exact, so a wrong
+MTP block cannot change a token.** Acceptance collapses and the feature becomes
+plain decode with a block and an output head running in front of it, and
+nothing in the output, in either gate or in the tiny fixture would show it. A
+second copy of the attention is exactly where that would hide, and the
+`--ignored` acceptance floor in `tests/gate.rs` is the only test here that can
+catch it at all.
+
+**The block's cache needs no ring and no rollback**, where the trunk's
+recurrent state needs both. An entry is written at an absolute position and read
+only from that position onwards, so the entries a rejected draft leaves behind
+are overwritten by the catch-up after the next trunk pass and read by nothing in
+between. That is the reference's "own KV, growing in the draft region" mode, and
+it is why `accept` is both the catch-up and the rollback rather than two calls.
+
+**The hidden state the block pairs with a token is the trunk's post-`output_norm`
+row.** That is `bufs.xn`, which the reference calls `h_nextn`. The non-verifying
+path normed only the last row of a batch, so with the block live every row is
+normed and the head still runs on one: one extra `rms_norm` per row and not one
+extra weight read. With the block off it is the same single row from the same
+input, so `--speculate 0` is byte for byte the pass it was.
+
+**The catch-up is the rows `accept` is committing, not the rows that ran.** A
+verification batch runs `draft + 1` rows and commits as few as one, so the block
+is caught up inside `accept`, a row at a time if that is how the burst goes.
+`accept` advances `pos` itself, which is the one trap here: by the time it calls
+the catch-up, `pos` already *is* the absolute position of the first row being
+committed, so adding the rows committed before it puts every row after the first
+somewhere else. That is unreachable without an accepted draft, which is why it
+survived five tests and was caught by the sixth.
+
+**A catch-up row runs the whole block bar the head**, though only the key and
+value projections feed its cache. Stopping after them would read 11 MB of
+weights instead of 75, which is under 2 ms against a 68 ms token; running the
+whole thing through the trunk's own two functions is worth more than that. The
+ceiling is named in the comment on `catch_up`.
+
+**Its scratch is a second set of buffers, not the trunk's.** Two are live at the
+same moment: the trunk's `xn` holds the hidden states the block is reading and
+its `logits` are still the caller's, which are precisely the two buffers that
+carry a result across the call.
+
+### Drafting from the head
+
+**The steps are sequential and each one costs the output head**, which is what
+makes a head a different economic proposition from prompt lookup. Step 0 is the
+last emitted token with the carried hidden state, at the trunk's own next
+position, which is exactly the pair a catch-up would use there; step `i` is what
+step `i - 1` drafted with the block's own post-`shared_head_norm` row. So `d`
+drafts are `d` passes over the block and the head, measured at 13.2 to 14.8 ms
+each against a 64 to 78 ms token, and break-even acceptance is 0.38 to 0.45
+rather than prompt lookup's 0.22 to 0.42. `docs/benchmarks.md` has the
+measurement and what the head then actually accepts.
+
+**`MTP_P_MIN` is a measured constant, not a flag.** The reference exposes
+`p_min` and defaults it to zero. What a floor saves here is a verification row
+and not a draft step, because the block and the head run before it is consulted,
+so it belongs where a drafted token's chance of being accepted stops covering
+the row it costs: 14.3 ms against 68.4, about 0.21. Swept from 0.0 to 0.70, the
+gain peaks between 0.15 and 0.35 and falls away on both sides. 0.25.
+
+**The draft source is chosen at start-up, not per request.** `--draft-source`
+on `run`, `chat`, `serve` and `bench`, defaulting to prompt lookup so that
+nothing changes silently, and `serve` fixes it for its lifetime: the block's
+cache is caught up as tokens go through, so it is not something a request can
+switch on. A request's `speculate` still chooses the draft length within it.
+Asking for the head on a file that has no block is refused by name rather than
+served by prompt lookup, because the two differ only in speed and a silent
+fallback reads as a feature that does nothing.
 
 **The rollback is a ring of state buffers, not a copy.** The KV cache needs
 nothing: a rejected row's entry is past `pos` and nothing reads it. The

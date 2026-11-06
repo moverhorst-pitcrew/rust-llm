@@ -59,6 +59,7 @@ cargo run --release -p llm-core --example bench_bandwidth
 # speculation: what a verification row costs, and the drafter on against off
 # with its acceptance histogram. --prompt-tokens above the fixed text's own
 # length repeats that text, which is the deliberately repetitive case.
+# --draft-source mtp adds what the head itself costs and its break-even.
 rust-llm bench --context 1024 --threads 8 --prompt-tokens 400 \
   --max-tokens 32 --repeats 5 --speculate 4
 
@@ -527,20 +528,183 @@ What the two tables say:
   accepts the whole draft, with little in between; prose is `0:10 1:5 4:5` and
   repetitive text is `2:3 4:3` or `7:3`. So the mean acceptance understates what
   a good pass does and overstates what a bad one does, which is why the
-  distribution is reported and not only the rate. It is also what any later draft
-  source, an MTP head included, has to beat.
+  distribution is reported and not only the rate. It is also the measurement the
+  MTP head below is held against.
+
+### Drafting from the MTP head
+
+`--draft-source mtp` drafts from the model's own multi-token-prediction block
+instead of from the text so far. That changes the arithmetic above in one way
+that matters: **prompt lookup drafts for free and a head does not.** So the
+verification table is no longer the whole cost and its last column is no longer
+the whole break-even.
+
+#### What the head costs
+
+Context 1024, 8 threads, tier `avx2+vnni`, under the model lock, 3 to 5
+repeats, median, from `bench --draft-source mtp`'s own `mtp` block.
+
+| | measured |
+| --- | --- |
+| one draft step | 13.2 to 14.8 ms, over eight blocks |
+| catch-up per committed token | +1.02 ms in the quietest block |
+| a sequential token in the same windows | 64 to 78 ms |
+
+A draft step is one pass over the MTP block, about 75 MB of weights, plus
+`eh_proj` at 7.4 MB, plus the output head on one row at 0.5 GiB. The head
+dominates it, which is why 13.2 to 14.8 ms is almost exactly the 11 ms "Where a
+token's time goes" prices the head at: **a draft step is the output head plus a
+block, and a token is the output head plus thirty-two.** The reading is stable
+across every window, quiet or not, because it is bandwidth and not scheduling.
+
+The catch-up is a row through the same block per committed token, so the block's
+cache holds every position the trunk holds. It is the one number here the pair
+method could not pin down: it is the difference between a `forward` on a runner
+with the head enabled and one without, and over eight blocks that difference
+came out between -1.02 and +4.98 ms with the box under load. +1.02 ms is the
+reading from the quietest block, and it is the one the arithmetic agrees with:
+75 MB against a token's 2.5 GiB is 2.8 per cent of 68 ms, which is 1.9 ms.
+Treat it as one to two per cent of a token.
+
+**A catch-up row runs more of the block than it has to.** Only the key and
+value projections feed the block's cache, so it could stop after them and read
+11 MB rather than 75. That is the upgrade path if the profile ever asks for it;
+what it buys back is under 2 ms a token, and what running the whole block
+through the trunk's own `full_attn` and `ffn` buys is that the head cannot
+drift away from the block it drafts for.
+
+#### The break-even that follows
+
+Speculation at draft length `d` with `a` of those drafts accepted pays when
+
+```text
+verify(d + 1) + d * step + (a + 1) * catch_up  <  (a + 1) * token
+```
+
+so `a > (verify(d + 1) + d * step) / (token - catch_up) - 1`. As accepted drafts
+per drafted token, which is what the acceptance column reports:
+
+| `--speculate` | ms per batch | ms of draft steps | break-even acceptance |
+| --- | --- | --- | --- |
+| 1 | 79.2 | 13.7 | 0.38 |
+| 2 | 101.0 | 27.3 | 0.45 |
+| 3 | 104.8 | 40.9 | 0.39 |
+| 4 | 120.9 | 54.6 | 0.40 |
+
+**0.38 to 0.45, against 0.22 to 0.42 for prompt lookup.** Drafting from a head
+has to be about twice as accurate as drafting from the text to be worth the
+same, and that is entirely the output head: a draft step is 20 per cent of a
+token and prompt lookup's is 0.3 ms.
+
+#### What it is worth: the acceptance histograms
+
+32 generated tokens, greedy, 3 repeats, histogram summed over them.
+`--draft-source mtp --speculate d`, the same two texts the prompt-lookup tables
+above use.
+
+**Prose**, the fixed bench text at 192 tokens, which repeats nothing:
+
+| `--speculate` | acceptance | accepted lengths | passes that drafted nothing |
+| --- | --- | --- | --- |
+| 1 | 0.83 | `0:6 1:30` | 27 of 63 |
+| 2 | 0.87 | `0:3 1:9 2:15` | 27 of 54 |
+| 4 | 0.78 | `0:3 1:6 2:6 3:0 4:6` | 30 of 51 |
+| 8 | 0.80 | `0:3 1:6 2:6 3:0 4:3 6:3` | 24 of 45 |
+
+**Deliberately repetitive text**, the same text twice over at 400 tokens:
+
+| `--speculate` | acceptance | accepted lengths | passes that drafted nothing |
+| --- | --- | --- | --- |
+| 1 | 0.76 | `0:12 1:39` | 3 of 54 |
+| 2 | 0.57 | `0:15 1:12 2:18` | 0 of 45 |
+| 4 | 0.51 | `0:12 1:6 2:9 3:3 4:6` | 0 of 36 |
+| 8 | 0.42 | `0:12 1:6 2:6 3:3 4:3 7:3` | 0 of 33 |
+
+**The gate prompt set**, ten real chat prompts, from
+`mtp_drafting_does_not_change_the_output`: 477 of 712 drafts accepted over 265
+verification passes at draft 2 and draft 4 together, so **0.67 per drafted
+token**, and 0.48 to 0.91 by prompt. Only 6 of 271 passes drafted nothing.
+
+What those three tables say, and it is the opposite of prompt lookup's shape:
+
+- **The head's best text is the text prompt lookup cannot do anything with.**
+  On prose it accepts 0.78 to 0.87 where prompt lookup accepts 0.31 at four
+  drafts and 0.16 at eight. On the gate prompt set it accepts 0.67 where prompt
+  lookup accepts 0.21, and two of those ten prompts never draft at all from the
+  text because nothing in them repeats. That is the whole reason to have built
+  it.
+- **A longer draft costs the head nothing in accuracy on prose.** 0.83, 0.87,
+  0.78, 0.80 at one, two, four and eight drafts, where prompt lookup halves from
+  0.31 to 0.16 between four and eight. The head predicts from the model, so it
+  does not run out of match the way a lookup does.
+- **On repetitive text the head is the *worse* drafter**, 0.42 to 0.76 against
+  prompt lookup's 0.75 to 1.00, and it falls off with the draft length where
+  prompt lookup does not. A literal repeat is exactly what a lookup is for, and
+  a head trained to predict the next token has no special advantage there.
+- **The confidence floor earns its place on prose and does nothing on
+  repetitive text.** A quarter to a half of the prose passes draft nothing at
+  all, which is the floor refusing a draft the trunk would probably have
+  rejected; on repetitive text it almost never fires. The cost of a pass that
+  drafts nothing is one draft step, 13.7 ms, because the block and the head run
+  before the floor is consulted.
+- **Both histograms are bimodal**, as prompt lookup's are: a pass either
+  accepts nothing or accepts most of the draft.
+
+#### The measured gain: one reading, at the edge of its own spread
+
+**Prose, two drafts**, the only pair taken in a window that started quiet
+(load 1.99, and 4.35 by the end of the block), 5 repeats:
+
+| | tok/s | spread |
+| --- | --- | --- |
+| sequential | 15.31 | 5.7% |
+| speculated | 16.24 | 6.4% |
+
+**+6.1 per cent**, at acceptance 0.87, against spreads of 5.7 and 6.4 per cent.
+So it is positive and it is inside the noise of the pair that produced it. That
+is the whole timing result, and it is one number.
+
+Every other attempt landed in a window with another ticket's benchmark on the
+box: load average 4.2 to 8.6 across ten further blocks, with the `sequential`
+row swinging from 11.11 to 15.64 tok/s on the same configuration, which is
+further than the effect. Those pairs are not quoted. Acceptance is, because it
+is a property of the model and the text and not of the clock, and it came out
+the same in every one of those windows.
+
+What the pieces predict, for something to check a quiet reading against: at four
+drafts on prose a round is seven verification batches of about 3.6 rows, ten
+passes that draft nothing and about 25 draft steps per 32 tokens, which is
+roughly 59 ms a token against 68 sequential, about +15 per cent. At two drafts
+the same arithmetic gives about +10. That is arithmetic and not a measurement.
+The gap between it and the +6.1 above is what a quiet window has to settle.
 
 ### The default is 0
 
 Ordinary prose, which is what the gate prompt set is, sits at or below
-break-even, so speculation there pays verification rows for nothing. Repetitive
+break-even for prompt lookup, so speculation there pays verification rows for
+nothing. Repetitive
 text wins by 10 to 29 per cent, but a runner cannot tell in advance which it has
 been given, and the cost of guessing wrong is a slower run. So it is a flag, not
 a default: a caller who knows their text repeats itself, a long quoted passage,
 a diff, boilerplate code, turns it on and gets the numbers above.
 
-**`--speculate 0` measures as the build without this change.** This branch's
-binary against `origin/main`'s (`9bdd45c`), alternated three times in one window,
+**The head does not change that on these numbers, and the reason is not its
+accuracy.** It accepts 0.67 on the gate prompt set against a break-even of 0.38
+to 0.45, which is the first draft source here that is clearly above its own
+break-even on ordinary prose. What is missing is the measured pair: every window
+on this box during this work had another ticket's benchmark in it, and the
+`sequential` row moved further than the effect. So the default stays 0 and the
+draft source stays `prompt-lookup`, and whether the numbers flip either is a
+decision taken against a quiet-window reading, not against this paragraph.
+
+**The two draft sources are for opposite texts, which is worth knowing whichever
+default wins.** Prompt lookup is for text that repeats literally and does
+nothing at all otherwise; the head is for text that does not repeat and is the
+worse drafter when it does. A caller who knows which they have should say so.
+
+**`--speculate 0` measures as the build without speculation at all.** Measured
+when prompt lookup landed, before the head existed: that branch's binary against
+`origin/main`'s (`9bdd45c`), alternated three times in one window,
 context 1024, 192-token prompt, 8 threads, 3 repeats each, medians over the
 rounds:
 
@@ -556,6 +720,11 @@ through the function it always used. What the off path gains is one modulo and
 one branch per row. The stronger check is not a timing one: `greedy_output_is_unchanged`
 and `every_next_token_matches_the_reference` pass unchanged on this branch
 against the committed fixture.
+
+`--draft-source mtp` does not move that path either, and it cannot: the flag
+only decides whether `enable_mtp` is called, and it is only called above
+`--speculate 0`. The block's cache, its scratch and the extra `rms_norm` per
+prompt row all come with that call.
 
 ## Memory
 

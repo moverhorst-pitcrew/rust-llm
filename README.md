@@ -61,6 +61,7 @@ for a development surface.
 | `--threads <n>` | all cores | worker threads |
 | `--max-tokens <n>` | 512 | stop after this many generated tokens |
 | `--speculate <n>` | 0 (off) | draft n tokens per step and verify them in one batch |
+| `--draft-source <name>` | `prompt-lookup` | where those drafts come from: `prompt-lookup` or `mtp` |
 | `--think`, `--no-think` | thinking on | the model's own thinking mode |
 | `--raw` | off | `run` only: take `--prompt` verbatim, no chat template |
 
@@ -78,6 +79,17 @@ they save. A draft costs about 50 MiB of memory. `docs/benchmarks.md` has the
 acceptance rates and the gains per draft length, and the number the default
 comes out of; the gains there do not order neatly by draft length, so read the
 table rather than reaching for the largest number the memory allows.
+
+`--draft-source mtp` drafts from the model's own multi-token-prediction head
+instead, which needs a file that kept it (`docs/models.md`); asking for it on a
+file without one is refused by name. **The two sources are for opposite texts.**
+Prompt lookup wants literal repetition and does nothing without it. The head
+drafts from the model, so it works on prose that repeats nothing, which is where
+it accepts 0.78 to 0.87 of its drafts against prompt lookup's 0.16 to 0.31, and
+it is the worse drafter on text that does repeat. It is not free, though: a
+draft step is a pass over one block and the output head, about a fifth of a
+token, so it has to be roughly twice as accurate as prompt lookup to be worth
+the same. Both are off at `--speculate 0`, and neither changes what comes out.
 
 Sampling, with Qwen3.5's own recommended values as the defaults. A value that
 cannot be a setting is refused by name rather than clamped:
