@@ -87,30 +87,35 @@ fn opens_the_real_model() {
         g.meta_u32("qwen35.nextn_predict_layers").unwrap()
     );
     println!("real blocks:     {}", plan.n_blocks);
+    println!("mtp block:       {:?}", plan.mtp);
     println!("full attention:  {:?}", plan.full_attention_layers());
     println!("linear attention:{:?}", plan.linear_attention_layers());
     println!("tensor checksum: {checksum}");
     println!(
         "RSS before open: {before} KiB\n\
          RSS after open:  {after_open} KiB, so open cost {open_cost} KiB ({:.2}% of the file)\n\
-         RSS after touch: {after_touch} KiB (first and last byte of all 426 tensors)\n\
+         RSS after touch: {after_touch} KiB (first and last byte of all {} tensors)\n\
          peak RSS:        {} KiB",
         (open_cost as f64 * 1024.0) / file_bytes as f64 * 100.0,
+        g.tensor_count(),
         status_kib("VmHWM")
     );
 
-    assert_eq!(g.tensor_count(), 426, "tensor count");
-    assert_eq!(plan.n_blocks, 32, "real block count");
+    assert_eq!(g.tensor_count(), 441, "tensor count");
+    assert_eq!(plan.n_blocks, 32, "trunk block count");
+    // The 15 tensors of `blk.32` are the whole difference from the older
+    // conversion of these weights, which had 426 and no MTP block.
+    assert_eq!(plan.mtp, Some(32), "the MTP block");
     assert_eq!(
         plan.full_attention_layers(),
         vec![3, 7, 11, 15, 19, 23, 27, 31]
     );
     assert_eq!(plan.linear_attention_layers().len(), 24);
-    assert_eq!(by_type.get("Q4_K").copied(), Some(216));
-    assert_eq!(by_type.get("Q6_K").copied(), Some(33));
-    assert_eq!(by_type.get("F32").copied(), Some(177));
+    assert_eq!(by_type.get("Q4_K").copied(), Some(222));
+    assert_eq!(by_type.get("Q6_K").copied(), Some(35));
+    assert_eq!(by_type.get("F32").copied(), Some(184));
 
-    // The whole point of the memory map: a 2.7 GB file must not become 2.7 GB
+    // The whole point of the memory map: a 2.8 GB file must not become 2.8 GB
     // of resident memory. What `open` does keep is the metadata, and nearly all
     // of that is the 248320-token vocabulary and the 247587 merges. The assert
     // is on what `open` itself added, not on the process total, so the baseline
@@ -147,9 +152,13 @@ fn opens_the_real_model() {
         };
         println!("{k} = {shown}");
     }
-    println!("\n--- tensors: the globals, one linear block, one full block ---");
+    println!("\n--- tensors: the globals, one linear block, one full block, the MTP block ---");
     for (name, t) in g.tensors() {
-        if name.starts_with("blk.3.") || name.starts_with("blk.0.") || !name.starts_with("blk.") {
+        if name.starts_with("blk.3.")
+            || name.starts_with("blk.0.")
+            || name.starts_with("blk.32.")
+            || !name.starts_with("blk.")
+        {
             println!("{name}: {:?} {:?} {} bytes", t.dims, t.ty, t.nbytes);
         }
     }
