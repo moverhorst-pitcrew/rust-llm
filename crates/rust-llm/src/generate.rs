@@ -122,8 +122,8 @@ impl Timings {
 /// The histogram is the point of this and not the acceptance rate it averages
 /// to: what a longer draft is worth depends on how the accepted lengths are
 /// distributed, because a pass that accepts none still pays for every row it
-/// ran. It is also the measurement any later draft source, an MTP head
-/// included, has to beat.
+/// ran. It is also the measurement the MTP head is held against, by the
+/// acceptance floor in `tests/gate.rs`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Speculated {
     /// Passes that ran a plain [`Runner::forward`], because the drafter found
