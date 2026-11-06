@@ -1,7 +1,7 @@
 //! A tiny but valid Qwen3.5 GGUF, and the `tokenizer.json` that belongs with
 //! it, written byte by byte.
 //!
-//! The product is otherwise only exercised end to end against the 2.7 GB file,
+//! The product is otherwise only exercised end to end against the 2.8 GB file,
 //! which CI does not have. This is the same architecture at the smallest
 //! dimensions its own constraints allow: two blocks, one linear and one full
 //! attention, `Q8_0` weights so the real dequant-free kernel path runs, and a
@@ -24,6 +24,13 @@
 //! - **Every other quantized row length is a multiple of 32**, which is
 //!   `Q8_0`'s block.
 //!
+//! It carries the **multi-token-prediction block** as well, as `blk.2`, with
+//! the four `nextn.*` tensors around a third full-attention block. Without it
+//! the MTP draft path, its catch-up and its rollback would only be reachable
+//! with the real weights, and the one way an MTP block can be wrong is the one
+//! way nothing fails: verification is exact, so a wrong block costs acceptance
+//! and not correctness.
+//!
 //! The tokenizer is byte-level BPE over the bytes a chat prompt and an ASCII
 //! test prompt actually contain, rather than all 256. Every token is then one
 //! printable byte, so whatever the fixture generates is valid UTF-8 and a test
@@ -39,6 +46,8 @@ use serde_json::json;
 
 // ------------------------------------------------------------- the shape
 
+/// Trunk blocks, which is what `layer_plan` reports: `block_count` is one
+/// more, because it counts the MTP block.
 pub const N_BLOCKS: usize = 2;
 pub const N_EMBD: usize = 256;
 pub const N_FF: usize = 32;
@@ -117,25 +126,43 @@ pub struct Tiny {
 /// find that token by running the library and then asking for a fixture that
 /// stops on it.
 pub fn write(name: &str, eos: u32) -> Tiny {
+    write_with(name, eos, true)
+}
+
+/// The same file without the MTP block, which is the conversion this runner
+/// started on: the trunk is identical and only drafting from the head is
+/// unavailable. One test needs it, to check that asking for a head the file
+/// does not have is refused rather than quietly ignored.
+// Not every test binary that includes this module needs it; the two that do
+// are `tests/mtp.rs` and `tests/tiny_model.rs`.
+#[allow(dead_code)]
+pub fn write_without_mtp(name: &str, eos: u32) -> Tiny {
+    write_with(name, eos, false)
+}
+
+fn write_with(name: &str, eos: u32, mtp: bool) -> Tiny {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::create_dir_all(&dir).expect("create the fixture directory");
     let model = dir.join("model.gguf");
     let tokenizer = dir.join("tokenizer.json");
-    std::fs::write(&model, gguf(eos)).expect("write the fixture model");
+    std::fs::write(&model, gguf(eos, mtp)).expect("write the fixture model");
     std::fs::write(&tokenizer, tokenizer_json()).expect("write the fixture tokenizer");
     Tiny { model, tokenizer }
 }
 
 // ----------------------------------------------------------- the metadata
 
-fn gguf(eos: u32) -> Vec<u8> {
+fn gguf(eos: u32, mtp: bool) -> Vec<u8> {
     let tokens = vocab_strings();
     let mut b = Builder::default();
     b = b
         .kv("general.architecture", kv(8, p_str("qwen35")))
         .kv("general.name", kv(8, p_str("tiny-qwen35")))
-        .kv("qwen35.block_count", u32v(N_BLOCKS as u32))
-        .kv("qwen35.nextn_predict_layers", u32v(0))
+        // One more than the trunk, as the real conversion does: the last one
+        // is the MTP block and `nextn_predict_layers` is what takes it out of
+        // the trunk again.
+        .kv("qwen35.block_count", u32v(N_BLOCKS as u32 + u32::from(mtp)))
+        .kv("qwen35.nextn_predict_layers", u32v(u32::from(mtp)))
         .kv("qwen35.context_length", u32v(4096))
         .kv("qwen35.embedding_length", u32v(N_EMBD as u32))
         .kv("qwen35.feed_forward_length", u32v(N_FF as u32))
@@ -145,11 +172,12 @@ fn gguf(eos: u32) -> Vec<u8> {
         .kv("qwen35.attention.value_length", u32v(HEAD_DIM as u32))
         .kv("qwen35.attention.layer_norm_rms_epsilon", f32v(1e-6))
         // Block 0 is the linear one and block 1 the full-attention one, the
-        // same ratio the real file has at a much smaller scale.
-        .kv(
-            "qwen35.attention.recurrent_layers",
-            kv(9, p_array(7, N_BLOCKS as u64, &[1, 0])),
-        )
+        // same ratio the real file has at a much smaller scale. The third
+        // entry is the MTP block, which is full attention as it is there.
+        .kv("qwen35.attention.recurrent_layers", {
+            let n = N_BLOCKS + usize::from(mtp);
+            kv(9, p_array(7, n as u64, &[1u8, 0, 0][..n]))
+        })
         .kv("qwen35.rope.freq_base", f32v(1e7))
         .kv("qwen35.rope.dimension_count", u32v(N_ROT as u32))
         // Sections for the three position axes a text-only path uses, with a
@@ -213,7 +241,9 @@ fn gguf(eos: u32) -> Vec<u8> {
     );
     b = b.tensor("output_norm.weight", &[N_EMBD], F32, ones(N_EMBD));
 
-    for il in 0..N_BLOCKS {
+    // The trunk, then the MTP block, which is a full-attention block with four
+    // tensors in front of it.
+    for il in 0..N_BLOCKS + usize::from(mtp) {
         let t = |suffix: &str| format!("blk.{il}.{suffix}");
         b = b.tensor(&t("attn_norm.weight"), &[N_EMBD], F32, ones(N_EMBD));
         b = b.tensor(
@@ -222,6 +252,19 @@ fn gguf(eos: u32) -> Vec<u8> {
             F32,
             ones(N_EMBD),
         );
+        if il == N_BLOCKS {
+            // `eh_proj` reads the normed embedding followed by the normed
+            // hidden state, so it is twice as wide as the embedding.
+            b = b.tensor(
+                &t("nextn.eh_proj.weight"),
+                &[2 * N_EMBD, N_EMBD],
+                Q8_0,
+                q8_0(&mut n, 2 * N_EMBD, N_EMBD),
+            );
+            for name in ["nextn.enorm", "nextn.hnorm", "nextn.shared_head_norm"] {
+                b = b.tensor(&t(&format!("{name}.weight")), &[N_EMBD], F32, ones(N_EMBD));
+            }
+        }
 
         if il == 0 {
             // The linear (gated delta net) block.

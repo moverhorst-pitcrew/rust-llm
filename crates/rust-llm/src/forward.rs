@@ -729,8 +729,12 @@ impl<'a> Runner<'a> {
             bufs: mbufs,
         } = mtp.as_mut().expect("the caller checked");
         let ne = model.config.n_embd;
+        // Which rows of the batch these are, and where they sit. The two are
+        // not the same number and adding them would be wrong: `accept` has
+        // already advanced `caches.pos` past every row committed before this
+        // call, so `caches.pos` *is* the absolute position of row `from`.
         let from = *committed;
-        let pos = caches.pos + from;
+        let pos = caches.pos;
         debug_assert!(from + rows <= *batch);
         debug_assert!(
             *caught_up >= pos,

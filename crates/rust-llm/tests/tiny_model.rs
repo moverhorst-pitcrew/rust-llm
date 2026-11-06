@@ -375,6 +375,8 @@ fn the_sampling_flags_are_honoured_and_checked() {
         (vec!["--speculate", "17"], "--speculate"),
         (vec!["--speculate", "-1"], "--speculate"),
         (vec!["--speculate", "some"], "--speculate"),
+        (vec!["--draft-source", "head"], "draft source"),
+        (vec!["--draft-source", ""], "draft source"),
     ] {
         let mut full = vec!["run", "--prompt", "hello"];
         full.extend(&args);
@@ -442,6 +444,74 @@ fn the_speculate_flag_changes_nothing_but_the_speed() {
             "--speculate {draft} printed no acceptance line:\n{log}"
         );
     }
+}
+
+/// `--draft-source` picks where the drafts come from, and either source
+/// streams the same text.
+///
+/// The parsing and the refusal are the point. `mtp` on a file without the
+/// block has to fail by name rather than quietly falling back to prompt
+/// lookup, because the two differ only in speed and a silent fallback would
+/// read as a feature that does nothing. On a file that has the block, the
+/// streamed answer has to be the one `--speculate 0` gives, which is the
+/// command-line end of the equivalence `tests/mtp.rs` asserts in the library.
+#[test]
+fn the_draft_source_flag_changes_nothing_but_the_speed() {
+    let with_mtp = support::write("draft-source-cli", support::UNREACHED_EOS);
+    let without = support::write_without_mtp("draft-source-cli-plain", support::UNREACHED_EOS);
+    let answer = |model: &std::path::Path, args: &[&str]| {
+        let mut full = vec![
+            "run",
+            "--prompt",
+            "hello hello hello hello",
+            "--max-tokens",
+            "16",
+            "--context",
+            "128",
+            "--temperature",
+            "0",
+        ];
+        full.extend(args);
+        let out = run(model, &full, "");
+        (out.status.success(), out.stdout, out.stderr)
+    };
+
+    let (ok, want, _) = answer(&with_mtp.model, &["--speculate", "0"]);
+    assert!(ok, "the baseline run failed");
+    for source in ["prompt-lookup", "mtp"] {
+        let (ok, got, log) = answer(
+            &with_mtp.model,
+            &["--speculate", "4", "--draft-source", source],
+        );
+        assert!(ok, "--draft-source {source} failed:
+{log}");
+        assert_eq!(got, want, "--draft-source {source} streamed different text");
+        assert!(
+            log.contains(&format!("4 drafted tokens per step from {source}")),
+            "--draft-source {source} did not say which source it used:
+{log}"
+        );
+    }
+    // The file the runner started on: it loads and runs, and the flag that
+    // needs a head it does not have is refused by name.
+    let (ok, _, log) = answer(&without.model, &["--speculate", "4"]);
+    assert!(ok, "a file without the block failed to run at all:
+{log}");
+    assert!(
+        log.contains("no MTP block"),
+        "a file without the block did not say so:
+{log}"
+    );
+    let (ok, _, log) = answer(
+        &without.model,
+        &["--speculate", "4", "--draft-source", "mtp"],
+    );
+    assert!(!ok, "--draft-source mtp was accepted on a file without one");
+    assert!(
+        log.contains("nextn.eh_proj"),
+        "the refusal did not name what is missing:
+{log}"
+    );
 }
 
 /// `chat` keeps the conversation, streams every turn, and handles `/reset`,
