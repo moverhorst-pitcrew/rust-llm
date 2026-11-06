@@ -18,6 +18,9 @@
 //! # speculation: the same tokens, and a rollback that leaves no trace (~4 min)
 //! cargo test -p rust-llm --release --test gate -- --ignored --nocapture speculat
 //!
+//! # the MTP head: the same tokens, and drafts that are still worth it (~5 min)
+//! cargo test -p rust-llm --release --test gate -- --ignored --nocapture mtp
+//!
 //! # re-derive one prompt of the fixture from a local llama.cpp build (~30 s)
 //! RUST_LLM_REFERENCE_BIN=$REF_DIR/llama.cpp/build/bin \
 //!   RUST_LLM_GATE_ONLY=capital_no_think \
@@ -85,7 +88,7 @@ use llm_core::Gguf;
 use rust_llm::Tokenizer;
 use rust_llm::chat::{self, ChatOptions, Message, Role};
 use rust_llm::forward::Runner;
-use rust_llm::generate::generate;
+use rust_llm::generate::{Speculated, generate};
 use rust_llm::model::Model;
 use rust_llm::sample::{Sampler, Sampling, argmax};
 
@@ -940,6 +943,111 @@ fn a_rejected_draft_leaves_no_trace_in_the_logits() {
             batch.len() - keep,
         );
     }
+}
+
+/// How far the MTP head's acceptance may fall before this is no longer a
+/// feature.
+///
+/// **This is the test that matters most, and it is the only one that can
+/// fail.** Verification is exact, so a wrong MTP block cannot change a token:
+/// acceptance collapses and the feature quietly becomes plain decode with a
+/// block and an output head running in front of it. Nothing in the output, the
+/// gates or the tiny fixture would show that.
+///
+/// The floor is set from the measured value with room for the model and the
+/// prompt set to move, not from the break-even: it is a regression test for the
+/// head, not a judgement on whether drafting pays. What it costs is in
+/// `docs/benchmarks.md`; measured on this prompt set the head sits well above
+/// this, and the break-even on this box is 0.38 to 0.45.
+const MTP_ACCEPTANCE_FLOOR: f64 = 0.35;
+
+/// The head must not change a token of the gate prompt set either.
+///
+/// The same comparison [`speculation_does_not_change_the_output`] makes for
+/// prompt lookup, which is the one that matters for a draft source: greedy is
+/// against the committed sequence, so a divergence is a divergence from the
+/// reference's own output and not merely from another run of ours.
+///
+/// It also prints the acceptance per prompt, which is the measurement
+/// `docs/benchmarks.md` carries, and asserts the floor over the set as a whole.
+/// Per prompt would be a different test: a 32-token answer is a handful of
+/// verification passes and one unlucky prompt is not a regression.
+#[test]
+#[ignore = "needs the model file"]
+fn mtp_drafting_does_not_change_the_output() {
+    let cases = cases();
+    let fixture = fixture();
+    let expected = fixture["cases"].as_array().expect("cases");
+    let gguf = open_model();
+    let tokenizer = tokenizer();
+    let model = Model::load(&gguf).expect("load model");
+    assert!(
+        model.mtp.is_some(),
+        "this file has no MTP block, so there is nothing to draft from; see docs/models.md"
+    );
+    let threads = threads();
+
+    let mut failures = Vec::new();
+    let mut total = Speculated::default();
+    for (case, want) in cases.iter().zip(expected) {
+        let prompt = tokenizer.encode(&case.prompt, true).expect("encode");
+        let committed = ids_of(&want["tokens"]);
+        for draft in [2usize, 4] {
+            let mut on = Runner::with_speculation(&model, CONTEXT, threads, 16, draft);
+            assert!(on.enable_mtp(), "the file has an MTP block");
+            let (got, stop, timings) = generate(
+                &mut on,
+                &mut Sampler::greedy(model.vocab()),
+                &prompt,
+                case.max_tokens,
+                |_| true,
+            );
+            let spec = timings.speculation;
+            println!(
+                "{:28} draft {draft}: {:3} tokens, {:?}, {:.2} tok/s, {}",
+                case.name,
+                got.len(),
+                stop,
+                timings.generate_per_second(),
+                spec.report(),
+            );
+            if got != committed {
+                let at = got
+                    .iter()
+                    .zip(&committed)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(got.len().min(committed.len()));
+                failures.push(format!(
+                    "{}, draft {draft}: diverges from the committed output at token {at}\n                       drafted: {:?}\n  committed: {:?}",
+                    case.name,
+                    &got[at.min(got.len())..],
+                    &committed[at.min(committed.len())..],
+                ));
+            }
+            total.plain += spec.plain;
+            total.offered += spec.offered;
+            for (a, b) in total.accepted.iter_mut().zip(spec.accepted) {
+                *a += b;
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} divergences:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+    println!("over the whole set: {}", total.report());
+    assert!(
+        total.acceptance() >= MTP_ACCEPTANCE_FLOOR,
+        "the head accepted {:.3} drafts per drafted token over the prompt set, below \
+         the {MTP_ACCEPTANCE_FLOOR} floor. The output is still right, because \
+         verification is exact, so this is what a wrong MTP block looks like: the \
+         feature has become plain decode with a block and an output head in front \
+         of it. {}",
+        total.acceptance(),
+        total.report()
+    );
 }
 
 #[test]

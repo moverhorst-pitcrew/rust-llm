@@ -324,14 +324,21 @@ pub const DEFAULT_BATCH: usize = 16;
 ///
 /// The reference calls this `p_min` and defaults it to zero, which drafts every
 /// step however hopeless. It is not a tuning knob here, it is a measured
-/// constant: see `docs/benchmarks.md`, "Drafting from the MTP head".
+/// constant: the sweep is in `docs/benchmarks.md`, "Drafting from the MTP head".
 ///
-/// A rejected draft costs a verification row, and the row after the first
-/// rejection is thrown away as well, so a step the head is not confident about
-/// is paid for twice. The floor is the probability of the top token after a
-/// softmax over the whole vocabulary, which is one pass over logits the matmul
-/// just wrote and does not show next to it.
-pub const MTP_P_MIN: f32 = 0.35;
+/// What the floor saves is a **verification row**, not a draft step: the block
+/// and the head run before it is consulted, so a step whose draft is dropped is
+/// paid for anyway. The bound it should sit at is therefore where a drafted
+/// token's chance of being accepted stops covering the row it costs, which on
+/// this box is a 14.3 ms row against a 68.4 ms token, about 0.21. Measured, the
+/// gain peaks between 0.15 and 0.35 and falls away on both sides: below it the
+/// rows of hopeless drafts eat the gain, above it the head stays silent and its
+/// steps are spent for nothing.
+///
+/// It is the probability of the top token after a softmax over the whole
+/// vocabulary, which is one pass over logits the matmul has just written and
+/// does not show next to it.
+pub const MTP_P_MIN: f32 = 0.25;
 
 /// The longest draft [`Runner::with_speculation`] takes.
 ///
