@@ -41,7 +41,7 @@ the wrong thing. `cargo bench` inherits this profile.
 
 | crate | why |
 | --- | --- |
-| `memmap2` | The only sane way to get 2.7 GB of weights addressable without reading them. Thin, pure Rust, no build script. |
+| `memmap2` | The only sane way to get 2.8 GB of weights addressable without reading them. Thin, pure Rust, no build script. |
 | `half` | `f16` decoding for the ggml block scales. `f16` in `core` is still unstable, and hand-rolling the subnormal cases is a silent-wrongness risk for twenty saved lines. |
 | `thiserror` | Error enums with a `Display` that names the file, the key or the tensor. Derive only, nothing at runtime. |
 | `tokenizers` | See the tokenizer section. |
@@ -78,14 +78,21 @@ owning-reference crate.
 **Metadata arrays hold `Value`s, including nested arrays.** GGUF allows an
 array of arrays, so a parallel element-type enum would have to recurse anyway.
 The cost is the enum tag per element, about 16 MB on the vocabulary, which is
-noise against a 2.7 GB model and is paid once at load.
+noise against a 2.8 GB model and is paid once at load.
 
-**The block count comes out of the tensors, not out of `block_count`.** In this
-conversion `qwen35.block_count` is 33 while `blk.32` does not exist, because
-the MTP block was stripped. `qwen35::layer_plan` takes
-`block_count - nextn_predict_layers` and then requires every block it implies
-to be present, so a file that really is missing a block fails with the name of
-the missing tensor instead of producing a 31-block model.
+**The block count comes out of the tensors, not out of `block_count`.**
+`qwen35.block_count` is 33 and counts the multi-token-prediction block, so
+`qwen35::layer_plan` takes `block_count - nextn_predict_layers` for the trunk
+and then requires every block that implies to be present: a file that really is
+missing a block fails with the name of the missing tensor instead of producing
+a 31-block model.
+
+Whether the MTP block itself is in the file is a property of the conversion,
+not of the architecture, so it comes back as an `Option` rather than as a
+requirement. The file this runner is gated against has it as `blk.32`; the
+conversion before it stripped it (`docs/models.md`). A block past the ones
+`block_count` accounts for is still an error, because one trained head is what
+`nextn_predict_layers` says and a second one would be a file we cannot read.
 
 **Layer typing comes from `qwen35.attention.recurrent_layers`.** Deriving it
 from `full_attention_interval` would be arithmetic that happens to agree with
@@ -1152,8 +1159,8 @@ Ten prompts in `fixtures/gate_prompts.json`, 32 to 48 tokens each: thinking on
 and off, a system persona, a multi-turn conversation, a non-ASCII prompt, Dutch
 diacritics, two code prompts (one with tabs) and one raw completion with no
 chat template. `fixtures/reference_generations.json` holds the reference's
-tokens, ours, and the model's sha256, so CI needs neither llama.cpp nor the
-weights.
+tokens from **both** of its kernel paths, ours, and the model's sha256, so CI
+needs neither llama.cpp nor the weights.
 
 **There are two gates rather than one, and the reason is not a concession.**
 Free-running token-for-token agreement is not a property an implementation can
@@ -1162,20 +1169,32 @@ deliberately are not. On a logit scale whose next-token margins are typically
 0.25 to 1.2, the two implementations' logits differ by about 1e-2, which leaves
 a band of roughly +/-0.1 inside which neither one's choice is determined by the
 model. llama.cpp disagrees with *itself* across its own two kernel paths on
-these prompts for the same reason: with repacking on it answers "Here's a
-thinking process that leads to the answer", with `--no-repack` "Here's my
-thought process for solving this word problem", same file, same greedy sampler.
+these prompts for the same reason, same file and same greedy sampler, and that
+is not an anecdote: the fixture records both of its outputs per prompt, and the
+two differ on 5 of the 10.
 
 So:
 
 - `every_next_token_matches_the_reference` is the correctness gate. It feeds
   the reference's own tokens and checks the prediction at every position
   independently, so a flipped near-tie cannot hide the predictions behind it. A
-  disagreement is accepted only where the fixture records one and only when the
-  top-two margin is inside the 0.25 band and the reference's token is at least
-  our runner-up. Currently 380 of 384 positions are identical and the four that
-  are not have margins of 0.0094, 0.0104, 0.0475 and 0.1262, against typical
-  margins twenty times that.
+  disagreement is accepted only where the fixture records one, and then on one
+  of two grounds: the top-two margin is inside the 0.25 band and the
+  reference's token is at least our runner-up, or the reference's repacked
+  kernels choose *our* token at exactly the position where its two paths first
+  part, which says the model does not determine that position whatever the
+  margin is. Currently 379 of 384 positions are identical and the five that are
+  not have margins of 0.0135, 0.0577, 0.1042, 0.1104 and 0.7516; four of them
+  are positions the reference itself does not settle.
+
+  **The second ground is why the band is still 0.25.** On `capital_think` the
+  reference's plain kernels open the fourth heading with "Identify the core
+  question" and its repacked kernels with "Analyze the Request", which is ours.
+  Those are two sentences rather than two spellings of one, so the gap between
+  them in our logits is 0.75: wide, and widening the band to cover it would
+  blind the gate on every other prompt. Recording what the reference does
+  instead costs one extra reference run per prompt when the fixture is written
+  and nothing at all when the gate runs.
 - `greedy_output_is_unchanged` is the regression gate: free-running output must
   equal the committed sequence token for token. For 7 of the 10 prompts that
   sequence is the reference's own output for its whole length; the fixture
@@ -1202,9 +1221,15 @@ keeps its work and the next one continues with what is missing. A case that is
 in neither the fresh run nor the file is left out, and the two gates then fail
 on the case count rather than quietly running a short set.
 
+Cases describing a **different model file** are dropped rather than merged,
+because two models' cases in one fixture is what `model_sha256` exists to rule
+out. A model swap therefore leaves a short file and takes the same resumable
+path as a stopped run: the gates fail on the case count until every prompt has
+been re-derived against the new weights.
+
 Omitting `RUST_LLM_GATE_ONLY` does the whole set in one command, which is about
-four minutes. Per prompt it is 20 to 35 seconds, which is the size to keep a
-check at.
+three minutes. Per prompt it is two reference runs, one per kernel path, plus
+our own free-running and teacher-forced passes.
 
 **Forgetting `RUST_LLM_REFERENCE_BIN` in the whole `--ignored` run costs more
 than this one test.** It panics on the missing variable, a failing test binary
@@ -1225,7 +1250,7 @@ dropped, so every token the gate uses is bounded by a log line on both sides.
 
 ## The tiny model, so the surfaces are covered without the weights
 
-The gate above proves what the model produces, and needs 2.7 GB of weights to
+The gate above proves what the model produces, and needs 2.8 GB of weights to
 do it. What it does not touch is the product around the model: argument parsing,
 streaming, the stop conditions, the sampling flags, the conversation. That was
 only ever exercised by hand.

@@ -31,7 +31,7 @@ download and where to put it; everything below takes it from `--model` or from
 `--tokenizer` says otherwise.
 
 ```sh
-export RUST_LLM_MODEL=/path/to/Qwen3.5-4B-heretic-Q4_K_M.gguf
+export RUST_LLM_MODEL=/path/to/Qwen3.5-4B-MTP-Heretic.Q4_K_M.gguf
 ```
 
 ## Using it
